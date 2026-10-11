@@ -4290,6 +4290,7 @@ void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
 		}
 	} else {
 		opaque_sort_runs.resize(runs);
+		opaque_sort_keys.resize(opaque_count);
 		for (uint32_t i = 0; i < runs; i++) {
 			const uint32_t from = uint32_t(uint64_t(opaque_count) * i / runs);
 			const uint32_t to = uint32_t(uint64_t(opaque_count) * (i + 1) / runs);
@@ -4300,25 +4301,28 @@ void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
 
 		// k-way merge of the opaque runs, ties to the earlier run. Equal keys may come out in another order than one
 		// sort would give (SortArray is not stable either): same mesh, material and pipeline, drawn in another order.
-		GeometryInstanceSurfaceDataCache **elements = render_list[RENDER_LIST_OPAQUE].elements.ptr();
 		uint32_t heads[16];
 		uint32_t ends[16];
 		for (uint32_t i = 0; i < runs; i++) {
 			heads[i] = opaque_sort_runs[i].from;
 			ends[i] = heads[i] + opaque_sort_runs[i].count;
 		}
-		const RenderList::SortByKey less;
-		opaque_merge_buffer.resize(opaque_count);
+		const RenderList::SortKeyElementLess less;
+		const RenderList::SortKeyElement *keys = opaque_sort_keys.ptr();
+		opaque_merge_keys.resize(opaque_count);
 		for (uint32_t out = 0; out < opaque_count; out++) {
 			int best = -1;
 			for (uint32_t i = 0; i < runs; i++) {
-				if (heads[i] < ends[i] && (best < 0 || less(elements[heads[i]], elements[heads[best]]))) {
+				if (heads[i] < ends[i] && (best < 0 || less(keys[heads[i]], keys[heads[best]]))) {
 					best = int(i);
 				}
 			}
-			opaque_merge_buffer[out] = elements[heads[best]++];
+			opaque_merge_keys[out] = keys[heads[best]++];
 		}
-		memcpy(elements, opaque_merge_buffer.ptr(), sizeof(GeometryInstanceSurfaceDataCache *) * opaque_count);
+		GeometryInstanceSurfaceDataCache **elements = render_list[RENDER_LIST_OPAQUE].elements.ptr();
+		for (uint32_t i = 0; i < opaque_count; i++) {
+			elements[i] = opaque_merge_keys[i].surface;
+		}
 	}
 
 	for (RenderListType list : main_lists) {
@@ -4349,13 +4353,50 @@ void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
 void RenderForwardClustered::_sort_render_lists_part(uint32_t p_part) {
 	const uint32_t runs = opaque_sort_runs.size();
 	if (p_part < runs) {
-		render_list[RENDER_LIST_OPAQUE].sort_by_key_range(opaque_sort_runs[p_part].from, opaque_sort_runs[p_part].count);
+		const OpaqueSortRun &run = opaque_sort_runs[p_part];
+		RenderList::SortKeyElement *keys = opaque_sort_keys.ptr() + run.from;
+		RenderList::fill_sort_keys(render_list[RENDER_LIST_OPAQUE].elements.ptr() + run.from, run.count, keys);
+		SortArray<RenderList::SortKeyElement, RenderList::SortKeyElementLess> sorter;
+		sorter.sort(keys, run.count);
 	} else if (p_part == runs) {
 		if (!main_sort_reused[RENDER_LIST_MOTION]) {
 			render_list[RENDER_LIST_MOTION].sort_by_key();
 		}
 	} else if (!main_sort_reused[RENDER_LIST_ALPHA]) {
 		render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
+	}
+}
+
+void RenderForwardClustered::RenderList::fill_sort_keys(GeometryInstanceSurfaceDataCache *const *p_elements, uint32_t p_count, SortKeyElement *r_keys) {
+	for (uint32_t i = 0; i < p_count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = p_elements[i];
+		r_keys[i] = { surface->sort.sort_key2, surface->sort.sort_key1, surface };
+	}
+}
+
+void RenderForwardClustered::RenderList::sort_by_key_range(uint32_t p_from, uint32_t p_size) {
+	thread_local LocalVector<SortKeyElement> keys;
+	keys.resize(p_size);
+	fill_sort_keys(elements.ptr() + p_from, p_size, keys.ptr());
+	SortArray<SortKeyElement, SortKeyElementLess> sorter;
+	sorter.sort(keys.ptr(), p_size);
+	for (uint32_t i = 0; i < p_size; i++) {
+		elements[p_from + i] = keys[i].surface;
+	}
+}
+
+void RenderForwardClustered::RenderList::sort_by_reverse_depth_and_priority() {
+	thread_local LocalVector<SortDepthElement> keys;
+	const uint32_t count = elements.size();
+	keys.resize(count);
+	for (uint32_t i = 0; i < count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = elements[i];
+		keys[i] = { uint32_t(surface->sort.priority), surface->owner->depth, surface };
+	}
+	SortArray<SortDepthElement, SortDepthElementLess> sorter;
+	sorter.sort(keys.ptr(), count);
+	for (uint32_t i = 0; i < count; i++) {
+		elements[i] = keys[i].surface;
 	}
 }
 

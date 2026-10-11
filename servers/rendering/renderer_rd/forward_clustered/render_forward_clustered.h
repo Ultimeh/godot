@@ -1081,8 +1081,9 @@ protected:
 			element_info.clear();
 		}
 
-		//should eventually be replaced by radix
-
+		// The order of the lists. The sorts below give the same order but compare copies of the keys
+		// (SortKeyElement, SortDepthElement), read once per element: comparing through the pointers reads the surfaces
+		// again at every comparison, and they are spread in memory.
 		struct SortByKey {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
 				if (A->sort.sort_key2 == B->sort.sort_key2 && A->sort.sort_key1 == B->sort.sort_key1) {
@@ -1092,15 +1093,28 @@ protected:
 			}
 		};
 
+		struct SortKeyElement {
+			uint64_t sort_key2;
+			uint64_t sort_key1;
+			GeometryInstanceSurfaceDataCache *surface;
+		};
+
+		struct SortKeyElementLess {
+			_FORCE_INLINE_ bool operator()(const SortKeyElement &A, const SortKeyElement &B) const {
+				if (A.sort_key2 == B.sort_key2 && A.sort_key1 == B.sort_key1) {
+					return sort_ties_by_surface && A.surface < B.surface;
+				}
+				return (A.sort_key2 == B.sort_key2) ? (A.sort_key1 < B.sort_key1) : (A.sort_key2 < B.sort_key2);
+			}
+		};
+
+		static void fill_sort_keys(GeometryInstanceSurfaceDataCache *const *p_elements, uint32_t p_count, SortKeyElement *r_keys);
+
 		void sort_by_key() {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr(), elements.size());
+			sort_by_key_range(0, elements.size());
 		}
 
-		void sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr() + p_from, p_size);
-		}
+		void sort_by_key_range(uint32_t p_from, uint32_t p_size);
 
 		struct SortByDepth {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
@@ -1123,11 +1137,22 @@ protected:
 			}
 		};
 
-		void sort_by_reverse_depth_and_priority() { //used for alpha
+		struct SortDepthElement {
+			uint32_t priority;
+			float depth;
+			GeometryInstanceSurfaceDataCache *surface;
+		};
 
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByReverseDepthAndPriority> sorter;
-			sorter.sort(elements.ptr(), elements.size());
-		}
+		struct SortDepthElementLess {
+			_FORCE_INLINE_ bool operator()(const SortDepthElement &A, const SortDepthElement &B) const {
+				if (A.priority == B.priority && A.depth == B.depth) {
+					return sort_ties_by_surface && A.surface < B.surface;
+				}
+				return (A.priority == B.priority) ? (A.depth > B.depth) : (A.priority < B.priority);
+			}
+		};
+
+		void sort_by_reverse_depth_and_priority(); // Used for alpha.
 
 		_FORCE_INLINE_ void add_element(GeometryInstanceSurfaceDataCache *p_element) {
 			elements.push_back(p_element);
@@ -1190,7 +1215,8 @@ protected:
 	};
 	bool list_sort_parallel = true;
 	LocalVector<OpaqueSortRun> opaque_sort_runs;
-	LocalVector<GeometryInstanceSurfaceDataCache *> opaque_merge_buffer;
+	LocalVector<RenderList::SortKeyElement> opaque_sort_keys; // The runs, sorted in place, then merged.
+	LocalVector<RenderList::SortKeyElement> opaque_merge_keys;
 
 	bool main_sort_reused[RENDER_LIST_MAX] = {};
 
