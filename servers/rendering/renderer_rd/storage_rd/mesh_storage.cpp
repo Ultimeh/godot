@@ -1712,17 +1712,13 @@ void MeshStorage::_multimesh_enable_motion_vectors(MultiMesh *multimesh) {
 	multimesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MULTIMESH);
 }
 
-void MeshStorage::_multimesh_get_motion_vectors_offsets(RID p_multimesh, uint32_t &r_current_offset, uint32_t &r_prev_offset) {
-	MultiMesh *multimesh = multimesh_owner.get_or_null(p_multimesh);
-	ERR_FAIL_NULL(multimesh);
-	r_current_offset = multimesh->motion_vectors_current_offset;
-	r_prev_offset = _multimesh_uses_motion_vectors(multimesh) ? multimesh->motion_vectors_previous_offset : multimesh->motion_vectors_current_offset;
-}
-
-bool MeshStorage::_multimesh_uses_motion_vectors_offsets(RID p_multimesh) {
+bool MeshStorage::_multimesh_get_motion_vectors_offsets(RID p_multimesh, uint32_t &r_current_offset, uint32_t &r_prev_offset) {
 	MultiMesh *multimesh = multimesh_owner.get_or_null(p_multimesh);
 	ERR_FAIL_NULL_V(multimesh, false);
-	return _multimesh_uses_motion_vectors(multimesh);
+	const bool uses_motion_vectors = _multimesh_uses_motion_vectors(multimesh);
+	r_current_offset = multimesh->motion_vectors_current_offset;
+	r_prev_offset = uses_motion_vectors ? multimesh->motion_vectors_previous_offset : multimesh->motion_vectors_current_offset;
+	return uses_motion_vectors;
 }
 
 int MeshStorage::_multimesh_get_instance_count(RID p_multimesh) const {

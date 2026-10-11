@@ -723,6 +723,7 @@ protected:
 		Plane near_plane;
 		float z_max = 0.0;
 		uint32_t max_lightmap_captures = 0; // Per chunk: the merge checks the total.
+		uint64_t frame = 0;
 	} fill_render_list_params;
 
 	LocalVector<FillRenderListChunk> fill_render_list_chunks;
@@ -858,6 +859,12 @@ protected:
 		uint32_t instance_count = 0;
 		uint32_t trail_steps = 1;
 		bool can_sdfgi = false;
+		// A MultiMesh's motion vector offsets for this frame: looked up by the first list fill of the frame that meets the
+		// instance, read by the other fills and by every draw.
+		uint64_t multimesh_motion_frame = UINT64_MAX;
+		uint32_t multimesh_motion_current_offset = 0;
+		uint32_t multimesh_motion_previous_offset = 0;
+		bool multimesh_uses_motion = false;
 		bool using_projectors = false;
 		bool using_softshadows = false;
 
