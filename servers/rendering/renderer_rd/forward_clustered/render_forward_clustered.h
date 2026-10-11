@@ -721,23 +721,26 @@ protected:
 			element_info.clear();
 		}
 
-		//should eventually be replaced by radix
+		// The sorts compare copies of the keys (SortKeyElement, SortDepthElement), read once per element: comparing through
+		// the pointers reads the surfaces again at every comparison, and they are spread in memory. The comparisons are
+		// those of sorting the pointers, so the order is the same.
+		struct SortKeyElement {
+			uint64_t sort_key2;
+			uint64_t sort_key1;
+			GeometryInstanceSurfaceDataCache *surface;
+		};
 
-		struct SortByKey {
-			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
-				return (A->sort.sort_key2 == B->sort.sort_key2) ? (A->sort.sort_key1 < B->sort.sort_key1) : (A->sort.sort_key2 < B->sort.sort_key2);
+		struct SortKeyElementLess {
+			_FORCE_INLINE_ bool operator()(const SortKeyElement &A, const SortKeyElement &B) const {
+				return (A.sort_key2 == B.sort_key2) ? (A.sort_key1 < B.sort_key1) : (A.sort_key2 < B.sort_key2);
 			}
 		};
 
 		void sort_by_key() {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr(), elements.size());
+			sort_by_key_range(0, elements.size());
 		}
 
-		void sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr() + p_from, p_size);
-		}
+		void sort_by_key_range(uint32_t p_from, uint32_t p_size);
 
 		struct SortByDepth {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
@@ -751,17 +754,19 @@ protected:
 			sorter.sort(elements.ptr(), elements.size());
 		}
 
-		struct SortByReverseDepthAndPriority {
-			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
-				return (A->sort.priority == B->sort.priority) ? (A->owner->depth > B->owner->depth) : (A->sort.priority < B->sort.priority);
+		struct SortDepthElement {
+			uint32_t priority;
+			float depth;
+			GeometryInstanceSurfaceDataCache *surface;
+		};
+
+		struct SortDepthElementLess {
+			_FORCE_INLINE_ bool operator()(const SortDepthElement &A, const SortDepthElement &B) const {
+				return (A.priority == B.priority) ? (A.depth > B.depth) : (A.priority < B.priority);
 			}
 		};
 
-		void sort_by_reverse_depth_and_priority() { //used for alpha
-
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByReverseDepthAndPriority> sorter;
-			sorter.sort(elements.ptr(), elements.size());
-		}
+		void sort_by_reverse_depth_and_priority(); // Used for alpha.
 
 		_FORCE_INLINE_ void add_element(GeometryInstanceSurfaceDataCache *p_element) {
 			elements.push_back(p_element);

@@ -1244,6 +1244,35 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 	}
 }
 
+void RenderForwardClustered::RenderList::sort_by_key_range(uint32_t p_from, uint32_t p_size) {
+	thread_local LocalVector<SortKeyElement> keys;
+	keys.resize(p_size);
+	for (uint32_t i = 0; i < p_size; i++) {
+		GeometryInstanceSurfaceDataCache *surface = elements[p_from + i];
+		keys[i] = { surface->sort.sort_key2, surface->sort.sort_key1, surface };
+	}
+	SortArray<SortKeyElement, SortKeyElementLess> sorter;
+	sorter.sort(keys.ptr(), p_size);
+	for (uint32_t i = 0; i < p_size; i++) {
+		elements[p_from + i] = keys[i].surface;
+	}
+}
+
+void RenderForwardClustered::RenderList::sort_by_reverse_depth_and_priority() {
+	thread_local LocalVector<SortDepthElement> keys;
+	const uint32_t count = elements.size();
+	keys.resize(count);
+	for (uint32_t i = 0; i < count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = elements[i];
+		keys[i] = { uint32_t(surface->sort.priority), surface->owner->depth, surface };
+	}
+	SortArray<SortDepthElement, SortDepthElementLess> sorter;
+	sorter.sort(keys.ptr(), count);
+	for (uint32_t i = 0; i < count; i++) {
+		elements[i] = keys[i].surface;
+	}
+}
+
 void RenderForwardClustered::_setup_voxelgis(const PagedArray<RID> &p_voxelgis) {
 	scene_state.voxelgis_used = MIN(p_voxelgis.size(), uint32_t(MAX_VOXEL_GI_INSTANCESS));
 	for (uint32_t i = 0; i < scene_state.voxelgis_used; i++) {
