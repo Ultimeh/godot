@@ -194,6 +194,8 @@ private:
 
 	Buffer *_get_buffer_from_owner(RID p_buffer);
 	Error _buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data, uint32_t p_required_align = 32);
+	RDD::BufferID _buffer_get_data_record(Buffer *p_buffer, uint32_t p_offset, uint32_t p_size);
+	Vector<uint8_t> _buffer_get_data_read(RDD::BufferID p_tmp_buffer, uint32_t p_size);
 
 	void update_perf_report();
 	// Flag for batching descriptor sets.
@@ -268,6 +270,7 @@ public:
 	Error buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data, bool p_skip_check = false);
 	Error buffer_clear(RID p_buffer, uint32_t p_offset, uint32_t p_size);
 	Vector<uint8_t> buffer_get_data(RID p_buffer, uint32_t p_offset = 0, uint32_t p_size = 0); // This causes stall, only use to retrieve large buffers for saving.
+	Vector<Vector<uint8_t>> buffers_get_data(Span<RID> p_buffers); // Whole buffers, one stall for all of them. A null RID gives an empty array.
 	Error buffer_get_data_async(RID p_buffer, const Callable &p_callback, uint32_t p_offset = 0, uint32_t p_size = 0);
 	uint64_t buffer_get_device_address(RID p_buffer);
 	uint8_t *buffer_persistent_map_advance(RID p_buffer);

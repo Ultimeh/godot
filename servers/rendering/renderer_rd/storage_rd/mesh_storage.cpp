@@ -700,43 +700,39 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 
 	Mesh::Surface &s = *mesh->surfaces[p_surface];
 
+	// Every buffer of the surface is read back with a single stall.
+	LocalVector<RID> buffers = { s.vertex_buffer, s.attribute_buffer, s.skin_buffer, s.index_count ? s.index_buffer : RID(), s.blend_shape_buffer };
+	for (uint32_t i = 0; i < s.lod_count; i++) {
+		buffers.push_back(s.lods[i].index_buffer);
+	}
+	const Vector<Vector<uint8_t>> data = RD::get_singleton()->buffers_get_data(buffers);
+	ERR_FAIL_COND_V(data.size() != int(buffers.size()), RenderingServerTypes::SurfaceData());
+
 	RenderingServerTypes::SurfaceData sd;
 	sd.format = s.format;
-	if (s.vertex_buffer.is_valid()) {
-		sd.vertex_data = RD::get_singleton()->buffer_get_data(s.vertex_buffer);
-		// When using an uncompressed buffer with normals, but without tangents, we have to trim the padding.
-		if (!(s.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) && (s.format & RSE::ARRAY_FORMAT_NORMAL) && !(s.format & RSE::ARRAY_FORMAT_TANGENT)) {
-			sd.vertex_data.resize(sd.vertex_data.size() - sizeof(uint16_t) * 2);
-		}
+	sd.vertex_data = data[0];
+	// When using an uncompressed buffer with normals, but without tangents, we have to trim the padding.
+	if (!sd.vertex_data.is_empty() && !(s.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) && (s.format & RSE::ARRAY_FORMAT_NORMAL) && !(s.format & RSE::ARRAY_FORMAT_TANGENT)) {
+		sd.vertex_data.resize(sd.vertex_data.size() - sizeof(uint16_t) * 2);
 	}
-	if (s.attribute_buffer.is_valid()) {
-		sd.attribute_data = RD::get_singleton()->buffer_get_data(s.attribute_buffer);
-	}
-	if (s.skin_buffer.is_valid()) {
-		sd.skin_data = RD::get_singleton()->buffer_get_data(s.skin_buffer);
-	}
+	sd.attribute_data = data[1];
+	sd.skin_data = data[2];
 	sd.vertex_count = s.vertex_count;
 	sd.index_count = s.index_count;
 	sd.primitive = s.primitive;
-
-	if (sd.index_count) {
-		sd.index_data = RD::get_singleton()->buffer_get_data(s.index_buffer);
-	}
+	sd.index_data = data[3];
 	sd.aabb = s.aabb;
 	sd.uv_scale = s.uv_scale;
 	for (uint32_t i = 0; i < s.lod_count; i++) {
 		RenderingServerTypes::SurfaceData::LOD lod;
 		lod.edge_length = s.lods[i].edge_length;
-		lod.index_data = RD::get_singleton()->buffer_get_data(s.lods[i].index_buffer);
+		lod.index_data = data[5 + i];
 		sd.lods.push_back(lod);
 	}
 
 	sd.bone_aabbs = s.bone_aabbs;
 	sd.mesh_to_skeleton_xform = s.mesh_to_skeleton_xform;
-
-	if (s.blend_shape_buffer.is_valid()) {
-		sd.blend_shape_data = RD::get_singleton()->buffer_get_data(s.blend_shape_buffer);
-	}
+	sd.blend_shape_data = data[4];
 
 	return sd;
 }
