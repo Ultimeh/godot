@@ -358,6 +358,16 @@ protected:
 		uint64_t shadow_store_usec = 0;
 		uint64_t shadow_instance_usec = 0;
 		uint64_t shadow_runs_usec = 0;
+		// What skipping unchanged instances in the fill could save: fills of the main view and of shadow passes whose
+		// camera (transform, projection, LOD settings) is the one of their previous fill, and the filled instances that
+		// moved this frame.
+		struct FillChanges {
+			uint32_t fills = 0;
+			uint32_t camera_still = 0;
+			uint64_t instances = 0;
+			uint64_t moved = 0;
+		} fill_changes[2]; // Main view, shadow passes.
+		HashMap<uint64_t, uint32_t> fill_cameras; // By view or shadow pass: the camera of its previous fill.
 		uint64_t sort_usec = 0; // Sorting the main view's opaque, motion and alpha lists, either path.
 		uint32_t sorted_lists = 0; // Main lists and deferred shadow passes, and how many of them kept their last order.
 		uint32_t reused_lists = 0;

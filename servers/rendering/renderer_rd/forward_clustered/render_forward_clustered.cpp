@@ -812,6 +812,11 @@ uint32_t RenderForwardClustered::_render_list_get_split_count(const RenderListPa
 						st.fill_usec / 240.0, st.instance_data_usec / 240.0, st.parallel_builds / 240.0, st.shadow_usec / 240.0, st.shadow_builds / 240.0, st.shadow_passes / 240.0, st.reused_shadow_passes / 240.0, st.sorted_shadow_passes / 240.0, st.shadow_elements / 240.0, st.shadow_draw_calls / 240.0, st.sort_usec / 240.0, st.reused_lists / 240.0, st.sorted_lists / 240.0, (surface_caches_freed - st.surface_caches_freed) / 240.0));
 				print_line(vformat("Shadow build, per frame: copying the elements %.0f us, checking for kept orders %.0f us, sorting %.0f us, keeping the orders %.0f us, instance data %.0f us, instancing runs %.0f us.",
 						st.shadow_copy_usec / 240.0, st.shadow_check_usec / 240.0, st.shadow_sort_usec / 240.0, st.shadow_store_usec / 240.0, st.shadow_instance_usec / 240.0, st.shadow_runs_usec / 240.0));
+				for (int i = 0; i < 2; i++) {
+					const RenderListSplitStats::FillChanges &changes = st.fill_changes[i];
+					print_line(vformat("Fill, %s: %.1f fills per frame, camera unchanged since the previous one in %.0f %% of them; %.0f instances per fill, %.1f %% of them moved this frame.",
+							i == 0 ? "main view" : "shadow passes", changes.fills / 240.0, 100.0 * changes.camera_still / MAX(changes.fills, 1u), double(changes.instances) / MAX(changes.fills, 1u), 100.0 * changes.moved / MAX(changes.instances, uint64_t(1))));
+				}
 				print_line(vformat("Parallel runs, per frame: %.1f runs, %.1f helpers woken, %.0f parts, %.0f of them on the calling thread, %.0f us of parts in total, %.0f us of wall time.",
 						st.runs / 240.0, st.helpers_woken / 240.0, st.run_parts.get() / 240.0, st.run_parts_on_caller.get() / 240.0, st.run_parts_usec.get() / 240.0, st.run_usec / 240.0));
 				render_list_split_stats.~RenderListSplitStats();
@@ -1727,6 +1732,29 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 	if (render_list_split_stats.enabled) {
 		render_list_split_stats.fill_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
 		render_list_split_stats.parallel_builds += chunk_count > 1 ? 1 : 0;
+
+		const bool main_view = p_render_list == RENDER_LIST_OPAQUE && p_pass_mode == PASS_MODE_COLOR;
+		const bool shadow_pass = p_render_list == RENDER_LIST_SECONDARY && (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP || p_pass_mode == PASS_MODE_SHADOW_CUBE);
+		if (main_view || shadow_pass) {
+			const RenderSceneDataRD *scene_data = p_render_data->scene_data;
+			uint32_t camera = hash_murmur3_buffer(&scene_data->cam_transform, sizeof(Transform3D));
+			camera = hash_murmur3_buffer(&scene_data->cam_projection, sizeof(Projection), camera);
+			camera = hash_murmur3_buffer(&scene_data->main_cam_transform, sizeof(Transform3D), camera);
+			camera = hash_murmur3_one_float(scene_data->lod_distance_multiplier, camera);
+			camera = hash_murmur3_one_float(scene_data->screen_mesh_lod_threshold, camera);
+			const uint64_t key = shadow_pass ? shadow_append_list_key : hash_murmur3_one_64(uint64_t(uintptr_t(p_render_data->render_buffers.ptr())), hash_murmur3_one_64(p_render_data->reflection_probe.get_id(), uint32_t(p_render_data->reflection_probe_pass)));
+			RenderListSplitStats::FillChanges &changes = render_list_split_stats.fill_changes[shadow_pass ? 1 : 0];
+			const uint32_t *previous = render_list_split_stats.fill_cameras.getptr(key);
+			changes.fills++;
+			changes.camera_still += (previous && *previous == camera) ? 1 : 0;
+			render_list_split_stats.fill_cameras[key] = camera;
+			const uint64_t frame = RSG::rasterizer->get_frame_number();
+			for (uint32_t i = 0; i < instance_count; i++) {
+				const GeometryInstanceForwardClustered *inst = static_cast<const GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
+				changes.moved += inst->prev_transform_change_frame == frame ? 1 : 0;
+			}
+			changes.instances += instance_count;
+		}
 	}
 
 	if (p_render_list == RENDER_LIST_OPAQUE && lightmap_captures_used) {
