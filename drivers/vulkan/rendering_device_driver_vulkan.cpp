@@ -7144,12 +7144,10 @@ void RenderingDeviceDriverVulkan::command_insert_breadcrumb(CommandBufferID p_cm
 
 	// We write to a circular buffer. If you're getting barrier sync errors here,
 	// increase the value of BREADCRUMB_BUFFER_ENTRIES.
-	vkCmdFillBuffer(command_buffer->vk_command_buffer, ((BufferInfo *)breadcrumb_buffer.id)->vk_buffer, breadcrumb_offset, sizeof(uint32_t), breadcrumb_id++);
+	const uint32_t breadcrumb = breadcrumb_id.postincrement();
+	const VkDeviceSize breadcrumb_offset = (breadcrumb % BREADCRUMB_BUFFER_ENTRIES) * sizeof(uint32_t) * 2u;
+	vkCmdFillBuffer(command_buffer->vk_command_buffer, ((BufferInfo *)breadcrumb_buffer.id)->vk_buffer, breadcrumb_offset, sizeof(uint32_t), breadcrumb);
 	vkCmdFillBuffer(command_buffer->vk_command_buffer, ((BufferInfo *)breadcrumb_buffer.id)->vk_buffer, breadcrumb_offset + sizeof(uint32_t), sizeof(uint32_t), p_data);
-	breadcrumb_offset += sizeof(uint32_t) * 2u;
-	if (breadcrumb_offset >= BREADCRUMB_BUFFER_ENTRIES * sizeof(uint32_t) * 2u) {
-		breadcrumb_offset = 0u;
-	}
 #endif
 }
 
@@ -7261,7 +7259,8 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 	if (breadcrumb_ptr && map_result == VK_SUCCESS) {
 		uint32_t last_breadcrumb_offset = 0;
 		{
-			_err_print_error_asap("Searching last breadcrumb. We've sent up to ID: " + itos(breadcrumb_id - 1u));
+			const uint32_t breadcrumbs_sent = breadcrumb_id.get();
+			_err_print_error_asap("Searching last breadcrumb. We've sent up to ID: " + itos(breadcrumbs_sent - 1u));
 
 			// Scan the whole buffer to find the offset with the highest ID.
 			// That means that was the last one to be written.
@@ -7275,7 +7274,7 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 			const uint32_t *breadcrumb_ptr32 = reinterpret_cast<const uint32_t *>(breadcrumb_ptr);
 			for (size_t i = 0u; i < BREADCRUMB_BUFFER_ENTRIES; ++i) {
 				const uint32_t id = breadcrumb_ptr32[i * 2u];
-				const uint32_t id_diff = breadcrumb_id - id;
+				const uint32_t id_diff = breadcrumbs_sent - id;
 				if (id_diff < smallest_id_diff) {
 					biggest_id = i;
 					smallest_id_diff = id_diff;

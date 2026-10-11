@@ -8554,6 +8554,11 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 		GodotProfileZoneGrouped(_profile_zone, "driver->command_pool_reset");
 		bool reset = driver->command_pool_reset(frames[frame].command_pool);
 		ERR_FAIL_COND(!reset);
+		// The graph's parallel slices recorded this slot's other command buffers, each from a pool of its own.
+		for (RDD::CommandPoolID parallel_pool : frames[frame].command_buffer_pool.parallel_pools) {
+			reset = driver->command_pool_reset(parallel_pool);
+			ERR_FAIL_COND(!reset);
+		}
 	}
 
 	if (p_presented) {

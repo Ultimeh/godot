@@ -2326,14 +2326,15 @@ void RenderingDeviceGraph::initialize(RDD *p_driver, RenderPassCreationFunction 
 	driver_clears_with_copy_engine = driver->api_trait_get(RDD::API_TRAIT_CLEARS_WITH_COPY_ENGINE);
 	driver_buffers_require_transitions = driver->api_trait_get(RDD::API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS);
 
-	// The frame's commands are recorded in up to 6 command buffers at once (D3D12 with enhanced barriers only, Adreno
-	// workaround off); GODOT_PARALLEL_RECORDING=N changes that count, 0 or 1 records serially. GODOT_PARALLEL_RECORDING_MIN
+	// The frame's commands are recorded in up to 6 command buffers at once (D3D12 with enhanced barriers, Vulkan on
+	// desktop; Adreno workaround off); GODOT_PARALLEL_RECORDING=N changes that count, 0 or 1 records serially. GODOT_PARALLEL_RECORDING_MIN
 	// is the smallest frame worth splitting, in bytes of commands. GODOT_PARALLEL_RECORDING_STATS=1 prints the cost of
 	// end() every 240 frames.
 	const uint32_t DEFAULT_PARALLEL_SLICE_COUNT = 6;
 	command_queue_family = p_secondary_command_queue_family;
 	const String parallel_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_RECORDING");
-	if (driver->get_api_name() == "D3D12" && driver_honors_barriers && !driver_workarounds.avoid_compute_after_draw) {
+	const bool parallel_api = driver->get_api_name() == "D3D12" || (driver->get_api_name() == "Vulkan" && !OS::get_singleton()->has_feature("mobile"));
+	if (parallel_api && driver_honors_barriers && !driver_workarounds.avoid_compute_after_draw) {
 		parallel_slice_count = parallel_env.is_empty() ? DEFAULT_PARALLEL_SLICE_COUNT : CLAMP(parallel_env.to_int(), 0, 16);
 	}
 	const String parallel_min_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_RECORDING_MIN");
