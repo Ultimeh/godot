@@ -1389,34 +1389,76 @@ Vector<uint8_t> RenderingDevice::buffer_get_data(RID p_buffer, uint32_t p_offset
 				"Size is larger than the buffer.");
 	}
 
-	_check_transfer_worker_buffer(buffer);
-
-	RDD::BufferID tmp_buffer = driver->buffer_create(buffer->size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+	RDD::BufferID tmp_buffer = _buffer_get_data_record(buffer, p_offset, p_size);
 	ERR_FAIL_COND_V(!tmp_buffer, Vector<uint8_t>());
+
+	// Flush everything so memory can be safely mapped.
+	_flush_and_stall_for_all_frames(true, __func__);
+
+	return _buffer_get_data_read(tmp_buffer, p_size);
+}
+
+Vector<Vector<uint8_t>> RenderingDevice::buffers_get_data(Span<RID> p_buffers) {
+	ERR_RENDER_THREAD_GUARD_V(Vector<Vector<uint8_t>>());
+
+	LocalVector<RDD::BufferID> tmp_buffers;
+	LocalVector<uint32_t> sizes;
+	tmp_buffers.resize(p_buffers.size());
+	sizes.resize(p_buffers.size());
+	for (uint32_t i = 0; i < p_buffers.size(); i++) {
+		sizes[i] = 0;
+		if (p_buffers[i].is_null()) {
+			continue;
+		}
+		Buffer *buffer = _get_buffer_from_owner(p_buffers[i]);
+		if (!buffer) {
+			ERR_PRINT("Buffer is either invalid or this type of buffer can't be retrieved.");
+			continue;
+		}
+		tmp_buffers[i] = _buffer_get_data_record(buffer, 0, buffer->size);
+		if (tmp_buffers[i]) {
+			sizes[i] = buffer->size;
+		}
+	}
+
+	// One flush for all of them: each one is a full frame cycle.
+	_flush_and_stall_for_all_frames(true, __func__);
+
+	Vector<Vector<uint8_t>> buffer_data;
+	buffer_data.resize(p_buffers.size());
+	for (uint32_t i = 0; i < p_buffers.size(); i++) {
+		if (tmp_buffers[i]) {
+			buffer_data.write[i] = _buffer_get_data_read(tmp_buffers[i], sizes[i]);
+		}
+	}
+	return buffer_data;
+}
+
+RDD::BufferID RenderingDevice::_buffer_get_data_record(Buffer *p_buffer, uint32_t p_offset, uint32_t p_size) {
+	_check_transfer_worker_buffer(p_buffer);
+
+	RDD::BufferID tmp_buffer = driver->buffer_create(p_buffer->size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+	ERR_FAIL_COND_V(!tmp_buffer, RDD::BufferID());
 
 	RDD::BufferCopyRegion region;
 	region.src_offset = p_offset;
 	region.size = p_size;
 
-	draw_graph->add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, tmp_buffer, region);
+	draw_graph->add_buffer_get_data(p_buffer->driver_id, p_buffer->draw_tracker, tmp_buffer, region);
+	return tmp_buffer;
+}
 
-	// Flush everything so memory can be safely mapped.
-	_flush_and_stall_for_all_frames(true, __func__);
-
-	uint8_t *buffer_mem = driver->buffer_map(tmp_buffer);
-	ERR_FAIL_NULL_V(buffer_mem, Vector<uint8_t>());
-
+Vector<uint8_t> RenderingDevice::_buffer_get_data_read(RDD::BufferID p_tmp_buffer, uint32_t p_size) {
 	Vector<uint8_t> buffer_data;
-	{
+	uint8_t *buffer_mem = driver->buffer_map(p_tmp_buffer);
+	if (buffer_mem) {
 		buffer_data.resize(p_size);
-		uint8_t *w = buffer_data.ptrw();
-		memcpy(w, buffer_mem, p_size);
+		memcpy(buffer_data.ptrw(), buffer_mem, p_size);
+		driver->buffer_unmap(p_tmp_buffer);
+	} else {
+		ERR_PRINT("Failed to map the buffer read back from the GPU.");
 	}
-
-	driver->buffer_unmap(tmp_buffer);
-
-	driver->buffer_free(tmp_buffer);
-
+	driver->buffer_free(p_tmp_buffer);
 	return buffer_data;
 }
 
