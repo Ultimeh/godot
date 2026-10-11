@@ -371,8 +371,10 @@ protected:
 		uint64_t sort_usec = 0; // Sorting the main view's opaque, motion and alpha lists, either path.
 		uint32_t sorted_lists = 0; // Main lists and deferred shadow passes, and how many of them kept their last order.
 		uint32_t reused_lists = 0;
+		uint32_t merged_lists = 0;
 		uint32_t sorted_shadow_passes = 0;
 		uint32_t reused_shadow_passes = 0;
+		uint32_t merged_shadow_passes = 0;
 		uint64_t surface_caches_freed = 0; // surface_caches_freed when these statistics started.
 		uint32_t shadow_parallel_passes = 0; // Shadow passes recorded together ahead of their draw lists, and the time it took.
 		uint64_t shadow_parallel_usec = 0;
@@ -1228,14 +1230,16 @@ protected:
 	LocalVector<RenderList::SortKeyElement> opaque_sort_keys; // The runs, sorted in place, then merged.
 	LocalVector<RenderList::SortKeyElement> opaque_merge_keys;
 
-	bool main_sort_reused[RENDER_LIST_MAX] = {};
+	uint8_t main_sort_reused[RENDER_LIST_MAX] = {}; // SortReuseResult.
 
 	void _sort_render_lists(uint64_t p_view_key);
 	void _sort_render_lists_part(uint32_t p_part);
 
 	// Each sorted list keeps the order it had the last time it was sorted (main lists by view, shadow passes by light
 	// and pass). When it holds the same surfaces with the same sort inputs, that order is what sorting would give: every
-	// comparison breaks ties by surface, so there is only one. GODOT_SORT_REUSE=0 sorts every list again.
+	// comparison breaks ties by surface, so there is only one. When some elements are new or have other inputs, the
+	// others keep their kept order (a subsequence of a sorted list), the new ones are sorted apart and both are merged.
+	// GODOT_SORT_REUSE=0 sorts every list again.
 	// A kept order is forgotten when its list is not sorted for a frame, and a freed surface cache stays allocated two
 	// frames (retired_surface_caches): every kept order then points to allocated surfaces, which a check may mark, and
 	// a freed surface's address cannot come back as another surface while an order still holds it.
@@ -1249,6 +1253,11 @@ protected:
 		LocalVector<SortReuseEntry> entries;
 		uint64_t frame = 0;
 	};
+	enum SortReuseResult : uint8_t {
+		SORT_REUSE_NONE, // Sorted from scratch.
+		SORT_REUSE_WHOLE, // The kept order as it was.
+		SORT_REUSE_MERGED, // The kept order of the elements that kept their inputs, merged with the others sorted apart.
+	};
 	struct SortReuse {
 		bool enabled = true;
 #ifdef DEBUG_ENABLED
@@ -1258,8 +1267,11 @@ protected:
 		uint64_t frame = 0;
 		HashMap<uint64_t, SortReuseList> lists;
 		LocalVector<GeometryInstanceSurfaceDataCache *> scratch;
+		LocalVector<GeometryInstanceSurfaceDataCache *> fresh;
 		LocalVector<ShadowElement> shadow_scratch;
-		LocalVector<uint8_t> shadow_pass_reused;
+		LocalVector<ShadowElement> shadow_fresh;
+		LocalVector<uint8_t> kept; // Per kept element: still in the list with the same inputs.
+		LocalVector<uint8_t> shadow_pass_reused; // SortReuseResult.
 	} sort_reuse;
 
 	struct RetiredSurfaceCache {
@@ -1278,7 +1290,9 @@ protected:
 	static SortReuseEntry _sort_reuse_entry(const ShadowElement &p_element, bool p_depth);
 	SortReuseList *_sort_reuse_list(uint64_t p_key);
 	template <typename T>
-	bool _sort_reuse_apply(uint64_t p_key, T *p_elements, uint32_t p_count, bool p_depth, LocalVector<T> &r_scratch);
+	SortReuseResult _sort_reuse_apply(uint64_t p_key, T *p_elements, uint32_t p_count, bool p_depth, LocalVector<T> &r_scratch, LocalVector<T> &r_fresh);
+	static void _sort_reuse_merge(GeometryInstanceSurfaceDataCache **r_elements, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_kept, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_fresh, bool p_depth);
+	static void _sort_reuse_merge(ShadowElement *r_elements, const LocalVector<ShadowElement> &p_kept, LocalVector<ShadowElement> &p_fresh, bool p_depth);
 	template <typename T>
 	void _sort_reuse_store(uint64_t p_key, const T *p_elements, uint32_t p_count, bool p_depth);
 #ifdef DEBUG_ENABLED

@@ -808,8 +808,8 @@ uint32_t RenderForwardClustered::_render_list_get_split_count(const RenderListPa
 				const RenderListSplitStats &st = render_list_split_stats;
 				print_line(vformat("Parallel draw lists, per frame: %.1f lists split in %.1f parts (%.0f elements, %.0f us, of which waiting %.0f us, joining %.0f us; parts %.0f us in total, last part started after %.0f us), %.1f shadow passes recorded together (%.0f us), %.1f lists recorded serially (%.0f elements, %.0f us).",
 						st.split_lists / 240.0, st.splits / 240.0, st.split_elements / 240.0, st.split_usec / 240.0, st.split_wait_usec / 240.0, st.split_join_usec / 240.0, st.split_parts_usec / 240.0, st.split_start_usec / 240.0, st.shadow_parallel_passes / 240.0, st.shadow_parallel_usec / 240.0, st.serial_lists / 240.0, st.serial_elements / 240.0, st.serial_usec / 240.0));
-				print_line(vformat("List building, per frame: filling %.0f us, instance data %.0f us, %.1f of them on several threads; shadow sort + instance data %.0f us (%.1f deferred builds of %.1f passes, %.1f of %.1f non-empty ones in their last order, %.0f elements, %.0f draw calls); main lists sort %.0f us (%.1f of %.1f non-empty lists in their last order); %.1f surface caches freed.",
-						st.fill_usec / 240.0, st.instance_data_usec / 240.0, st.parallel_builds / 240.0, st.shadow_usec / 240.0, st.shadow_builds / 240.0, st.shadow_passes / 240.0, st.reused_shadow_passes / 240.0, st.sorted_shadow_passes / 240.0, st.shadow_elements / 240.0, st.shadow_draw_calls / 240.0, st.sort_usec / 240.0, st.reused_lists / 240.0, st.sorted_lists / 240.0, (surface_caches_freed - st.surface_caches_freed) / 240.0));
+				print_line(vformat("List building, per frame: filling %.0f us, instance data %.0f us, %.1f of them on several threads; shadow sort + instance data %.0f us (%.1f deferred builds of %.1f passes, %.1f of %.1f non-empty ones in their last order and %.1f merged, %.0f elements, %.0f draw calls); main lists sort %.0f us (%.1f of %.1f non-empty lists in their last order, %.1f merged); %.1f surface caches freed.",
+						st.fill_usec / 240.0, st.instance_data_usec / 240.0, st.parallel_builds / 240.0, st.shadow_usec / 240.0, st.shadow_builds / 240.0, st.shadow_passes / 240.0, st.reused_shadow_passes / 240.0, st.sorted_shadow_passes / 240.0, st.merged_shadow_passes / 240.0, st.shadow_elements / 240.0, st.shadow_draw_calls / 240.0, st.sort_usec / 240.0, st.reused_lists / 240.0, st.sorted_lists / 240.0, st.merged_lists / 240.0, (surface_caches_freed - st.surface_caches_freed) / 240.0));
 				print_line(vformat("Shadow build, per frame: copying the elements %.0f us, checking for kept orders %.0f us, sorting %.0f us, keeping the orders %.0f us, instance data %.0f us, instancing runs %.0f us.",
 						st.shadow_copy_usec / 240.0, st.shadow_check_usec / 240.0, st.shadow_sort_usec / 240.0, st.shadow_store_usec / 240.0, st.shadow_instance_usec / 240.0, st.shadow_runs_usec / 240.0));
 				for (int i = 0; i < 2; i++) {
@@ -4039,7 +4039,7 @@ void RenderForwardClustered::_render_shadow_build() {
 	sort_reuse.shadow_pass_reused.resize(pass_count);
 	for (uint32_t i = 0; i < pass_count; i++) {
 		const SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[i];
-		sort_reuse.shadow_pass_reused[i] = sort_reuse.enabled && _sort_reuse_apply(shadow_pass.list_key, shadow_elements.ptr() + shadow_pass.element_from, shadow_pass.element_count, false, sort_reuse.shadow_scratch);
+		sort_reuse.shadow_pass_reused[i] = sort_reuse.enabled ? _sort_reuse_apply(shadow_pass.list_key, shadow_elements.ptr() + shadow_pass.element_from, shadow_pass.element_count, false, sort_reuse.shadow_scratch, sort_reuse.shadow_fresh) : SORT_REUSE_NONE;
 	}
 	step_done(render_list_split_stats.shadow_check_usec);
 	bool merges = false;
@@ -4110,7 +4110,7 @@ void RenderForwardClustered::_render_shadow_build() {
 	for (uint32_t i = 0; i < pass_count; i++) {
 		const SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[i];
 		const ShadowElement *elements = shadow_elements.ptr() + shadow_pass.element_from;
-		if (sort_reuse.enabled && !sort_reuse.shadow_pass_reused[i]) {
+		if (sort_reuse.enabled && sort_reuse.shadow_pass_reused[i] != SORT_REUSE_WHOLE) {
 			_sort_reuse_store(shadow_pass.list_key, elements, shadow_pass.element_count, false);
 		}
 #ifdef DEBUG_ENABLED
@@ -4120,7 +4120,8 @@ void RenderForwardClustered::_render_shadow_build() {
 #endif
 		if (render_list_split_stats.enabled && shadow_pass.element_count > 0u) {
 			render_list_split_stats.sorted_shadow_passes++;
-			render_list_split_stats.reused_shadow_passes += sort_reuse.shadow_pass_reused[i] ? 1 : 0;
+			render_list_split_stats.reused_shadow_passes += sort_reuse.shadow_pass_reused[i] == SORT_REUSE_WHOLE ? 1 : 0;
+			render_list_split_stats.merged_shadow_passes += sort_reuse.shadow_pass_reused[i] == SORT_REUSE_MERGED ? 1 : 0;
 		}
 	}
 
@@ -4299,7 +4300,7 @@ void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
 	for (RenderListType list : main_lists) {
 		RenderList &rl = render_list[list];
 		// Alpha lists are sorted by depth.
-		main_sort_reused[list] = sort_reuse.enabled && _sort_reuse_apply(hash_murmur3_one_64(p_view_key, uint32_t(list)), rl.elements.ptr(), rl.elements.size(), list == RENDER_LIST_ALPHA, sort_reuse.scratch);
+		main_sort_reused[list] = sort_reuse.enabled ? _sort_reuse_apply(hash_murmur3_one_64(p_view_key, uint32_t(list)), rl.elements.ptr(), rl.elements.size(), list == RENDER_LIST_ALPHA, sort_reuse.scratch, sort_reuse.fresh) : SORT_REUSE_NONE;
 	}
 
 	const uint32_t opaque_count = render_list[RENDER_LIST_OPAQUE].elements.size();
@@ -4355,7 +4356,7 @@ void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
 
 	for (RenderListType list : main_lists) {
 		const RenderList &rl = render_list[list];
-		if (sort_reuse.enabled && !main_sort_reused[list]) {
+		if (sort_reuse.enabled && main_sort_reused[list] != SORT_REUSE_WHOLE) {
 			_sort_reuse_store(hash_murmur3_one_64(p_view_key, uint32_t(list)), rl.elements.ptr(), rl.elements.size(), list == RENDER_LIST_ALPHA);
 		}
 #ifdef DEBUG_ENABLED
@@ -4369,7 +4370,8 @@ void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
 #endif
 		if (render_list_split_stats.enabled && !rl.elements.is_empty()) {
 			render_list_split_stats.sorted_lists++;
-			render_list_split_stats.reused_lists += main_sort_reused[list] ? 1 : 0;
+			render_list_split_stats.reused_lists += main_sort_reused[list] == SORT_REUSE_WHOLE ? 1 : 0;
+			render_list_split_stats.merged_lists += main_sort_reused[list] == SORT_REUSE_MERGED ? 1 : 0;
 		}
 	}
 
@@ -4487,38 +4489,125 @@ void RenderForwardClustered::_sort_reuse_begin_frame() {
 }
 
 template <typename T>
-bool RenderForwardClustered::_sort_reuse_apply(uint64_t p_key, T *p_elements, uint32_t p_count, bool p_depth, LocalVector<T> &r_scratch) {
+RenderForwardClustered::SortReuseResult RenderForwardClustered::_sort_reuse_apply(uint64_t p_key, T *p_elements, uint32_t p_count, bool p_depth, LocalVector<T> &r_scratch, LocalVector<T> &r_fresh) {
 	SortReuseList *list = _sort_reuse_list(p_key);
-	if (!list || list->entries.size() != p_count || p_count == 0u) {
-		return false;
+	if (!list || list->entries.is_empty() || p_count == 0u) {
+		return SORT_REUSE_NONE;
 	}
 	// The kept surfaces are all allocated, even those freed since: each can be marked with its place.
+	const uint32_t kept_count = list->entries.size();
 	sort_reuse.mark = sort_reuse.mark == UINT32_MAX ? 1u : sort_reuse.mark + 1u;
 	const uint32_t mark = sort_reuse.mark;
-	for (uint32_t i = 0; i < p_count; i++) {
+	for (uint32_t i = 0; i < kept_count; i++) {
 		GeometryInstanceSurfaceDataCache *surface = const_cast<GeometryInstanceSurfaceDataCache *>(list->entries[i].surface);
 		surface->sort_reuse_mark = mark;
 		surface->sort_reuse_index = i;
 	}
-	r_scratch.resize(p_count);
+	r_scratch.resize(kept_count);
+	sort_reuse.kept.resize(kept_count);
+	memset(sort_reuse.kept.ptr(), 0, kept_count);
+	r_fresh.clear();
 	for (uint32_t i = 0; i < p_count; i++) {
 		GeometryInstanceSurfaceDataCache *surface = _sort_reuse_surface(p_elements[i]);
-		if (surface->sort_reuse_mark != mark) {
-			return false; // Not in the kept order, or a second time.
+		if (surface->sort_reuse_mark == mark) {
+			const uint32_t index = surface->sort_reuse_index;
+			const SortReuseEntry &kept = list->entries[index];
+			const SortReuseEntry current = _sort_reuse_entry(p_elements[i], p_depth);
+			if (kept.surface == current.surface && kept.sort_key1 == current.sort_key1 && kept.sort_key2 == current.sort_key2 && kept.extra == current.extra) {
+				surface->sort_reuse_mark = 0;
+				r_scratch[index] = p_elements[i];
+				sort_reuse.kept[index] = 1;
+				continue;
+			}
 		}
-		const SortReuseEntry &kept = list->entries[surface->sort_reuse_index];
-		const SortReuseEntry current = _sort_reuse_entry(p_elements[i], p_depth);
-		if (kept.surface != current.surface || kept.sort_key1 != current.sort_key1 || kept.sort_key2 != current.sort_key2 || kept.extra != current.extra) {
-			return false;
+		// New to the list, a second time, or with other inputs: sorted apart. When that is most of the list, a full sort
+		// costs less.
+		if ((r_fresh.size() + 1u) * 2u > p_count) {
+			return SORT_REUSE_NONE;
 		}
-		surface->sort_reuse_mark = 0;
-		r_scratch[surface->sort_reuse_index] = p_elements[i];
-	}
-	for (uint32_t i = 0; i < p_count; i++) {
-		p_elements[i] = r_scratch[i];
+		r_fresh.push_back(p_elements[i]);
 	}
 	list->frame = sort_reuse.frame;
-	return true;
+
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < kept_count; i++) {
+		if (sort_reuse.kept[i]) {
+			r_scratch[kept++] = r_scratch[i];
+		}
+	}
+	r_scratch.resize(kept);
+	if (r_fresh.is_empty()) {
+		for (uint32_t i = 0; i < kept; i++) {
+			p_elements[i] = r_scratch[i];
+		}
+		return kept == kept_count ? SORT_REUSE_WHOLE : SORT_REUSE_MERGED;
+	}
+	_sort_reuse_merge(p_elements, r_scratch, r_fresh, p_depth);
+	return SORT_REUSE_MERGED;
+}
+
+// Merges two sorted sequences, ties to the first one.
+template <typename S, typename Less>
+static void _merge_sorted(const S *p_a, uint32_t p_a_count, const S *p_b, uint32_t p_b_count, S *r_out) {
+	const Less less;
+	uint32_t a = 0;
+	uint32_t b = 0;
+	uint32_t out = 0;
+	while (a < p_a_count && b < p_b_count) {
+		r_out[out++] = less(p_b[b], p_a[a]) ? p_b[b++] : p_a[a++];
+	}
+	while (a < p_a_count) {
+		r_out[out++] = p_a[a++];
+	}
+	while (b < p_b_count) {
+		r_out[out++] = p_b[b++];
+	}
+}
+
+void RenderForwardClustered::_sort_reuse_merge(GeometryInstanceSurfaceDataCache **r_elements, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_kept, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_fresh, bool p_depth) {
+	const uint32_t kept_count = p_kept.size();
+	const uint32_t fresh_count = p_fresh.size();
+	if (p_depth) {
+		thread_local LocalVector<RenderList::SortDepthElement> keys;
+		keys.resize(kept_count + fresh_count);
+		RenderList::SortDepthElement *kept = keys.ptr();
+		RenderList::SortDepthElement *fresh = kept + kept_count;
+		for (uint32_t i = 0; i < kept_count; i++) {
+			kept[i] = { uint32_t(p_kept[i]->sort.priority), p_kept[i]->owner->depth, p_kept[i] };
+		}
+		for (uint32_t i = 0; i < fresh_count; i++) {
+			fresh[i] = { uint32_t(p_fresh[i]->sort.priority), p_fresh[i]->owner->depth, p_fresh[i] };
+		}
+		SortArray<RenderList::SortDepthElement, RenderList::SortDepthElementLess> sorter;
+		sorter.sort(fresh, fresh_count);
+		thread_local LocalVector<RenderList::SortDepthElement> out;
+		out.resize(kept_count + fresh_count);
+		_merge_sorted<RenderList::SortDepthElement, RenderList::SortDepthElementLess>(kept, kept_count, fresh, fresh_count, out.ptr());
+		for (uint32_t i = 0; i < kept_count + fresh_count; i++) {
+			r_elements[i] = out[i].surface;
+		}
+	} else {
+		thread_local LocalVector<RenderList::SortKeyElement> keys;
+		keys.resize(kept_count + fresh_count);
+		RenderList::SortKeyElement *kept = keys.ptr();
+		RenderList::SortKeyElement *fresh = kept + kept_count;
+		RenderList::fill_sort_keys(p_kept.ptr(), kept_count, kept);
+		RenderList::fill_sort_keys(p_fresh.ptr(), fresh_count, fresh);
+		SortArray<RenderList::SortKeyElement, RenderList::SortKeyElementLess> sorter;
+		sorter.sort(fresh, fresh_count);
+		thread_local LocalVector<RenderList::SortKeyElement> out;
+		out.resize(kept_count + fresh_count);
+		_merge_sorted<RenderList::SortKeyElement, RenderList::SortKeyElementLess>(kept, kept_count, fresh, fresh_count, out.ptr());
+		for (uint32_t i = 0; i < kept_count + fresh_count; i++) {
+			r_elements[i] = out[i].surface;
+		}
+	}
+}
+
+void RenderForwardClustered::_sort_reuse_merge(ShadowElement *r_elements, const LocalVector<ShadowElement> &p_kept, LocalVector<ShadowElement> &p_fresh, bool) {
+	SortArray<ShadowElement, ShadowElementByKey> sorter;
+	sorter.sort(p_fresh.ptr(), p_fresh.size());
+	_merge_sorted<ShadowElement, ShadowElementByKey>(p_kept.ptr(), p_kept.size(), p_fresh.ptr(), p_fresh.size(), r_elements);
 }
 
 template <typename T>
