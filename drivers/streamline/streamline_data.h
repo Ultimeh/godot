@@ -37,7 +37,7 @@ enum StreamlineMarkerType {
 	STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY,
 	STREAMLINE_MARKER_AFTER_DEVICE_CREATION,
 	STREAMLINE_MARKER_MODIFY_SWAPCHAIN,
-	STREAMLINE_MARKER_BEFORE_SWAPCHAIN_CREATION, // D3D12: loads or unloads DLSS-G for the next swap chain.
+	STREAMLINE_MARKER_BEFORE_SWAPCHAIN_CREATION, // D3D12: loads/unloads DLSS-G, Reflex, PCL for the next swap chain.
 	STREAMLINE_MARKER_BEGIN_SIMULATION,
 	STREAMLINE_MARKER_END_SIMULATION,
 	STREAMLINE_MARKER_BEGIN_RENDER,
@@ -53,7 +53,8 @@ enum StreamlineCapabilityType {
 	STREAMLINE_CAPABILITY_DLSS_RR,
 	STREAMLINE_CAPABILITY_REFLEX,
 	STREAMLINE_CAPABILITY_PCL,
-	STREAMLINE_CAPABILITY_NIS
+	STREAMLINE_CAPABILITY_NIS,
+	STREAMLINE_CAPABILITY_FSR_FRAME_GENERATION,
 };
 
 enum StreamlineInternalParameterType {
@@ -79,5 +80,6 @@ enum StreamlineParameterType {
 	STREAMLINE_PARAM_REFLEX_FRAME_LIMIT_US, // [double] frame limit in microseconds
 	STREAMLINE_PARAM_DLSS_PRESET, // [string] DLSS preset. Defaults to "?" (auto). Can be overridden to "J" or "K" for transformer models.
 	STREAMLINE_PARAM_DLSS_RR_PRESET, // [string] DLSS RR preset. Defaults to "?" (auto). Can be overridden to "D" or "E" for transformer models.
+	STREAMLINE_PARAM_FRAME_GENERATION_PROVIDER, // [int] 0 = NVIDIA DLSS-G, 1 = AMD FSR (D3D12). Recreates the window's swap chain.
 	STREAMLINE_PARAM_COUNT,
 };

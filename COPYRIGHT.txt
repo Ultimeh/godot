@@ -191,6 +191,11 @@ Comment: AccessKit
 Copyright: 2023, The AccessKit Authors.
 License: Expat
 
+Files: thirdparty/amd-ffx-api/*
+Comment: AMD FidelityFX SDK API
+Copyright: 2026, Advanced Micro Devices, Inc.
+License: Expat
+
 Files: thirdparty/amd-fsr/*
 Comment: AMD FidelityFX Super Resolution
 Copyright: 2021, Advanced Micro Devices, Inc.
