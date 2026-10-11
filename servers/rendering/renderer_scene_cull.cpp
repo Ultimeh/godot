@@ -3058,7 +3058,13 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 							RSG::particles_storage->particles_request_process(idata.base_rid);
 							cull_data.cull->lock.unlock();
 
-							RS::get_singleton()->call_on_render_thread(callable_mp_static(&RendererSceneCull::_scene_particles_set_view_axis).bind(idata.base_rid, -cull_data.cam_transform.basis.get_column(2).normalized(), cull_data.cam_transform.basis.get_column(1).normalized()));
+							if (cull_data.threaded) {
+								// Queued by _render_scene() once the cull is done, in one command: every cull thread
+								// queuing its own made them all contend on the command queue's lock.
+								cull_result.view_axis_particles.push_back(idata.base_rid);
+							} else {
+								RS::get_singleton()->call_on_render_thread(callable_mp_static(&RendererSceneCull::_scene_particles_set_view_axis).bind(idata.base_rid, -cull_data.cam_transform.basis.get_column(2).normalized(), cull_data.cam_transform.basis.get_column(1).normalized()));
+							}
 							//particles visible? request redraw
 							RenderingServerDefault::redraw_request();
 						}
@@ -3396,6 +3402,12 @@ void RendererSceneCull::_scene_particles_set_view_axis(RID p_particles, const Ve
 	RSG::particles_storage->particles_set_view_axis(p_particles, p_axis, p_up_axis);
 }
 
+void RendererSceneCull::_scene_particles_set_view_axis_list(const Array &p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis) {
+	for (const Variant &particles : p_particles) {
+		RSG::particles_storage->particles_set_view_axis(particles, p_axis, p_up_axis);
+	}
+}
+
 void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_camera_data, const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, RID p_force_camera_attributes, RID p_compositor, uint32_t p_visible_layers, RID p_scenario, RID p_viewport, RID p_shadow_atlas, RID p_reflection_probe, int p_reflection_probe_pass, float p_screen_mesh_lod_threshold, float p_window_output_max_value, bool p_using_shadows, RenderingServerTypes::RenderInfo *r_render_info) {
 	Instance *render_reflection_probe = instance_owner.get_or_null(p_reflection_probe); //if null, not rendering to it
 
@@ -3552,11 +3564,22 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 				thread.clear();
 			}
 
+			cull_data.threaded = true;
 			WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &RendererSceneCull::_scene_cull_threaded, &cull_data, scene_cull_result_threads.size(), -1, true, SNAME("RenderCullInstances"));
 			WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
 
 			for (InstanceCullResult &thread : scene_cull_result_threads) {
 				scene_cull_result.append_from(thread);
+			}
+
+			if (scene_cull_result.view_axis_particles.size()) {
+				// Queued, not called: the cull threads' calls were queued too, and run after this draw.
+				Array view_axis_particles;
+				view_axis_particles.resize(scene_cull_result.view_axis_particles.size());
+				for (uint32_t i = 0; i < scene_cull_result.view_axis_particles.size(); i++) {
+					view_axis_particles[i] = scene_cull_result.view_axis_particles[i];
+				}
+				static_cast<RenderingServerDefault *>(RS::get_singleton())->queue_on_render_thread(callable_mp_static(&RendererSceneCull::_scene_particles_set_view_axis_list).bind(view_axis_particles, -cull_data.cam_transform.basis.get_column(2).normalized(), cull_data.cam_transform.basis.get_column(1).normalized()));
 			}
 
 		} else {

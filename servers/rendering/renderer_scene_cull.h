@@ -894,6 +894,8 @@ public:
 		PagedArray<RID> voxel_gi_instances;
 		PagedArray<RID> mesh_instances;
 		PagedArray<RID> fog_volumes;
+		// Threaded cull: visible particles whose view axis is set once the cull is done (_render_scene()).
+		PagedArray<RID> view_axis_particles;
 
 		// RT-extra: instances/lights inside the camera AABB but outside the view frustum.
 		// Used for path tracing TLAS and light gathering only (not rasterized).
@@ -917,6 +919,7 @@ public:
 			voxel_gi_instances.clear();
 			mesh_instances.clear();
 			fog_volumes.clear();
+			view_axis_particles.clear();
 			rt_geometry_instances.clear();
 			rt_light_instances.clear();
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
@@ -944,6 +947,7 @@ public:
 			voxel_gi_instances.reset();
 			mesh_instances.reset();
 			fog_volumes.reset();
+			view_axis_particles.reset();
 			rt_geometry_instances.reset();
 			rt_light_instances.reset();
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
@@ -971,6 +975,7 @@ public:
 			voxel_gi_instances.merge_unordered(p_cull_result.voxel_gi_instances);
 			mesh_instances.merge_unordered(p_cull_result.mesh_instances);
 			fog_volumes.merge_unordered(p_cull_result.fog_volumes);
+			view_axis_particles.merge_unordered(p_cull_result.view_axis_particles);
 			rt_geometry_instances.merge_unordered(p_cull_result.rt_geometry_instances);
 			rt_light_instances.merge_unordered(p_cull_result.rt_light_instances);
 
@@ -999,6 +1004,7 @@ public:
 			voxel_gi_instances.set_page_pool(p_rid_pool);
 			mesh_instances.set_page_pool(p_rid_pool);
 			fog_volumes.set_page_pool(p_rid_pool);
+			view_axis_particles.set_page_pool(p_rid_pool);
 			rt_geometry_instances.set_page_pool(p_geometry_instance_pool);
 			rt_light_instances.set_page_pool(p_rid_pool);
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
@@ -1169,11 +1175,13 @@ public:
 		const RendererSceneOcclusionCull::HZBuffer *occlusion_buffer;
 		const Projection *camera_matrix;
 		uint64_t visibility_viewport_mask;
+		bool threaded = false;
 	};
 
 	void _scene_cull_threaded(uint32_t p_thread, CullData *cull_data);
 	void _scene_cull(CullData &cull_data, InstanceCullResult &cull_result, uint64_t p_from, uint64_t p_to);
 	static void _scene_particles_set_view_axis(RID p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis);
+	static void _scene_particles_set_view_axis_list(const Array &p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis);
 	_FORCE_INLINE_ bool _visibility_parent_check(const CullData &p_cull_data, const InstanceData &p_instance_data);
 
 	bool _render_reflection_probe_step(Instance *p_instance, int p_step);

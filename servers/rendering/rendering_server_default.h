@@ -1273,6 +1273,12 @@ public:
 		}
 	}
 
+	// Like call_on_render_thread() from another thread, also from the render thread: p_callable runs after the command
+	// being executed.
+	void queue_on_render_thread(const Callable &p_callable) {
+		command_queue.push(this, &RenderingServerDefault::_call_on_render_thread, p_callable);
+	}
+
 	/* TESTING */
 
 	virtual double get_frame_setup_time_cpu() const override;
