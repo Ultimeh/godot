@@ -3432,6 +3432,12 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		} else {
 			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
 		}
+#elif defined(STREAMLINE_ENABLED)
+		{
+			// Latency markers set from other threads use the swap chain too.
+			MutexLock swap_chain_lock(Streamline::get_swap_chain_mutex());
+			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
+		}
 #else
 		err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
 #endif

@@ -112,6 +112,11 @@ void Streamline::set_present_frame_token(uint64_t p_token) {
 	present_frame_token = p_token;
 }
 
+Mutex &Streamline::get_swap_chain_mutex() {
+	static Mutex swap_chain_mutex;
+	return swap_chain_mutex;
+}
+
 void Streamline::emit_marker(StreamlineMarkerType marker) {
 #ifdef STREAMLINE_ENABLED
 	StreamlineContext &sl_context = StreamlineContext::get();
@@ -236,7 +241,12 @@ void Streamline::emit_marker(StreamlineMarkerType marker) {
 			break;
 	}
 	if (token && sl_marker != sl::PCLMarker::eMaximum) {
-		sl_context.pcl_marker(token, sl_marker);
+		if (sl_context.is_d3d12) {
+			sl_context.pcl_marker(token, sl_marker);
+		} else {
+			MutexLock lock(get_swap_chain_mutex());
+			sl_context.pcl_marker(token, sl_marker);
+		}
 	}
 #endif
 }

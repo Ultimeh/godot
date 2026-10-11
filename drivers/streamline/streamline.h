@@ -32,6 +32,7 @@
 
 #include "core/object/class_db.h" // IWYU pragma: keep
 #include "core/object/object.h"
+#include "core/os/mutex.h"
 #include "core/os/thread_safe.h"
 #include "core/templates/safe_refcount.h"
 #include "core/variant/binder_common.h" // IWYU pragma: keep
@@ -70,6 +71,10 @@ public:
 	// 0 (the default on every thread) uses the draw's own token.
 	uint64_t get_render_frame_token() const;
 	static void set_present_frame_token(uint64_t p_token);
+
+	// Vulkan: Streamline's latency markers (vkSetLatencyMarkerNV) and the swap chain's present use the same
+	// VkSwapchainKHR, which needs external synchronization, from different threads: both hold this lock.
+	static Mutex &get_swap_chain_mutex();
 
 	Streamline();
 	virtual ~Streamline();
