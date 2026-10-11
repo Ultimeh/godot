@@ -92,10 +92,10 @@ private:
 	// rendering/rendering_device/vsync/submit_after_previous_frame, on Vulkan, with a swap chain and more than one frame in flight.
 	bool submit_after_previous_frame = false;
 
-	// Submission thread (D3D12, main instance with a window; GODOT_SUBMIT_THREAD=0 disables it): swap_buffers() hands
-	// the recorded frame over and begins the next one while this thread submits and presents it. Anything else that
-	// uses the main queue or a swap chain first waits for it to be idle (_submit_thread_drain()), and a frame slot is
-	// reused only once its submission is done (_stall_for_frame()).
+	// Submission thread (D3D12 and desktop Vulkan, main instance with a window; GODOT_SUBMIT_THREAD=0 disables it):
+	// swap_buffers() hands the recorded frame over and begins the next one while this thread submits and presents it.
+	// Anything else that uses the main queue or a swap chain first waits for it to be idle (_submit_thread_drain()), and
+	// a frame slot is reused only once its submission is done (_stall_for_frame()).
 	struct SubmitJob {
 		uint32_t frame = 0;
 		bool present = false;
@@ -1995,6 +1995,9 @@ private:
 		// Signaled by the command buffer submission. Must wait on this fence before beginning command recording for the frame.
 		RDD::FenceID fence;
 		bool fence_signaled = false;
+		// vsync/submit_after_previous_frame with the submission thread: that thread already waited on the fence (and
+		// reset it) before submitting the next frame.
+		bool fence_waited = false;
 
 		// Semaphores the frame must wait on before executing the command buffer.
 		LocalVector<RDD::SemaphoreID> semaphores_to_wait_on;

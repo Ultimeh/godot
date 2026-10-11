@@ -8378,9 +8378,10 @@ void RenderingDevice::swap_buffers(bool p_present) {
 		stats_usec = now;
 	}
 
-	if (submit_after_previous_frame) {
+	if (submit_after_previous_frame && !submit_thread_enabled) {
 		// The CPU has recorded this frame while the GPU rendered the previous one; submit it only once that one
-		// has finished, so the GPU queue drains between frames (see vsync/submit_after_previous_frame).
+		// has finished, so the GPU queue drains between frames (see vsync/submit_after_previous_frame). The
+		// submission thread does this wait itself, and this thread records the next frame meanwhile.
 		_stall_for_frame((frame + frames.size() - 1) % frames.size());
 	}
 
@@ -8859,6 +8860,18 @@ void RenderingDevice::_submit_thread_func(void *p_userdata) {
 			rd->submit_jobs.remove_at(0);
 		}
 
+		const uint32_t previous_frame = (job.frame + rd->frames.size() - 1) % rd->frames.size();
+		if (rd->submit_after_previous_frame && rd->frames[previous_frame].fence_signaled) {
+			// vsync/submit_after_previous_frame: submit this frame once the previous one has finished. The render thread
+			// does not stall on that slot until this wait is done (_stall_for_frame()).
+			rd->driver->fence_wait(rd->frames[previous_frame].fence);
+			{
+				MutexLock lock(rd->submit_mutex);
+				rd->frames[previous_frame].fence_waited = true;
+			}
+			rd->submit_done_condition.notify_all();
+		}
+
 		Streamline::set_present_frame_token(job.frame_token);
 		rd->_execute_frame_slot(job.frame, job.present);
 
@@ -8897,12 +8910,24 @@ void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 	if (submit_thread_enabled) {
 		// The slot's fence is only signaled once its submission has run.
 		_submit_thread_wait(submit_frame_job[p_frame]);
+		if (submit_after_previous_frame) {
+			// The next frame's submission waits on this fence and resets it: let it, or one of the two waits would
+			// wait on a reset fence forever.
+			MutexLock lock(submit_mutex);
+			const uint64_t next_job = submit_frame_job[p_frame] + 1;
+			while (submit_jobs_pushed >= next_job && submit_jobs_done < next_job && !frames[p_frame].fence_waited) {
+				submit_done_condition.wait(lock);
+			}
+		}
 	}
 
 	const bool fence_signaled = frames[p_frame].fence_signaled;
 	if (fence_signaled) {
-		GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait");
-		driver->fence_wait(frames[p_frame].fence);
+		if (!frames[p_frame].fence_waited) {
+			GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait");
+			driver->fence_wait(frames[p_frame].fence);
+		}
+		frames[p_frame].fence_waited = false;
 		frames[p_frame].fence_signaled = false;
 	}
 	if (frame_stats.in_begin_frame) {
@@ -9298,11 +9323,10 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	submit_after_previous_frame = main_surface != 0 && frames.size() > 1 && driver->get_api_name() == "Vulkan" && bool(GLOBAL_GET("rendering/rendering_device/vsync/submit_after_previous_frame"));
 
 	// With a window, frames are submitted and presented by a thread of their own (GODOT_SUBMIT_THREAD=0: by the render
-	// thread, as before). D3D12, and Vulkan on desktop without OpenXR (its runtime submits to the main queue itself) and
-	// without vsync/submit_after_previous_frame (which has the render thread wait for the previous frame first).
+	// thread, as before). D3D12, and Vulkan on desktop without OpenXR (its runtime submits to the main queue itself).
 	frame_stats.enabled = is_main_instance && (OS::get_singleton()->get_environment("GODOT_RD_STATS") == "1" || OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS_STATS") == "1");
 	bool submit_thread_api = driver->get_api_name() == "D3D12";
-	if (driver->get_api_name() == "Vulkan" && !OS::get_singleton()->has_feature("mobile") && !submit_after_previous_frame) {
+	if (driver->get_api_name() == "Vulkan" && !OS::get_singleton()->has_feature("mobile")) {
 		submit_thread_api = true;
 #ifndef XR_DISABLED
 		const XRServer::XRMode xr_mode = XRServer::get_xr_mode();
