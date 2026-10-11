@@ -114,6 +114,7 @@ private:
 
 	static void _submit_thread_func(void *p_userdata);
 	void _submit_thread_wait(uint64_t p_job);
+	static uint64_t _get_render_frame_token(); // Streamline's frame token of the frame being recorded, 0 without it.
 	void _submit_thread_drain();
 
 	// Replay thread (with the submission thread; GODOT_RD_REPLAY_THREAD=0 disables it): swap_buffers()

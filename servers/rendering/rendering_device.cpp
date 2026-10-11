@@ -44,6 +44,10 @@
 #include "servers/rendering/rendering_shader_container.h"
 #include "servers/rendering/shader_include_db.h"
 
+#ifndef XR_DISABLED
+#include "servers/xr/xr_server.h"
+#endif
+
 #include "modules/modules_enabled.gen.h"
 
 #ifdef MODULE_GLSLANG_ENABLED
@@ -8282,6 +8286,11 @@ RenderingDeviceEnums::DeviceType RenderingDevice::get_device_type() const {
 	return RenderingDeviceEnums::DeviceType(device.type);
 }
 
+uint64_t RenderingDevice::_get_render_frame_token() {
+	Streamline *streamline = Streamline::get_singleton();
+	return streamline ? streamline->get_render_frame_token() : 0;
+}
+
 String RenderingDevice::get_device_api_name() const {
 	return driver->get_api_name();
 }
@@ -8340,7 +8349,7 @@ void RenderingDevice::swap_buffers(bool p_present) {
 		{
 			MutexLock lock(submit_mutex);
 			const uint64_t job = ++submit_jobs_pushed;
-			replay_jobs.push_back({ uint32_t(frame), draw_graph, p_present, Streamline::get_singleton()->get_render_frame_token(), job });
+			replay_jobs.push_back({ uint32_t(frame), draw_graph, p_present, _get_render_frame_token(), job });
 			submit_frame_job[frame] = job;
 			draw_graph_job[draw_graph == &draw_graphs[0] ? 0 : 1] = job;
 		}
@@ -8349,7 +8358,7 @@ void RenderingDevice::swap_buffers(bool p_present) {
 		// The submission thread submits and presents this frame while this one begins the next.
 		{
 			MutexLock lock(submit_mutex);
-			submit_jobs.push_back({ uint32_t(frame), p_present, Streamline::get_singleton()->get_render_frame_token() });
+			submit_jobs.push_back({ uint32_t(frame), p_present, _get_render_frame_token() });
 			submit_frame_job[frame] = ++submit_jobs_pushed;
 		}
 		submit_condition.notify_one();
@@ -9246,10 +9255,21 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	// Vulkan only: the hiccups it removes were seen with Vulkan presentation; D3D12 did not need it.
 	submit_after_previous_frame = main_surface != 0 && frames.size() > 1 && driver->get_api_name() == "Vulkan" && bool(GLOBAL_GET("rendering/rendering_device/vsync/submit_after_previous_frame"));
 
-	// D3D12 with a window: frames are submitted and presented by a thread of their own (GODOT_SUBMIT_THREAD=0: by the
-	// render thread, as before).
+	// With a window, frames are submitted and presented by a thread of their own (GODOT_SUBMIT_THREAD=0: by the render
+	// thread, as before). D3D12, and Vulkan on desktop without OpenXR (its runtime submits to the main queue itself) and
+	// without vsync/submit_after_previous_frame (which has the render thread wait for the previous frame first).
 	frame_stats.enabled = is_main_instance && (OS::get_singleton()->get_environment("GODOT_RD_STATS") == "1" || OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS_STATS") == "1");
-	submit_thread_enabled = main_surface != 0 && driver->get_api_name() == "D3D12" && OS::get_singleton()->get_environment("GODOT_SUBMIT_THREAD") != "0";
+	bool submit_thread_api = driver->get_api_name() == "D3D12";
+	if (driver->get_api_name() == "Vulkan" && !OS::get_singleton()->has_feature("mobile") && !submit_after_previous_frame) {
+		submit_thread_api = true;
+#ifndef XR_DISABLED
+		const XRServer::XRMode xr_mode = XRServer::get_xr_mode();
+		if (xr_mode == XRServer::XRMODE_ON || (xr_mode == XRServer::XRMODE_DEFAULT && bool(GLOBAL_GET("xr/openxr/enabled")))) {
+			submit_thread_api = false;
+		}
+#endif
+	}
+	submit_thread_enabled = main_surface != 0 && submit_thread_api && OS::get_singleton()->get_environment("GODOT_SUBMIT_THREAD") != "0";
 	if (submit_thread_enabled) {
 		submit_frame_job.resize(frames.size());
 		for (uint64_t &job : submit_frame_job) {
