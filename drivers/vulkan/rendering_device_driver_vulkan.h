@@ -194,6 +194,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	};
 
 	PendingFlushes pending_flushes;
+	BinaryMutex pending_flushes_mutex; // Filled by buffer_flush(), flushed by the next submission (any thread).
 
 	struct PipelineStatistics {
 		Ref<FileAccess> file_access;
@@ -381,6 +382,9 @@ public:
 	// ----- QUEUE -----
 private:
 	struct CommandQueue {
+		// Guards the semaphore vectors: the swap chain acquire and the fence waits change them on the render thread, the
+		// submission on the thread that submits and presents (RenderingDevice's submission thread, when it runs).
+		Mutex mutex;
 		LocalVector<VkSemaphore> image_semaphores;
 		LocalVector<SwapChain *> image_semaphores_swap_chains;
 		LocalVector<uint32_t> pending_semaphores_for_execute;

@@ -2250,6 +2250,7 @@ void RenderingDeviceDriverVulkan::buffer_flush(BufferID p_buffer) {
 	const bool needs_flushing = !(mem_props_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
 	if (needs_flushing) {
+		MutexLock lock(pending_flushes_mutex);
 		if (buf_info->is_dynamic()) {
 			pending_flushes.allocations.push_back(buf_info->allocation.handle);
 			pending_flushes.offsets.push_back(buf_info->frame_idx * buf_info->size);
@@ -3162,6 +3163,7 @@ Error RenderingDeviceDriverVulkan::fence_wait(FenceID p_fence) {
 
 	if (fence->queue_signaled_from != nullptr) {
 		// Release all semaphores that the command queue associated to the fence waited on the last time it was submitted.
+		MutexLock lock(fence->queue_signaled_from->mutex);
 		LocalVector<Pair<Fence *, uint32_t>> &pairs = fence->queue_signaled_from->image_semaphores_for_fences;
 		uint32_t i = 0;
 		while (i < pairs.size()) {
@@ -3299,13 +3301,13 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 	wait_semaphores.clear();
 	wait_semaphores_stages.clear();
 
-	if (!command_queue->pending_semaphores_for_execute.is_empty()) {
+	{
+		MutexLock lock(command_queue->mutex);
 		for (uint32_t i = 0; i < command_queue->pending_semaphores_for_execute.size(); i++) {
 			VkSemaphore wait_semaphore = command_queue->image_semaphores[command_queue->pending_semaphores_for_execute[i]];
 			wait_semaphores.push_back(wait_semaphore);
 			wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 		}
-
 		command_queue->pending_semaphores_for_execute.clear();
 	}
 
@@ -3315,16 +3317,19 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 	}
 
-	if (!pending_flushes.allocations.is_empty()) {
-		// We must do this now, even if p_cmd_buffers is empty; because afterwards pending_flushes.allocations
-		// could become dangling. We cannot delay this call for the next frame(s).
-		err = vmaFlushAllocations(allocator, pending_flushes.allocations.size(),
-				pending_flushes.allocations.ptr(), pending_flushes.offsets.ptr(),
-				pending_flushes.sizes.ptr());
-		pending_flushes.allocations.clear();
-		pending_flushes.offsets.clear();
-		pending_flushes.sizes.clear();
-		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't flush Vulkan memory allocations (VkResult error %d).", err));
+	{
+		MutexLock lock(pending_flushes_mutex);
+		if (!pending_flushes.allocations.is_empty()) {
+			// We must do this now, even if p_cmd_buffers is empty; because afterwards pending_flushes.allocations
+			// could become dangling. We cannot delay this call for the next frame(s).
+			err = vmaFlushAllocations(allocator, pending_flushes.allocations.size(),
+					pending_flushes.allocations.ptr(), pending_flushes.offsets.ptr(),
+					pending_flushes.sizes.ptr());
+			pending_flushes.allocations.clear();
+			pending_flushes.offsets.clear();
+			pending_flushes.sizes.clear();
+			ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't flush Vulkan memory allocations (VkResult error %d).", err));
+		}
 	}
 
 	if (p_cmd_buffers.size() > 0) {
@@ -3371,6 +3376,7 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		}
 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't submit to Vulkan queue (VkResult error %d).", err));
 
+		MutexLock lock(command_queue->mutex);
 		if (fence != nullptr && !command_queue->pending_semaphores_for_fence.is_empty()) {
 			fence->queue_signaled_from = command_queue;
 
@@ -3433,7 +3439,9 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		device_queue.submit_mutex.unlock();
 
 #ifdef STREAMLINE_ENABLED
-		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_END_PRESENT);
+		if (Streamline::get_singleton()) {
+			Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_END_PRESENT);
+		}
 #endif
 
 		// Set the index to an invalid value. If any of the swap chains returned out of date, indicate it should be resized the next time it's acquired.
@@ -3758,6 +3766,7 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
 	}
 
 	for (uint32_t i = 0; i < swap_chain->command_queues_acquired.size(); i++) {
+		MutexLock lock(swap_chain->command_queues_acquired[i]->mutex);
 		_recreate_image_semaphore(swap_chain->command_queues_acquired[i], swap_chain->command_queues_acquired_semaphores[i], false);
 	}
 
@@ -4117,30 +4126,35 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
 	VkResult err;
 	VkSemaphore semaphore = VK_NULL_HANDLE;
 	uint32_t semaphore_index = 0;
-	if (command_queue->free_image_semaphores.is_empty()) {
-		// Add a new semaphore if none are free.
-		VkSemaphoreCreateInfo create_info = {};
-		create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		err = vkCreateSemaphore(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &semaphore);
-		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FramebufferID(), vformat("Couldn't create Vulkan semaphore for acquiring swapchain image (VkResult error %d).", err));
+	// The queue's lock is not held while acquiring: the acquire may wait for a present, which needs it.
+	{
+		MutexLock semaphores_lock(command_queue->mutex);
+		if (command_queue->free_image_semaphores.is_empty()) {
+			// Add a new semaphore if none are free.
+			VkSemaphoreCreateInfo create_info = {};
+			create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+			err = vkCreateSemaphore(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &semaphore);
+			ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FramebufferID(), vformat("Couldn't create Vulkan semaphore for acquiring swapchain image (VkResult error %d).", err));
 
-		semaphore_index = command_queue->image_semaphores.size();
-		command_queue->image_semaphores.push_back(semaphore);
-		command_queue->image_semaphores_swap_chains.push_back(swap_chain);
-	} else {
-		// Pick a free semaphore.
-		uint32_t free_index = command_queue->free_image_semaphores.size() - 1;
-		semaphore_index = command_queue->free_image_semaphores[free_index];
-		command_queue->image_semaphores_swap_chains[semaphore_index] = swap_chain;
-		command_queue->free_image_semaphores.remove_at(free_index);
-		semaphore = command_queue->image_semaphores[semaphore_index];
+			semaphore_index = command_queue->image_semaphores.size();
+			command_queue->image_semaphores.push_back(semaphore);
+			command_queue->image_semaphores_swap_chains.push_back(swap_chain);
+		} else {
+			// Pick a free semaphore.
+			uint32_t free_index = command_queue->free_image_semaphores.size() - 1;
+			semaphore_index = command_queue->free_image_semaphores[free_index];
+			command_queue->image_semaphores_swap_chains[semaphore_index] = swap_chain;
+			command_queue->free_image_semaphores.remove_at(free_index);
+			semaphore = command_queue->image_semaphores[semaphore_index];
+		}
+
+		// Store in the swap chain the acquired semaphore.
+		swap_chain->command_queues_acquired.push_back(command_queue);
+		swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
 	}
 
-	// Store in the swap chain the acquired semaphore.
-	swap_chain->command_queues_acquired.push_back(command_queue);
-	swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
-
 	err = device_functions.AcquireNextImageKHR(vk_device, swap_chain->vk_swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &swap_chain->image_index);
+	MutexLock lock(command_queue->mutex);
 	if (err == VK_ERROR_OUT_OF_DATE_KHR) {
 		// Out of date leaves the semaphore in a signaled state that will never finish, so it's necessary to recreate it.
 		bool semaphore_recreated = _recreate_image_semaphore(command_queue, semaphore_index, true);
