@@ -782,8 +782,8 @@ public:
 	virtual MultiMeshInterpolator *_multimesh_get_interpolator(RID p_multimesh) const override;
 
 	void _update_dirty_multimeshes();
-	void _multimesh_get_motion_vectors_offsets(RID p_multimesh, uint32_t &r_current_offset, uint32_t &r_prev_offset);
-	bool _multimesh_uses_motion_vectors_offsets(RID p_multimesh);
+	// Returns whether the previous transforms differ from the current ones (motion vectors).
+	bool _multimesh_get_motion_vectors_offsets(RID p_multimesh, uint32_t &r_current_offset, uint32_t &r_prev_offset);
 	bool _multimesh_uses_motion_vectors(RID p_multimesh);
 
 	_FORCE_INLINE_ bool multimesh_uses_indirect(RID p_multimesh) const {

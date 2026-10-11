@@ -594,7 +594,8 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			if (surf->owner->base_flags & INSTANCE_DATA_FLAG_PARTICLES) {
 				particles_storage->particles_get_instance_buffer_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
 			} else if (surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) {
-				mesh_storage->_multimesh_get_motion_vectors_offsets(surf->owner->data->base, push_constant.multimesh_motion_vectors_current_offset, push_constant.multimesh_motion_vectors_previous_offset);
+				push_constant.multimesh_motion_vectors_current_offset = surf->owner->multimesh_motion_current_offset;
+				push_constant.multimesh_motion_vectors_previous_offset = surf->owner->multimesh_motion_previous_offset;
 			} else {
 				push_constant.multimesh_motion_vectors_current_offset = 0;
 				push_constant.multimesh_motion_vectors_previous_offset = 0;
@@ -966,8 +967,14 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	//fill list
 
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
 	for (int i = 0; i < (int)p_render_data->instances->size(); i++) {
 		GeometryInstanceForwardClustered *inst = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
+
+		if ((inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && !(inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES) && inst->multimesh_motion_frame != frame) {
+			inst->multimesh_uses_motion = mesh_storage->_multimesh_get_motion_vectors_offsets(inst->data->base, inst->multimesh_motion_current_offset, inst->multimesh_motion_previous_offset);
+			inst->multimesh_motion_frame = frame;
+		}
 
 		Vector3 center = inst->transform.origin;
 		if (p_render_data->scene_data->cam_orthogonal) {
@@ -1013,7 +1020,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				bool transform_changed = inst->transform_status == GeometryInstanceForwardClustered::TransformStatus::MOVED;
 				bool has_mesh_instance = inst->mesh_instance.is_valid();
 				bool uses_particles = inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES;
-				bool is_multimesh_with_motion = !uses_particles && (inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && mesh_storage->_multimesh_uses_motion_vectors_offsets(inst->data->base);
+				bool is_multimesh_with_motion = !uses_particles && (inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && inst->multimesh_uses_motion;
 				bool is_dynamic = transform_changed || has_mesh_instance || uses_particles || is_multimesh_with_motion;
 				if (p_pass_mode == PASS_MODE_COLOR && p_using_motion_pass) {
 					uses_motion = is_dynamic;
