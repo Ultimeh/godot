@@ -33,6 +33,7 @@
 #include "core/templates/hash_map.h"
 #include "core/templates/paged_allocator.h"
 #include "core/templates/rb_map.h"
+#include "core/templates/safe_refcount.h"
 #include "drivers/vulkan/rendering_context_driver_vulkan.h"
 #include "drivers/vulkan/rendering_shader_container_vulkan.h"
 #include "servers/rendering/rendering_device_driver.h"
@@ -193,6 +194,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	};
 
 	PendingFlushes pending_flushes;
+	BinaryMutex pending_flushes_mutex; // Filled by buffer_flush(), flushed by the next submission (any thread).
 
 	struct PipelineStatistics {
 		Ref<FileAccess> file_access;
@@ -233,10 +235,10 @@ private:
 
 private:
 #if defined(DEBUG_ENABLED) || defined(DEV_ENABLED)
-	// It's a circular buffer.
+	// It's a circular buffer. Breadcrumb `id` is written at entry `id % BREADCRUMB_BUFFER_ENTRIES`; the graph's parallel
+	// slices insert them from several threads.
 	BufferID breadcrumb_buffer;
-	uint32_t breadcrumb_offset = 0u;
-	uint32_t breadcrumb_id = 0u;
+	SafeNumeric<uint32_t> breadcrumb_id;
 #endif
 
 public:
@@ -380,6 +382,9 @@ public:
 	// ----- QUEUE -----
 private:
 	struct CommandQueue {
+		// Guards the semaphore vectors: the swap chain acquire and the fence waits change them on the render thread, the
+		// submission on the thread that submits and presents (RenderingDevice's submission thread, when it runs).
+		Mutex mutex;
 		LocalVector<VkSemaphore> image_semaphores;
 		LocalVector<SwapChain *> image_semaphores_swap_chains;
 		LocalVector<uint32_t> pending_semaphores_for_execute;
@@ -483,7 +488,7 @@ private:
 	};
 
 public:
-	virtual FramebufferID framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height) override final;
+	virtual FramebufferID framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height, uint32_t p_layers = 1) override final;
 	virtual void framebuffer_free(FramebufferID p_framebuffer) override final;
 
 	/****************/

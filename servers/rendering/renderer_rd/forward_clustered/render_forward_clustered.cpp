@@ -31,6 +31,8 @@
 #include "render_forward_clustered.h"
 
 #include "core/config/project_settings.h"
+#include "core/object/worker_thread_pool.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/effects/camera_reprojection.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -42,6 +44,10 @@
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_default.h"
 #include "servers/rendering/storage/ltc_lut.gen.h"
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 using namespace RendererSceneRenderImplementation;
 
@@ -312,6 +318,7 @@ bool RenderForwardClustered::free(RID p_rid) {
 
 void RenderForwardClustered::update() {
 	RendererSceneRenderRD::update();
+	_sort_reuse_begin_frame();
 	_update_global_pipeline_data_requirements_from_project();
 	_update_global_pipeline_data_requirements_from_light_storage();
 }
@@ -319,7 +326,7 @@ void RenderForwardClustered::update() {
 /// RENDERING ///
 
 template <RenderForwardClustered::PassMode p_pass_mode, uint32_t p_color_pass_flags>
-void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element) {
+void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element, RenderListSplit *p_split) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::ParticlesStorage *particles_storage = RendererRD::ParticlesStorage::get_singleton();
 	RD::DrawListID draw_list = p_draw_list;
@@ -342,7 +349,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 	uint32_t pipeline_hash = 0;
 	uint32_t prev_pipeline_hash = 0;
 
-	bool shadow_pass = (p_pass_mode == PASS_MODE_SHADOW) || (p_pass_mode == PASS_MODE_SHADOW_DP);
+	bool shadow_pass = (p_pass_mode == PASS_MODE_SHADOW) || (p_pass_mode == PASS_MODE_SHADOW_DP) || (p_pass_mode == PASS_MODE_SHADOW_CUBE);
 
 	SceneState::PushConstant push_constant;
 
@@ -354,6 +361,18 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 	}
 
 	bool should_request_redraw = false;
+
+	// The vertex arrays of the surfaces met in this list. Looking them up in the mesh storage takes the surface's lock,
+	// which threads recording other parts of the same list would fight over for every element of a shared mesh.
+	struct VertexArrayCacheEntry {
+		void *mesh_surface = nullptr;
+		uint64_t input_mask = 0;
+		bool input_motion_vectors = false;
+		bool point_size_emulated = false;
+		RID vertex_array;
+		RD::VertexFormatID vertex_format = 0;
+	};
+	VertexArrayCacheEntry vertex_array_cache[16];
 
 	for (uint32_t i = p_from_element; i < p_to_element; i++) {
 		const GeometryInstanceSurfaceDataCache *surf = p_params->elements[i];
@@ -394,7 +413,11 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 #endif
 				material_uniform_set = surf->material_uniform_set;
 				shader = surf->shader;
-				surf->material->set_as_used();
+				if (p_split == nullptr) {
+					surf->material->set_as_used();
+				} else if (unlikely(!surf->material->render_target_cache.is_empty())) {
+					p_split->used_materials.push_back(surf->material);
+				}
 #ifdef DEBUG_ENABLED
 			}
 #endif
@@ -415,7 +438,7 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 		if constexpr (p_pass_mode == PASS_MODE_DEPTH_MATERIAL || p_pass_mode == PASS_MODE_SDF) {
 			cull_variant = SceneShaderForwardClustered::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
 		} else {
-			if constexpr (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
+			if constexpr (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP || p_pass_mode == PASS_MODE_SHADOW_CUBE) {
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DOUBLE_SIDED_SHADOWS) {
 					cull_variant = SceneShaderForwardClustered::ShaderData::CULL_VARIANT_DOUBLE_SIDED;
 				}
@@ -483,6 +506,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for shadow DP pass");
 				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_DP;
 			} break;
+			case PASS_MODE_SHADOW_CUBE: {
+				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_CUBE_LAYERED;
+			} break;
 			case PASS_MODE_DEPTH_NORMAL_ROUGHNESS: {
 				pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_MULTIVIEW : SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS;
 			} break;
@@ -520,7 +546,16 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			if (surf->owner->mesh_instance.is_valid()) {
 				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, pipeline_motion_vectors, emulate_point_size, vertex_array_rd, vertex_format);
 			} else {
-				mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, pipeline_motion_vectors, emulate_point_size, vertex_array_rd, vertex_format);
+				VertexArrayCacheEntry &entry = vertex_array_cache[((uintptr_t(mesh_surface) >> 6) ^ (uintptr_t(mesh_surface) >> 12)) & 15];
+				if (entry.mesh_surface != mesh_surface || entry.input_mask != input_mask || entry.input_motion_vectors != pipeline_motion_vectors || entry.point_size_emulated != emulate_point_size) {
+					entry.mesh_surface = mesh_surface;
+					entry.input_mask = input_mask;
+					entry.input_motion_vectors = pipeline_motion_vectors;
+					entry.point_size_emulated = emulate_point_size;
+					mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, pipeline_motion_vectors, emulate_point_size, entry.vertex_array, entry.vertex_format);
+				}
+				vertex_array_rd = entry.vertex_array;
+				vertex_format = entry.vertex_format;
 			}
 
 			pipeline_key.vertex_format_id = vertex_format;
@@ -611,14 +646,52 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				push_constant_size = sizeof(SceneState::PushConstant) - sizeof(SceneState::PushConstantUbershader);
 			}
 
-			RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
-
 			uint32_t instance_count = surf->owner->instance_count > 1 ? surf->owner->instance_count : element_info.repeat;
 			if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_PARTICLE_TRAILS) {
 				instance_count /= surf->owner->trail_steps;
 			}
 
 			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
+
+			if constexpr (p_pass_mode == PASS_MODE_SHADOW_CUBE) {
+				// The faces that see the element, 3 bits each, their count in bits 18-20 (CUBE_FACE in the shader): one
+				// draw instanced once per face. Indirect draws and emulated point sizes can't multiply their instance
+				// count: one draw per face.
+				uint32_t faces = 0;
+				uint32_t face_count = 0;
+				for (uint32_t face = 0; face < 6; face++) {
+					if (element_info.cube_face_mask & (1u << face)) {
+						faces |= face << (3 * face_count);
+						face_count++;
+					}
+				}
+				if (face_count == 0) {
+					i += element_info.repeat - 1;
+					continue;
+				}
+
+				if (emulate_point_size || indirect) {
+					for (uint32_t face = 0; face < 6; face++) {
+						if (!(element_info.cube_face_mask & (1u << face))) {
+							continue;
+						}
+						push_constant.uv_offset = face | (1u << 18);
+						RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
+						if (emulate_point_size) {
+							RD::get_singleton()->draw_list_draw(draw_list, false, mesh_storage->mesh_surface_get_vertex_count(mesh_surface), instance_count * 6);
+						} else {
+							RD::get_singleton()->draw_list_draw_indirect(draw_list, index_array_rd.is_valid(), mesh_storage->_multimesh_get_command_buffer_rd_rid(surf->owner->data->base), surf->surface_index * sizeof(uint32_t) * mesh_storage->INDIRECT_MULTIMESH_COMMAND_STRIDE, 1, 0);
+						}
+					}
+					i += element_info.repeat - 1;
+					continue;
+				}
+
+				push_constant.uv_offset = faces | (face_count << 18);
+				instance_count *= face_count;
+			}
+
+			RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, push_constant_size);
 
 			if (emulate_point_size) {
 				if (indirect) {
@@ -637,17 +710,21 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 	// Make the actual redraw request
 	if (should_request_redraw) {
-		RenderingServerDefault::redraw_request();
+		if (p_split == nullptr) {
+			RenderingServerDefault::redraw_request();
+		} else {
+			p_split->request_redraw = true;
+		}
 	}
 }
 
-void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element) {
+void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element, RenderListSplit *p_split) {
 	//use template for faster performance (pass mode comparisons are inlined)
 
 	switch (p_params->pass_mode) {
 #define VALID_FLAG_COMBINATION(f) \
 	case f: { \
-		_render_list_template<PASS_MODE_COLOR, f>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element); \
+		_render_list_template<PASS_MODE_COLOR, f>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split); \
 	} break;
 
 		case PASS_MODE_COLOR: {
@@ -671,25 +748,28 @@ void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_lis
 
 		} break;
 		case PASS_MODE_SHADOW: {
-			_render_list_template<PASS_MODE_SHADOW>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_SHADOW>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		case PASS_MODE_SHADOW_DP: {
-			_render_list_template<PASS_MODE_SHADOW_DP>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_SHADOW_DP>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
+		} break;
+		case PASS_MODE_SHADOW_CUBE: {
+			_render_list_template<PASS_MODE_SHADOW_CUBE>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		case PASS_MODE_DEPTH: {
-			_render_list_template<PASS_MODE_DEPTH>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_DEPTH>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS: {
-			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		case PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI: {
-			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		case PASS_MODE_DEPTH_MATERIAL: {
-			_render_list_template<PASS_MODE_DEPTH_MATERIAL>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_DEPTH_MATERIAL>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		case PASS_MODE_SDF: {
-			_render_list_template<PASS_MODE_SDF>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+			_render_list_template<PASS_MODE_SDF>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element, p_split);
 		} break;
 		default: {
 			// Unknown pass mode.
@@ -702,8 +782,271 @@ void RenderForwardClustered::_render_list_with_draw_list(RenderListParameters *p
 	p_params->framebuffer_format = fb_format;
 
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, p_draw_flags, p_clear_color_values, p_clear_depth_value, p_clear_stencil_value, p_region);
-	_render_list(draw_list, fb_format, p_params, 0, p_params->element_count);
+	const uint32_t split_count = _render_list_get_split_count(p_params);
+	if (split_count > 1) {
+		_render_list_split(p_params, split_count);
+	} else {
+		const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+		_render_list(draw_list, fb_format, p_params, 0, p_params->element_count);
+		if (render_list_split_stats.enabled) {
+			render_list_split_stats.serial_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
+		}
+	}
 	RD::get_singleton()->draw_list_end();
+}
+
+uint32_t RenderForwardClustered::_render_list_get_split_count(const RenderListParameters *p_params) {
+	if (!parallel_groups.is_empty()) {
+		_parallel_release_groups(false);
+	}
+
+	if (render_list_split_stats.enabled) {
+		const uint64_t frame = RSG::rasterizer->get_frame_number();
+		if (frame != render_list_split_stats.frame) {
+			render_list_split_stats.frame = frame;
+			render_list_split_stats.frames++;
+			if (render_list_split_stats.frames == 240) {
+				const RenderListSplitStats &st = render_list_split_stats;
+				print_line(vformat("Parallel draw lists, per frame: %.1f lists split in %.1f parts (%.0f elements, %.0f us, of which waiting %.0f us, joining %.0f us; parts %.0f us in total, last part started after %.0f us), %.1f shadow passes recorded together (%.0f us), %.1f lists recorded serially (%.0f elements, %.0f us).",
+						st.split_lists / 240.0, st.splits / 240.0, st.split_elements / 240.0, st.split_usec / 240.0, st.split_wait_usec / 240.0, st.split_join_usec / 240.0, st.split_parts_usec / 240.0, st.split_start_usec / 240.0, st.shadow_parallel_passes / 240.0, st.shadow_parallel_usec / 240.0, st.serial_lists / 240.0, st.serial_elements / 240.0, st.serial_usec / 240.0));
+				print_line(vformat("List building, per frame: filling %.0f us, instance data %.0f us, %.1f of them on several threads; shadow sort + instance data %.0f us (%.1f deferred builds of %.1f passes, %.1f of %.1f non-empty ones in their last order and %.1f merged, %.0f elements, %.0f draw calls); main lists sort %.0f us (%.1f of %.1f non-empty lists in their last order, %.1f merged); %.1f surface caches freed.",
+						st.fill_usec / 240.0, st.instance_data_usec / 240.0, st.parallel_builds / 240.0, st.shadow_usec / 240.0, st.shadow_builds / 240.0, st.shadow_passes / 240.0, st.reused_shadow_passes / 240.0, st.sorted_shadow_passes / 240.0, st.merged_shadow_passes / 240.0, st.shadow_elements / 240.0, st.shadow_draw_calls / 240.0, st.sort_usec / 240.0, st.reused_lists / 240.0, st.sorted_lists / 240.0, st.merged_lists / 240.0, (surface_caches_freed - st.surface_caches_freed) / 240.0));
+				print_line(vformat("Shadow build, per frame: copying the elements %.0f us, checking for kept orders %.0f us, sorting %.0f us, keeping the orders %.0f us, instance data %.0f us, instancing runs %.0f us.",
+						st.shadow_copy_usec / 240.0, st.shadow_check_usec / 240.0, st.shadow_sort_usec / 240.0, st.shadow_store_usec / 240.0, st.shadow_instance_usec / 240.0, st.shadow_runs_usec / 240.0));
+				for (int i = 0; i < 2; i++) {
+					const RenderListSplitStats::FillChanges &changes = st.fill_changes[i];
+					print_line(vformat("Fill, %s: %.1f fills per frame, camera unchanged since the previous one in %.0f %% of them; %.0f instances per fill, %.1f %% of them moved this frame.",
+							i == 0 ? "main view" : "shadow passes", changes.fills / 240.0, 100.0 * changes.camera_still / MAX(changes.fills, 1u), double(changes.instances) / MAX(changes.fills, 1u), 100.0 * changes.moved / MAX(changes.instances, uint64_t(1))));
+				}
+				print_line(vformat("Parallel runs, per frame: %.1f runs, %.1f helpers woken, %.0f parts, %.0f of them on the calling thread, %.0f us of parts in total, %.0f us of wall time.",
+						st.runs / 240.0, st.helpers_woken / 240.0, st.run_parts.get() / 240.0, st.run_parts_on_caller.get() / 240.0, st.run_parts_usec.get() / 240.0, st.run_usec / 240.0));
+				render_list_split_stats.~RenderListSplitStats();
+				memnew_placement(&render_list_split_stats, RenderListSplitStats);
+				render_list_split_stats.enabled = true;
+				render_list_split_stats.frame = frame;
+				render_list_split_stats.surface_caches_freed = surface_caches_freed;
+			}
+		}
+	}
+
+	// Twice as many parts as threads: a worker that starts late leaves its parts to the others instead of making
+	// everyone wait for it.
+	uint32_t split_count = 1;
+	if (render_list_max_splits > 1 && render_list_split_min_elements > 0) {
+		split_count = CLAMP(uint32_t(p_params->element_count) / render_list_split_min_elements, 1u, render_list_max_splits * 2);
+	}
+
+	if (render_list_split_stats.enabled && split_count <= 1) {
+		render_list_split_stats.serial_lists++;
+		render_list_split_stats.serial_elements += p_params->element_count;
+	}
+
+	return split_count;
+}
+
+void RenderForwardClustered::_render_list_split(RenderListParameters *p_params, uint32_t p_split_count) {
+	const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	const uint32_t element_count = p_params->element_count;
+
+	if (render_list_splits.size() < p_split_count) {
+		render_list_splits.resize(p_split_count);
+		render_list_split_ids.resize(p_split_count);
+	}
+
+	// Equal ranges, each boundary moved forward to the start of a run of repeated elements: the first element of a run
+	// draws the whole run instanced, a range starting inside one would draw its tail twice.
+	uint32_t split_count = 0;
+	uint32_t from = 0;
+	for (uint32_t i = 0; i < p_split_count && from < element_count; i++) {
+		uint32_t to = i == p_split_count - 1 ? element_count : uint32_t(uint64_t(element_count) * (i + 1) / p_split_count);
+		while (to > from && to < element_count && p_params->element_info[to - 1].repeat > 1) {
+			to++;
+		}
+
+		if (to <= from) {
+			continue;
+		}
+
+		RenderListSplit &split = render_list_splits[split_count];
+		split.from_element = from;
+		split.to_element = to;
+		split.request_redraw = false;
+		split.used_materials.clear();
+		split_count++;
+		from = to;
+	}
+
+	RD::get_singleton()->draw_list_split_begin(split_count, render_list_split_ids.ptr());
+	for (uint32_t i = 0; i < split_count; i++) {
+		render_list_splits[i].draw_list = render_list_split_ids[i];
+	}
+
+	render_list_split_params = p_params;
+	const uint64_t wait_usec = _parallel_run(split_count, render_list_max_splits, &RenderForwardClustered::_render_list_split_part);
+
+	const uint64_t join_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	RD::get_singleton()->draw_list_split_end();
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.split_wait_usec += wait_usec;
+		render_list_split_stats.split_join_usec += OS::get_singleton()->get_ticks_usec() - join_usec;
+	}
+
+	bool request_redraw = false;
+	for (uint32_t i = 0; i < split_count; i++) {
+		RenderListSplit &split = render_list_splits[i];
+		request_redraw = request_redraw || split.request_redraw;
+		for (RendererRD::MaterialStorage::MaterialData *material : split.used_materials) {
+			material->set_as_used();
+		}
+	}
+
+	if (request_redraw) {
+		RenderingServerDefault::redraw_request();
+	}
+
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.split_lists++;
+		render_list_split_stats.splits += split_count;
+		render_list_split_stats.split_elements += element_count;
+		render_list_split_stats.split_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
+		uint64_t last_begin_usec = begin_usec;
+		for (uint32_t i = 0; i < split_count; i++) {
+			render_list_split_stats.split_parts_usec += render_list_splits[i].end_usec - render_list_splits[i].begin_usec;
+			last_begin_usec = MAX(last_begin_usec, render_list_splits[i].begin_usec);
+		}
+		render_list_split_stats.split_start_usec += last_begin_usec - begin_usec;
+	}
+}
+
+void RenderForwardClustered::_render_list_split_part(uint32_t p_part) {
+	RenderListSplit &split = render_list_splits[p_part];
+	if (render_list_split_stats.enabled) {
+		split.begin_usec = OS::get_singleton()->get_ticks_usec();
+	}
+	_render_list(split.draw_list, render_list_split_params->framebuffer_format, render_list_split_params, split.from_element, split.to_element, &split);
+	if (render_list_split_stats.enabled) {
+		split.end_usec = OS::get_singleton()->get_ticks_usec();
+	}
+}
+
+uint64_t RenderForwardClustered::_parallel_run(uint32_t p_part_count, uint32_t p_thread_count, ParallelPart p_part) {
+	// Publish the run: closed first, so a helper still looking at the previous one can't pair its claim with the new
+	// count.
+	const uint32_t worker_count = MIN(p_part_count, p_thread_count) - 1;
+	parallel_generation++;
+	const uint64_t generation_bits = uint64_t(parallel_generation) << 32;
+	parallel_claim.store(generation_bits | 0xFFFFFFFF, std::memory_order_relaxed);
+	parallel_part = p_part;
+	parallel_part_count.set(p_part_count);
+	parallel_parts_done.set(0);
+	parallel_run_workers.store(worker_count, std::memory_order_relaxed);
+	parallel_run_joined.set(0);
+	parallel_claim.store(generation_bits, std::memory_order_release);
+
+	// Wake only the helpers missing; the render thread takes parts too while they come, and doesn't wait for helpers
+	// that come after every part is taken.
+	_parallel_release_groups(false);
+	const uint32_t helpers = parallel_helpers.get();
+	if (worker_count > helpers) {
+		const uint32_t wake = worker_count - helpers;
+		parallel_helpers.add(wake);
+		parallel_groups.push_back(WorkerThreadPool::get_singleton()->add_template_group_task(this, &RenderForwardClustered::_parallel_helper_task, parallel_epoch.get(), wake, wake, true, "ForwardClusteredParallelHelper"));
+		if (render_list_split_stats.enabled) {
+			render_list_split_stats.helpers_woken += wake;
+		}
+	}
+	const uint64_t begin_usec = OS::get_singleton()->get_ticks_usec();
+	_parallel_run_claimed(true);
+
+	const uint64_t wait_begin_usec = OS::get_singleton()->get_ticks_usec();
+	while (parallel_parts_done.get() < p_part_count) {
+		Thread::yield();
+	}
+	const uint64_t end_usec = OS::get_singleton()->get_ticks_usec();
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.run_usec += end_usec - begin_usec;
+		render_list_split_stats.runs++;
+	}
+	return end_usec - wait_begin_usec;
+}
+
+// Wait a little without leaving the core, and without taking much from the other thread of the same core.
+static _FORCE_INLINE_ void _parallel_spin_pause() {
+	for (int i = 0; i < 16; i++) {
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+		_mm_pause();
+#elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_ARM64))
+		__yield();
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__))
+		__builtin_ia32_pause();
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__arm__) || defined(__aarch64__))
+		asm volatile("yield");
+#endif
+	}
+}
+
+void RenderForwardClustered::_parallel_helper_task(uint32_t p_index, uint32_t p_epoch) {
+	uint32_t generation = 0xFFFFFFFF; // The last run this helper looked at.
+	bool joined = false;
+	uint64_t idle_begin_usec = 0;
+	while (!parallel_helpers_stop.is_set()) {
+		const uint64_t claim = parallel_claim.load(std::memory_order_acquire);
+		if (uint32_t(claim) < parallel_part_count.get()) {
+			// A run with parts left: join it if it still wants helpers. Time spent beside a run isn't idle.
+			if (uint32_t(claim >> 32) != generation) {
+				generation = uint32_t(claim >> 32);
+				joined = parallel_run_joined.increment() <= parallel_run_workers.load(std::memory_order_relaxed);
+			}
+			if (joined) {
+				_parallel_run_claimed(false);
+			}
+			idle_begin_usec = 0;
+		} else {
+			const uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
+			if (idle_begin_usec == 0) {
+				idle_begin_usec = now_usec;
+			} else if (now_usec - idle_begin_usec >= parallel_linger_usec || parallel_epoch.get() != p_epoch) {
+				break;
+			}
+		}
+		_parallel_spin_pause();
+	}
+	parallel_helpers.decrement();
+}
+
+bool RenderForwardClustered::_parallel_run_claimed(bool p_caller) {
+	bool ran = false;
+	uint64_t claim = parallel_claim.load(std::memory_order_acquire);
+	while (uint32_t(claim) < parallel_part_count.get()) {
+		if (!parallel_claim.compare_exchange_weak(claim, claim + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+			continue;
+		}
+
+		const uint64_t part_begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+		(this->*parallel_part)(uint32_t(claim));
+		if (render_list_split_stats.enabled) {
+			render_list_split_stats.run_parts.increment();
+			render_list_split_stats.run_parts_usec.add(OS::get_singleton()->get_ticks_usec() - part_begin_usec);
+			if (p_caller) {
+				render_list_split_stats.run_parts_on_caller.increment();
+			}
+		}
+		parallel_parts_done.increment();
+		ran = true;
+		claim = parallel_claim.load(std::memory_order_acquire);
+	}
+	return ran;
+}
+
+void RenderForwardClustered::_parallel_release_groups(bool p_wait) {
+	for (uint32_t i = 0; i < parallel_groups.size();) {
+		if (p_wait || WorkerThreadPool::get_singleton()->is_group_task_completed(parallel_groups[i])) {
+			WorkerThreadPool::get_singleton()->wait_for_group_task_completion(parallel_groups[i]);
+			parallel_groups.remove_at_unordered(i);
+		} else {
+			i++;
+		}
+	}
 }
 
 uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier, bool p_pancake_shadows) {
@@ -807,10 +1150,10 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 
 void RenderForwardClustered::SceneState::grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append) {
 	if (p_req_element_count > 0) {
-		if (instance_buffer[p_render_list].get_size(0u) < p_req_element_count * sizeof(SceneState::InstanceData)) {
+		if (instance_buffer[p_render_list].get_size(0u) < p_req_element_count * sizeof(SceneState::ElementData)) {
 			instance_buffer[p_render_list].uninit();
 			uint32_t new_size = Math::nearest_power_of_2_templated(MAX(uint64_t(INSTANCE_DATA_BUFFER_MIN_SIZE), p_req_element_count));
-			instance_buffer[p_render_list].set_storage_size(0u, new_size * sizeof(SceneState::InstanceData));
+			instance_buffer[p_render_list].set_storage_size(0u, new_size * sizeof(SceneState::ElementData));
 			curr_gpu_ptr[p_render_list] = nullptr;
 		}
 
@@ -821,7 +1164,324 @@ void RenderForwardClustered::SceneState::grow_instance_buffer(RenderListType p_r
 	}
 }
 
+#ifdef DEBUG_ENABLED
+void RenderForwardClustered::_store_instance_data(const GeometryInstanceForwardClustered *p_inst, const GeometryInstanceSurfaceDataCache *p_surface, uint32_t p_flags, uint32_t p_gi_offset, SceneState::InstanceData *r_instance_data) {
+	if (likely(p_inst->store_transform_cache)) {
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(p_inst->transform, r_instance_data->transform);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(p_inst->prev_transform, r_instance_data->prev_transform);
+
+#ifdef REAL_T_IS_DOUBLE
+		// Split the origin into two components, the float approximation and the missing precision.
+		// In the shader we will combine these back together to restore the lost precision.
+		RendererRD::MaterialStorage::split_double(p_inst->transform.origin.x, &r_instance_data->transform[3], &r_instance_data->model_precision[0]);
+		RendererRD::MaterialStorage::split_double(p_inst->transform.origin.y, &r_instance_data->transform[7], &r_instance_data->model_precision[1]);
+		RendererRD::MaterialStorage::split_double(p_inst->transform.origin.z, &r_instance_data->transform[11], &r_instance_data->model_precision[2]);
+		RendererRD::MaterialStorage::split_double(p_inst->prev_transform.origin.x, &r_instance_data->prev_transform[3], &r_instance_data->prev_model_precision[0]);
+		RendererRD::MaterialStorage::split_double(p_inst->prev_transform.origin.y, &r_instance_data->prev_transform[7], &r_instance_data->prev_model_precision[1]);
+		RendererRD::MaterialStorage::split_double(p_inst->prev_transform.origin.z, &r_instance_data->prev_transform[11], &r_instance_data->prev_model_precision[2]);
+#endif
+	} else {
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(Transform3D(), r_instance_data->transform);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(Transform3D(), r_instance_data->prev_transform);
+#ifdef REAL_T_IS_DOUBLE
+		memset(r_instance_data->model_precision, 0, sizeof(r_instance_data->model_precision));
+		memset(r_instance_data->prev_model_precision, 0, sizeof(r_instance_data->prev_model_precision));
+#endif
+	}
+
+	r_instance_data->flags = p_flags;
+	r_instance_data->gi_offset = p_gi_offset;
+	r_instance_data->layer_mask = p_inst->layer_mask;
+	r_instance_data->instance_uniforms_ofs = uint32_t(p_inst->shader_uniforms_offset);
+	r_instance_data->set_lightmap_uv_scale(p_inst->lightmap_uv_scale);
+
+	AABB surface_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
+	uint64_t format = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_surface->surface);
+	Vector4 uv_scale = Vector4(0.0, 0.0, 0.0, 0.0);
+
+	if (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+		surface_aabb = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_aabb(p_surface->surface);
+		uv_scale = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_uv_scale(p_surface->surface);
+	}
+
+	r_instance_data->set_compressed_aabb(surface_aabb);
+	r_instance_data->set_uv_scale(uv_scale);
+}
+#endif
+
+void RenderForwardClustered::_instance_slot_compute(const GeometryInstanceForwardClustered *p_instance, InstanceSlotData &r_data) {
+	// Same values as the instance fields of the per-element record (_store_instance_data()).
+	if (likely(p_instance->store_transform_cache)) {
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(p_instance->transform, r_data.transform);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(p_instance->prev_transform, r_data.prev_transform);
+#ifdef REAL_T_IS_DOUBLE
+		RendererRD::MaterialStorage::split_double(p_instance->transform.origin.x, &r_data.transform[3], &r_data.model_precision[0]);
+		RendererRD::MaterialStorage::split_double(p_instance->transform.origin.y, &r_data.transform[7], &r_data.model_precision[1]);
+		RendererRD::MaterialStorage::split_double(p_instance->transform.origin.z, &r_data.transform[11], &r_data.model_precision[2]);
+		RendererRD::MaterialStorage::split_double(p_instance->prev_transform.origin.x, &r_data.prev_transform[3], &r_data.prev_model_precision[0]);
+		RendererRD::MaterialStorage::split_double(p_instance->prev_transform.origin.y, &r_data.prev_transform[7], &r_data.prev_model_precision[1]);
+		RendererRD::MaterialStorage::split_double(p_instance->prev_transform.origin.z, &r_data.prev_transform[11], &r_data.prev_model_precision[2]);
+		r_data.model_precision[3] = 0.0f;
+		r_data.prev_model_precision[3] = 0.0f;
+#endif
+	} else {
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(Transform3D(), r_data.transform);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(Transform3D(), r_data.prev_transform);
+#ifdef REAL_T_IS_DOUBLE
+		memset(r_data.model_precision, 0, sizeof(r_data.model_precision));
+		memset(r_data.prev_model_precision, 0, sizeof(r_data.prev_model_precision));
+#endif
+	}
+	r_data.layer_mask = p_instance->layer_mask;
+	r_data.instance_uniforms_ofs = uint32_t(p_instance->shader_uniforms_offset);
+	r_data.pad[0] = 0;
+	r_data.pad[1] = 0;
+	r_data.lightmap_uv_scale[0] = p_instance->lightmap_uv_scale.position.x;
+	r_data.lightmap_uv_scale[1] = p_instance->lightmap_uv_scale.position.y;
+	r_data.lightmap_uv_scale[2] = p_instance->lightmap_uv_scale.size.x;
+	r_data.lightmap_uv_scale[3] = p_instance->lightmap_uv_scale.size.y;
+}
+
+void RenderForwardClustered::_surface_slot_alloc(GeometryInstanceSurfaceDataCache *p_surface) {
+	SurfaceSlots &slots = surface_slots;
+	uint32_t slot;
+	if (!slots.free_slots.is_empty()) {
+		slot = slots.free_slots[slots.free_slots.size() - 1];
+		slots.free_slots.resize(slots.free_slots.size() - 1);
+	} else {
+		slot = slots.data.size();
+		slots.data.push_back(SurfaceSlotData());
+	}
+	p_surface->surface_slot = slot;
+
+	// Same values as the surface fields of the per-element record (_store_instance_data()).
+	AABB aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
+	Vector4 uv_scale = Vector4(0.0, 0.0, 0.0, 0.0);
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	if (mesh_storage->mesh_surface_get_format(p_surface->surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+		aabb = mesh_storage->mesh_surface_get_aabb(p_surface->surface);
+		uv_scale = mesh_storage->mesh_surface_get_uv_scale(p_surface->surface);
+	}
+	slots.dirty.push_back(slot);
+	SurfaceSlotData &data = slots.data[slot];
+	data.compressed_aabb_position[0] = aabb.position.x;
+	data.compressed_aabb_position[1] = aabb.position.y;
+	data.compressed_aabb_position[2] = aabb.position.z;
+	data.compressed_aabb_position[3] = 0.0f;
+	data.compressed_aabb_size[0] = aabb.size.x;
+	data.compressed_aabb_size[1] = aabb.size.y;
+	data.compressed_aabb_size[2] = aabb.size.z;
+	data.compressed_aabb_size[3] = 0.0f;
+	data.uv_scale[0] = uv_scale.x;
+	data.uv_scale[1] = uv_scale.y;
+	data.uv_scale[2] = uv_scale.z;
+	data.uv_scale[3] = uv_scale.w;
+}
+
+void RenderForwardClustered::_surface_slot_free(GeometryInstanceSurfaceDataCache *p_surface) {
+	if (p_surface->surface_slot == UINT32_MAX) {
+		return;
+	}
+	surface_slots.free_slots.push_back(p_surface->surface_slot);
+	p_surface->surface_slot = UINT32_MAX;
+}
+
+void RenderForwardClustered::_instance_slot_alloc(GeometryInstanceForwardClustered *p_instance) {
+	InstanceSlots &slots = instance_slots;
+	uint32_t slot;
+	if (!slots.free_slots.is_empty()) {
+		slot = slots.free_slots[slots.free_slots.size() - 1];
+		slots.free_slots.resize(slots.free_slots.size() - 1);
+	} else {
+		slot = slots.data.size();
+		slots.data.push_back(InstanceSlotData());
+		slots.owners.push_back(nullptr);
+	}
+	slots.owners[slot] = p_instance;
+	p_instance->instance_slot = slot;
+	p_instance->instance_slot_dirty = false;
+	p_instance->_mark_instance_slot_dirty();
+}
+
+void RenderForwardClustered::_instance_slot_free(GeometryInstanceForwardClustered *p_instance) {
+	if (p_instance->instance_slot == UINT32_MAX) {
+		return;
+	}
+	// It may still be listed as dirty: _instance_slots_flush() skips a slot without owner, or whose owner is not dirty.
+	instance_slots.owners[p_instance->instance_slot] = nullptr;
+	instance_slots.free_slots.push_back(p_instance->instance_slot);
+	p_instance->instance_slot = UINT32_MAX;
+}
+
+void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_instance_slot_dirty() {
+	if (instance_slot_dirty || instance_slot == UINT32_MAX) {
+		return;
+	}
+	InstanceSlots &slots = RenderForwardClustered::get_singleton()->instance_slots;
+	slots.dirty_lock.lock();
+	instance_slot_dirty = true;
+	slots.dirty.push_back(instance_slot);
+	slots.dirty_lock.unlock();
+}
+
+void RenderForwardClustered::_instance_slots_flush() {
+	InstanceSlots &slots = instance_slots;
+#ifdef DEBUG_ENABLED
+	if (slots.check) {
+		const uint64_t frame = RSG::rasterizer->get_frame_number();
+		if (frame != slots.frame) {
+			slots.frame = frame;
+			slots.frames++;
+			if (slots.frames == 240) {
+				MutexLock lock(slots.first_mismatch_mutex);
+				print_line(vformat("Instance slots: %d in use, %.1f written per frame, %d surface slots; %.0f elements checked per frame, %d differences%s.",
+						slots.owners.size() - slots.free_slots.size(), slots.slots_written / 240.0, surface_slots.data.size() - surface_slots.free_slots.size(), slots.checked.get() / 240.0, slots.mismatches.get(), slots.first_mismatch.is_empty() ? String() : " (first: " + slots.first_mismatch + ")"));
+				slots.frames = 0;
+				slots.slots_written = 0;
+				slots.checked.set(0);
+				slots.mismatches.set(0);
+				slots.first_mismatch = String();
+			}
+		}
+	}
+#endif
+	instance_slots_written.clear();
+	for (uint32_t slot : slots.dirty) {
+		GeometryInstanceForwardClustered *instance = slots.owners[slot];
+		if (!instance || !instance->instance_slot_dirty) {
+			continue;
+		}
+		_instance_slot_compute(instance, slots.data[slot]);
+		instance->instance_slot_dirty = false;
+		instance_slots_written.push_back(slot);
+#ifdef DEBUG_ENABLED
+		slots.slots_written++;
+#endif
+	}
+	slots.dirty.clear();
+	_slot_buffers_upload();
+}
+
+void RenderForwardClustered::SlotUploadBuffer::ensure(uint32_t p_slot_count) {
+	if (buffer.is_valid() && capacity >= p_slot_count) {
+		return;
+	}
+	RenderingDevice *rd = RD::get_singleton();
+	if (buffer.is_valid()) {
+		rd->free_rid(buffer); // Freed once the frames using it are done.
+	}
+	capacity = Math::nearest_power_of_2_templated(MAX(1024u, p_slot_count));
+	buffer = rd->storage_buffer_create(capacity * slot_size, Vector<uint8_t>(), BitField<RenderingDevice::StorageBufferUsage>(), RD::BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT);
+	written.resize(MAX(rd->get_frame_delay(), 1u));
+	for (LocalVector<uint32_t> &slots : written) {
+		slots.clear();
+	}
+	full_writes = written.size();
+	mapped_frame = UINT64_MAX;
+	mapped = nullptr;
+}
+
+void RenderForwardClustered::SlotUploadBuffer::begin_frame(uint32_t p_slot_count, const uint8_t *p_slots, uint64_t p_frame) {
+	ensure(p_slot_count);
+	if (mapped_frame == p_frame) {
+		return;
+	}
+	mapped = RD::get_singleton()->buffer_persistent_map_advance(buffer);
+	mapped_frame = p_frame;
+	map_index = (map_index + 1) % written.size();
+	if (full_writes > 0) {
+		memcpy(mapped, p_slots, size_t(p_slot_count) * slot_size);
+		full_writes--;
+	} else {
+		// This copy was last written written.size() maps ago: the slots written by the maps since then are stale here.
+		for (uint32_t i = 0; i < written.size(); i++) {
+			if (i == map_index) {
+				continue;
+			}
+			for (uint32_t slot : written[i]) {
+				if (slot < p_slot_count) {
+					memcpy(mapped + size_t(slot) * slot_size, p_slots + size_t(slot) * slot_size, slot_size);
+				}
+			}
+		}
+	}
+	written[map_index].clear();
+}
+
+void RenderForwardClustered::SlotUploadBuffer::write(uint32_t p_slot, const uint8_t *p_slots) {
+	memcpy(mapped + size_t(p_slot) * slot_size, p_slots + size_t(p_slot) * slot_size, slot_size);
+	written[map_index].push_back(p_slot);
+}
+
+void RenderForwardClustered::SlotUploadBuffer::free() {
+	if (buffer.is_valid()) {
+		RD::get_singleton()->free_rid(buffer);
+		buffer = RID();
+	}
+	capacity = 0;
+}
+
+void RenderForwardClustered::_slot_buffers_upload() {
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+
+	const uint8_t *instance_data = reinterpret_cast<const uint8_t *>(instance_slots.data.ptr());
+	instance_slot_buffer.begin_frame(instance_slots.data.size(), instance_data, frame);
+	for (uint32_t slot : instance_slots_written) {
+		instance_slot_buffer.write(slot, instance_data);
+	}
+
+	const uint8_t *surface_data = reinterpret_cast<const uint8_t *>(surface_slots.data.ptr());
+	surface_slot_buffer.begin_frame(surface_slots.data.size(), surface_data, frame);
+	for (uint32_t slot : surface_slots.dirty) {
+		surface_slot_buffer.write(slot, surface_data);
+	}
+	surface_slots.dirty.clear();
+}
+
+#ifdef DEBUG_ENABLED
+void RenderForwardClustered::_instance_slot_check(const GeometryInstanceForwardClustered *p_instance, const GeometryInstanceSurfaceDataCache *p_surface, const SceneState::InstanceData &p_data) {
+	InstanceSlots &slots = instance_slots;
+	slots.checked.increment();
+	if (p_instance->instance_slot == UINT32_MAX) {
+		return;
+	}
+	const InstanceSlotData &slot = slots.data[p_instance->instance_slot];
+	const char *field = nullptr;
+	if (memcmp(slot.transform, p_data.transform, sizeof(slot.transform)) != 0) {
+		field = "transform";
+	} else if (memcmp(slot.prev_transform, p_data.prev_transform, sizeof(slot.prev_transform)) != 0) {
+		field = "prev_transform";
+	} else if (slot.layer_mask != p_data.layer_mask) {
+		field = "layer_mask";
+	} else if (slot.instance_uniforms_ofs != p_data.instance_uniforms_ofs) {
+		field = "instance_uniforms_ofs";
+	} else if (memcmp(slot.lightmap_uv_scale, p_data.lightmap_uv_scale, sizeof(slot.lightmap_uv_scale)) != 0) {
+		field = "lightmap_uv_scale";
+#ifdef REAL_T_IS_DOUBLE
+	} else if (memcmp(slot.model_precision, p_data.model_precision, sizeof(float) * 3) != 0 || memcmp(slot.prev_model_precision, p_data.prev_model_precision, sizeof(float) * 3) != 0) {
+		field = "model_precision";
+#endif
+	} else if (p_surface->surface_slot != UINT32_MAX) {
+		// The fourth component of the AABB vectors is never written in InstanceData, nor read.
+		const SurfaceSlotData &surface = surface_slots.data[p_surface->surface_slot];
+		if (memcmp(surface.compressed_aabb_position, p_data.compressed_aabb_position, sizeof(float) * 3) != 0 || memcmp(surface.compressed_aabb_size, p_data.compressed_aabb_size, sizeof(float) * 3) != 0) {
+			field = "compressed_aabb";
+		} else if (memcmp(surface.uv_scale, p_data.uv_scale, sizeof(surface.uv_scale)) != 0) {
+			field = "uv_scale";
+		}
+	} else {
+		field = "surface without slot";
+	}
+	if (field && slots.mismatches.increment() == 1) {
+		MutexLock lock(slots.first_mismatch_mutex);
+		slots.first_mismatch = vformat("%s, slot %d, base type %d, transform status %d, still marked dirty: %s", field, p_instance->instance_slot, int(p_instance->data->base_type), int(p_instance->transform_status), p_instance->instance_slot_dirty ? "yes" : "no");
+		print_line("Instance slots: difference in frame " + itos(RSG::rasterizer->get_frame_number()) + ": " + slots.first_mismatch);
+	}
+}
+#endif
+
 void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, int *p_render_info, uint32_t p_offset, int32_t p_max_elements, bool p_update_buffer) {
+	_instance_slots_flush();
 	RenderList *rl = &render_list[p_render_list];
 	uint32_t element_total = p_max_elements >= 0 ? uint32_t(p_max_elements) : rl->elements.size();
 
@@ -832,69 +1492,42 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 	scene_state.grow_instance_buffer(p_render_list, p_offset + element_total, p_offset != 0u);
 	if (!scene_state.curr_gpu_ptr[p_render_list] && element_total > 0u) {
 		// The old buffer was replaced for another larger one. We must start copying from scratch.
-		element_total += p_offset;
-		p_offset = 0u;
-		scene_state.curr_gpu_ptr[p_render_list] = reinterpret_cast<SceneState::InstanceData *>(scene_state.instance_buffer[p_render_list].map_raw_for_upload(0u));
+		scene_state.curr_gpu_ptr[p_render_list] = reinterpret_cast<SceneState::ElementData *>(scene_state.instance_buffer[p_render_list].map_raw_for_upload(0u));
+		// The elements before p_offset belong to earlier calls (the previous shadow passes), drawn from this buffer too:
+		// only their entries are written again, their element info (instancing repeats) stays as it was computed.
+		for (uint32_t i = 0; i < p_offset; i++) {
+			const GeometryInstanceSurfaceDataCache *surface = rl->elements[i];
+			const GeometryInstanceForwardClustered *inst = surface->owner;
+			scene_state.curr_gpu_ptr[p_render_list][i] = { inst->instance_slot, surface->surface_slot, inst->flags_cache, inst->gi_offset_cache };
+		}
 	}
 
 	if (p_render_info) {
 		p_render_info[RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME] += element_total;
 	}
 
+	// Large lists are filled by several threads in ranges of elements; the runs of repeated elements are counted
+	// afterwards, in order.
+	const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	fill_instance_data_repeats.resize(element_total);
+	uint32_t part_count = 1;
+	if (list_build_min_instances > 0 && list_build_max_threads > 1) {
+		part_count = CLAMP(element_total / (list_build_min_instances * 4), 1u, list_build_max_threads * 2);
+	}
+	if (part_count > 1) {
+		FillInstanceDataParameters &params = fill_instance_data_params;
+		params.render_list = p_render_list;
+		params.offset = p_offset;
+		params.count = element_total;
+		params.part_count = part_count;
+		_parallel_run(part_count, list_build_max_threads, &RenderForwardClustered::_fill_instance_data_part);
+	} else {
+		_fill_instance_data_range(p_render_list, p_offset, 0, element_total);
+	}
+
 	uint32_t repeats = 0;
-	GeometryInstanceSurfaceDataCache *prev_surface = nullptr;
 	for (uint32_t i = 0; i < element_total; i++) {
-		GeometryInstanceSurfaceDataCache *surface = rl->elements[i + p_offset];
-		GeometryInstanceForwardClustered *inst = surface->owner;
-
-		SceneState::InstanceData instance_data;
-
-		if (likely(inst->store_transform_cache)) {
-			RendererRD::MaterialStorage::store_transform_transposed_3x4(inst->transform, instance_data.transform);
-			RendererRD::MaterialStorage::store_transform_transposed_3x4(inst->prev_transform, instance_data.prev_transform);
-
-#ifdef REAL_T_IS_DOUBLE
-			// Split the origin into two components, the float approximation and the missing precision.
-			// In the shader we will combine these back together to restore the lost precision.
-			RendererRD::MaterialStorage::split_double(inst->transform.origin.x, &instance_data.transform[3], &instance_data.model_precision[0]);
-			RendererRD::MaterialStorage::split_double(inst->transform.origin.y, &instance_data.transform[7], &instance_data.model_precision[1]);
-			RendererRD::MaterialStorage::split_double(inst->transform.origin.z, &instance_data.transform[11], &instance_data.model_precision[2]);
-			RendererRD::MaterialStorage::split_double(inst->prev_transform.origin.x, &instance_data.prev_transform[3], &instance_data.prev_model_precision[0]);
-			RendererRD::MaterialStorage::split_double(inst->prev_transform.origin.y, &instance_data.prev_transform[7], &instance_data.prev_model_precision[1]);
-			RendererRD::MaterialStorage::split_double(inst->prev_transform.origin.z, &instance_data.prev_transform[11], &instance_data.prev_model_precision[2]);
-#endif
-		} else {
-			RendererRD::MaterialStorage::store_transform_transposed_3x4(Transform3D(), instance_data.transform);
-			RendererRD::MaterialStorage::store_transform_transposed_3x4(Transform3D(), instance_data.prev_transform);
-#ifdef REAL_T_IS_DOUBLE
-			memset(instance_data.model_precision, 0, sizeof(instance_data.model_precision));
-			memset(instance_data.prev_model_precision, 0, sizeof(instance_data.prev_model_precision));
-#endif
-		}
-
-		instance_data.flags = inst->flags_cache;
-		instance_data.gi_offset = inst->gi_offset_cache;
-		instance_data.layer_mask = inst->layer_mask;
-		instance_data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
-		instance_data.set_lightmap_uv_scale(inst->lightmap_uv_scale);
-
-		AABB surface_aabb = AABB(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 1.0));
-		uint64_t format = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(surface->surface);
-		Vector4 uv_scale = Vector4(0.0, 0.0, 0.0, 0.0);
-
-		if (format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
-			surface_aabb = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_aabb(surface->surface);
-			uv_scale = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_uv_scale(surface->surface);
-		}
-
-		instance_data.set_compressed_aabb(surface_aabb);
-		instance_data.set_uv_scale(uv_scale);
-
-		scene_state.curr_gpu_ptr[p_render_list][i + p_offset] = instance_data;
-
-		const bool cant_repeat = instance_data.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
-
-		if (prev_surface != nullptr && !cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && inst->mirror == prev_surface->owner->mirror && repeats < RenderElementInfo::MAX_REPEATS) {
+		if (fill_instance_data_repeats[i] && repeats < RenderElementInfo::MAX_REPEATS) {
 			//this element is the same as the previous one, count repeats to draw it using instancing
 			repeats++;
 		} else {
@@ -908,16 +1541,6 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 				p_render_info[RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME]++;
 			}
 		}
-
-		RenderElementInfo &element_info = rl->element_info[p_offset + i];
-
-		element_info.value = uint32_t(surface->sort.sort_key1 & 0xFFF);
-
-		if (cant_repeat) {
-			prev_surface = nullptr;
-		} else {
-			prev_surface = surface;
-		}
 	}
 
 	if (repeats > 0) {
@@ -926,8 +1549,53 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 		}
 	}
 
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.instance_data_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
+		render_list_split_stats.parallel_builds += part_count > 1 ? 1 : 0;
+	}
+
 	if (p_update_buffer && element_total > 0u) {
 		RenderingDevice::get_singleton()->buffer_flush(scene_state.instance_buffer[p_render_list]._get(0u));
+	}
+}
+
+void RenderForwardClustered::_fill_instance_data_part(uint32_t p_part) {
+	const FillInstanceDataParameters &params = fill_instance_data_params;
+	const uint32_t from = uint32_t(uint64_t(params.count) * p_part / params.part_count);
+	const uint32_t to = uint32_t(uint64_t(params.count) * (p_part + 1) / params.part_count);
+	_fill_instance_data_range(params.render_list, params.offset, from, to);
+}
+
+void RenderForwardClustered::_fill_instance_data_range(RenderListType p_render_list, uint32_t p_offset, uint32_t p_from, uint32_t p_to) {
+	RenderList *rl = &render_list[p_render_list];
+	for (uint32_t i = p_from; i < p_to; i++) {
+		GeometryInstanceSurfaceDataCache *surface = rl->elements[i + p_offset];
+		GeometryInstanceForwardClustered *inst = surface->owner;
+
+#ifdef DEBUG_ENABLED
+		if (unlikely(instance_slots.check)) {
+			SceneState::InstanceData instance_data;
+			_store_instance_data(inst, surface, inst->flags_cache, inst->gi_offset_cache, &instance_data);
+			_instance_slot_check(inst, surface, instance_data);
+		}
+#endif
+
+		scene_state.curr_gpu_ptr[p_render_list][i + p_offset] = { inst->instance_slot, surface->surface_slot, inst->flags_cache, inst->gi_offset_cache };
+
+		// Same as the previous element: drawn with it, instanced. Multimeshes and mesh instances never are.
+		const bool cant_repeat = inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
+		bool repeat = false;
+		if (i > 0 && !cant_repeat) {
+			const GeometryInstanceSurfaceDataCache *prev_surface = rl->elements[i - 1 + p_offset];
+			const GeometryInstanceForwardClustered *prev_inst = prev_surface->owner;
+			const bool prev_cant_repeat = prev_inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH || prev_inst->mesh_instance.is_valid();
+			repeat = !prev_cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && inst->mirror == prev_inst->mirror && inst->cube_face_mask == prev_inst->cube_face_mask;
+		}
+		fill_instance_data_repeats[i] = repeat;
+
+		RenderElementInfo &element_info = rl->element_info[p_offset + i];
+		element_info.value = uint32_t(surface->sort.sort_key1 & 0xFFF);
+		element_info.cube_face_mask = inst->cube_face_mask;
 	}
 }
 
@@ -937,8 +1605,6 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append, bool p_alpha_only) {
-	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
-
 	if (p_render_list == RENDER_LIST_OPAQUE) {
 		scene_state.used_sss = false;
 		scene_state.used_screen_texture = false;
@@ -947,7 +1613,6 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 		scene_state.used_lightmap = false;
 		scene_state.used_opaque_stencil = false;
 	}
-	uint32_t lightmap_captures_used = 0;
 
 	Plane near_plane = Plane(-p_render_data->scene_data->cam_transform.basis.get_column(Vector3::AXIS_Z), p_render_data->scene_data->cam_transform.origin);
 	near_plane.d += p_render_data->scene_data->cam_projection.get_z_near();
@@ -955,6 +1620,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	RenderList *rl = &render_list[p_render_list];
 	_update_dirty_geometry_instances();
+	_instance_slots_flush();
 
 	if (!p_append) {
 		rl->clear();
@@ -967,13 +1633,160 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	//fill list
 
-	const uint64_t frame = RSG::rasterizer->get_frame_number();
-	for (int i = 0; i < (int)p_render_data->instances->size(); i++) {
+	const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	const uint32_t instance_count = p_render_data->instances->size();
+
+	FillRenderListParameters &params = fill_render_list_params;
+	params.render_list = p_render_list;
+	params.render_data = p_render_data;
+	params.pass_mode = p_pass_mode;
+	params.using_sdfgi = p_using_sdfgi;
+	params.using_opaque_gi = p_using_opaque_gi;
+	params.using_motion_pass = p_using_motion_pass;
+	params.alpha_only = p_alpha_only;
+	params.near_plane = near_plane;
+	params.z_max = z_max;
+	params.max_lightmap_captures = scene_state.max_lightmap_captures;
+	params.frame = RSG::rasterizer->get_frame_number();
+
+	// Large lists are filled by several threads, in contiguous ranges of instances merged in order: the same lists
+	// in the same order as filled serially.
+	uint32_t chunk_count = 1;
+	if (list_build_min_instances > 0 && list_build_max_threads > 1) {
+		chunk_count = CLAMP(instance_count / list_build_min_instances, 1u, list_build_max_threads * 2);
+	}
+
+	for (int attempt = 0; attempt < 2; attempt++) {
+		if (fill_render_list_chunks.size() < chunk_count) {
+			fill_render_list_chunks.resize(chunk_count);
+		}
+		for (uint32_t i = 0; i < chunk_count; i++) {
+			FillRenderListChunk &chunk = fill_render_list_chunks[i];
+			chunk.from_instance = uint32_t(uint64_t(instance_count) * i / chunk_count);
+			chunk.to_instance = uint32_t(uint64_t(instance_count) * (i + 1) / chunk_count);
+			chunk.elements.clear();
+			chunk.alpha_elements.clear();
+			chunk.motion_elements.clear();
+			chunk.lightmap_captures.clear();
+			chunk.used = 0;
+			chunk.visible_primitives = 0;
+			chunk.shadow_primitives = 0;
+		}
+
+		if (chunk_count > 1) {
+			_parallel_run(chunk_count, list_build_max_threads, &RenderForwardClustered::_fill_render_list_part);
+		} else {
+			_fill_render_list_chunk(fill_render_list_chunks[0]);
+		}
+
+		// Lightmap captures beyond the limit are dropped in instance order, which only one chunk knows: redo serially.
+		uint32_t captures = 0;
+		for (uint32_t i = 0; i < chunk_count; i++) {
+			captures += fill_render_list_chunks[i].lightmap_captures.size();
+		}
+		if (chunk_count == 1 || captures <= scene_state.max_lightmap_captures) {
+			break;
+		}
+		chunk_count = 1;
+	}
+
+	uint32_t lightmap_captures_used = 0;
+	uint32_t used = 0;
+	for (uint32_t i = 0; i < chunk_count; i++) {
+		const FillRenderListChunk &chunk = fill_render_list_chunks[i];
+		for (GeometryInstanceSurfaceDataCache *surf : chunk.elements) {
+			rl->add_element(surf);
+		}
+		for (GeometryInstanceSurfaceDataCache *surf : chunk.alpha_elements) {
+			render_list[RENDER_LIST_ALPHA].add_element(surf);
+		}
+		for (GeometryInstanceSurfaceDataCache *surf : chunk.motion_elements) {
+			render_list[RENDER_LIST_MOTION].add_element(surf);
+		}
+
+		for (GeometryInstanceForwardClustered *inst : chunk.lightmap_captures) {
+			const Color *src_capture = inst->lightmap_sh->sh;
+			LightmapCaptureData &lcd = scene_state.lightmap_captures[lightmap_captures_used];
+			for (int j = 0; j < 9; j++) {
+				lcd.sh[j * 4 + 0] = src_capture[j].r;
+				lcd.sh[j * 4 + 1] = src_capture[j].g;
+				lcd.sh[j * 4 + 2] = src_capture[j].b;
+				lcd.sh[j * 4 + 3] = src_capture[j].a;
+			}
+			inst->gi_offset_cache = lightmap_captures_used;
+			lightmap_captures_used++;
+		}
+
+		used |= chunk.used;
+		if (p_render_data->render_info) {
+			p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += int(chunk.visible_primitives);
+			p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += int(chunk.shadow_primitives);
+		}
+	}
+
+	scene_state.used_sss = scene_state.used_sss || (used & FillRenderListChunk::USED_SSS);
+	scene_state.used_screen_texture = scene_state.used_screen_texture || (used & FillRenderListChunk::USED_SCREEN_TEXTURE);
+	scene_state.used_normal_texture = scene_state.used_normal_texture || (used & FillRenderListChunk::USED_NORMAL_TEXTURE);
+	scene_state.used_depth_texture = scene_state.used_depth_texture || (used & FillRenderListChunk::USED_DEPTH_TEXTURE);
+	scene_state.used_lightmap = scene_state.used_lightmap || (used & FillRenderListChunk::USED_LIGHTMAP);
+	scene_state.used_opaque_stencil = scene_state.used_opaque_stencil || (used & FillRenderListChunk::USED_OPAQUE_STENCIL);
+
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.fill_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
+		render_list_split_stats.parallel_builds += chunk_count > 1 ? 1 : 0;
+
+		const bool main_view = p_render_list == RENDER_LIST_OPAQUE && p_pass_mode == PASS_MODE_COLOR;
+		const bool shadow_pass = p_render_list == RENDER_LIST_SECONDARY && (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP || p_pass_mode == PASS_MODE_SHADOW_CUBE);
+		if (main_view || shadow_pass) {
+			const RenderSceneDataRD *scene_data = p_render_data->scene_data;
+			uint32_t camera = hash_murmur3_buffer(&scene_data->cam_transform, sizeof(Transform3D));
+			camera = hash_murmur3_buffer(&scene_data->cam_projection, sizeof(Projection), camera);
+			camera = hash_murmur3_buffer(&scene_data->main_cam_transform, sizeof(Transform3D), camera);
+			camera = hash_murmur3_one_float(scene_data->lod_distance_multiplier, camera);
+			camera = hash_murmur3_one_float(scene_data->screen_mesh_lod_threshold, camera);
+			const uint64_t key = shadow_pass ? shadow_append_list_key : hash_murmur3_one_64(uint64_t(uintptr_t(p_render_data->render_buffers.ptr())), hash_murmur3_one_64(p_render_data->reflection_probe.get_id(), uint32_t(p_render_data->reflection_probe_pass)));
+			RenderListSplitStats::FillChanges &changes = render_list_split_stats.fill_changes[shadow_pass ? 1 : 0];
+			const uint32_t *previous = render_list_split_stats.fill_cameras.getptr(key);
+			changes.fills++;
+			changes.camera_still += (previous && *previous == camera) ? 1 : 0;
+			render_list_split_stats.fill_cameras[key] = camera;
+			const uint64_t frame = RSG::rasterizer->get_frame_number();
+			for (uint32_t i = 0; i < instance_count; i++) {
+				const GeometryInstanceForwardClustered *inst = static_cast<const GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
+				changes.moved += inst->prev_transform_change_frame == frame ? 1 : 0;
+			}
+			changes.instances += instance_count;
+		}
+	}
+
+	if (p_render_list == RENDER_LIST_OPAQUE && lightmap_captures_used) {
+		RD::get_singleton()->buffer_update(scene_state.lightmap_capture_buffer, 0, sizeof(LightmapCaptureData) * lightmap_captures_used, scene_state.lightmap_captures);
+	}
+}
+
+void RenderForwardClustered::_fill_render_list_part(uint32_t p_part) {
+	_fill_render_list_chunk(fill_render_list_chunks[p_part]);
+}
+
+void RenderForwardClustered::_fill_render_list_chunk(FillRenderListChunk &p_chunk) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const FillRenderListParameters &params = fill_render_list_params;
+	const RenderListType p_render_list = params.render_list;
+	const RenderDataRD *p_render_data = params.render_data;
+	const PassMode p_pass_mode = params.pass_mode;
+	const bool p_using_sdfgi = params.using_sdfgi;
+	const bool p_using_opaque_gi = params.using_opaque_gi;
+	const bool p_using_motion_pass = params.using_motion_pass;
+	const bool p_alpha_only = params.alpha_only;
+	const Plane &near_plane = params.near_plane;
+	const float z_max = params.z_max;
+
+	for (uint32_t i = p_chunk.from_instance; i < p_chunk.to_instance; i++) {
 		GeometryInstanceForwardClustered *inst = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
 
-		if ((inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && !(inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES) && inst->multimesh_motion_frame != frame) {
+		if ((inst->base_flags & INSTANCE_DATA_FLAG_MULTIMESH) && !(inst->base_flags & INSTANCE_DATA_FLAG_PARTICLES) && inst->multimesh_motion_frame != params.frame) {
 			inst->multimesh_uses_motion = mesh_storage->_multimesh_get_motion_vectors_offsets(inst->data->base, inst->multimesh_motion_current_offset, inst->multimesh_motion_previous_offset);
-			inst->multimesh_motion_frame = frame;
+			inst->multimesh_motion_frame = params.frame;
 		}
 
 		Vector3 center = inst->transform.origin;
@@ -1073,18 +1886,9 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				}
 
 			} else if (inst->lightmap_sh) {
-				if (lightmap_captures_used < scene_state.max_lightmap_captures) {
-					const Color *src_capture = inst->lightmap_sh->sh;
-					LightmapCaptureData &lcd = scene_state.lightmap_captures[lightmap_captures_used];
-					for (int j = 0; j < 9; j++) {
-						lcd.sh[j * 4 + 0] = src_capture[j].r;
-						lcd.sh[j * 4 + 1] = src_capture[j].g;
-						lcd.sh[j * 4 + 2] = src_capture[j].b;
-						lcd.sh[j * 4 + 3] = src_capture[j].a;
-					}
+				if (p_chunk.lightmap_captures.size() < params.max_lightmap_captures) {
 					flags |= INSTANCE_DATA_FLAG_USE_LIGHTMAP_CAPTURE;
-					inst->gi_offset_cache = lightmap_captures_used;
-					lightmap_captures_used++;
+					p_chunk.lightmap_captures.push_back(inst);
 					uses_lightmap = true;
 				}
 
@@ -1153,9 +1957,9 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				if (p_render_data->render_info && !p_alpha_only) {
 					indices = _indices_to_primitives(surf->primitive, indices);
 					if (p_render_list == RENDER_LIST_OPAQUE) { //opaque
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += indices;
+						p_chunk.visible_primitives += indices;
 					} else if (p_render_list == RENDER_LIST_SECONDARY) { //shadow
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += indices;
+						p_chunk.shadow_primitives += indices;
 					}
 				}
 			} else {
@@ -1166,9 +1970,9 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					to_draw = _indices_to_primitives(surf->primitive, to_draw);
 					to_draw *= inst->instance_count;
 					if (p_render_list == RENDER_LIST_OPAQUE) { //opaque
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += to_draw;
+						p_chunk.visible_primitives += to_draw;
 					} else if (p_render_list == RENDER_LIST_SECONDARY) { //shadow
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += to_draw;
+						p_chunk.shadow_primitives += to_draw;
 					}
 				}
 			}
@@ -1190,53 +1994,53 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				const uint32_t pass_flags = p_alpha_only ? surf->rt_pass_flags : surf->flags;
 
 				if (!p_alpha_only && !force_alpha && (pass_flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
-					rl->add_element(surf);
+					p_chunk.elements.push_back(surf);
 				}
 
 				if (force_alpha || (pass_flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_TRANSPARENT;
-					render_list[RENDER_LIST_ALPHA].add_element(surf);
+					p_chunk.alpha_elements.push_back(surf);
 					if (uses_gi) {
 						surf->sort.uses_forward_gi = 1;
 					}
 				} else if (p_using_motion_pass && (uses_motion || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR))) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_MOTION_VECTORS;
-					render_list[RENDER_LIST_MOTION].add_element(surf);
+					p_chunk.motion_elements.push_back(surf);
 				} else {
 					surf->color_pass_inclusion_mask = 0;
 				}
 
 				if (uses_lightmap) {
 					surf->sort.uses_lightmap = 1;
-					scene_state.used_lightmap = true;
+					p_chunk.used |= FillRenderListChunk::USED_LIGHTMAP;
 				}
 
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_SUBSURFACE_SCATTERING) {
-					scene_state.used_sss = true;
+					p_chunk.used |= FillRenderListChunk::USED_SSS;
 				}
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_SCREEN_TEXTURE) {
-					scene_state.used_screen_texture = true;
+					p_chunk.used |= FillRenderListChunk::USED_SCREEN_TEXTURE;
 				}
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_NORMAL_TEXTURE) {
-					scene_state.used_normal_texture = true;
+					p_chunk.used |= FillRenderListChunk::USED_NORMAL_TEXTURE;
 				}
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_DEPTH_TEXTURE) {
-					scene_state.used_depth_texture = true;
+					p_chunk.used |= FillRenderListChunk::USED_DEPTH_TEXTURE;
 				}
 				if ((surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_STENCIL) && !force_alpha && (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
-					scene_state.used_opaque_stencil = true;
+					p_chunk.used |= FillRenderListChunk::USED_OPAQUE_STENCIL;
 				}
-			} else if (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
+			} else if (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP || p_pass_mode == PASS_MODE_SHADOW_CUBE) {
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW) {
-					rl->add_element(surf);
+					p_chunk.elements.push_back(surf);
 				}
 			} else if (p_pass_mode == PASS_MODE_DEPTH_MATERIAL) {
 				if (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
-					rl->add_element(surf);
+					p_chunk.elements.push_back(surf);
 				}
 			} else {
 				if (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE)) {
-					rl->add_element(surf);
+					p_chunk.elements.push_back(surf);
 				}
 			}
 
@@ -1244,39 +2048,6 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 			surf = surf->next;
 		}
-	}
-
-	if (p_render_list == RENDER_LIST_OPAQUE && lightmap_captures_used) {
-		RD::get_singleton()->buffer_update(scene_state.lightmap_capture_buffer, 0, sizeof(LightmapCaptureData) * lightmap_captures_used, scene_state.lightmap_captures);
-	}
-}
-
-void RenderForwardClustered::RenderList::sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-	thread_local LocalVector<SortKeyElement> keys;
-	keys.resize(p_size);
-	for (uint32_t i = 0; i < p_size; i++) {
-		GeometryInstanceSurfaceDataCache *surface = elements[p_from + i];
-		keys[i] = { surface->sort.sort_key2, surface->sort.sort_key1, surface };
-	}
-	SortArray<SortKeyElement, SortKeyElementLess> sorter;
-	sorter.sort(keys.ptr(), p_size);
-	for (uint32_t i = 0; i < p_size; i++) {
-		elements[p_from + i] = keys[i].surface;
-	}
-}
-
-void RenderForwardClustered::RenderList::sort_by_reverse_depth_and_priority() {
-	thread_local LocalVector<SortDepthElement> keys;
-	const uint32_t count = elements.size();
-	keys.resize(count);
-	for (uint32_t i = 0; i < count; i++) {
-		GeometryInstanceSurfaceDataCache *surface = elements[i];
-		keys[i] = { uint32_t(surface->sort.priority), surface->owner->depth, surface };
-	}
-	SortArray<SortDepthElement, SortDepthElementLess> sorter;
-	sorter.sort(keys.ptr(), count);
-	for (uint32_t i = 0; i < count; i++) {
-		elements[i] = keys[i].surface;
 	}
 }
 
@@ -1653,8 +2424,40 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 		if (p_render_data->cube_shadows.size()) {
 			RENDER_TIMESTAMP("Render OmniLight Shadows");
-			// Cube shadows are rendered in their own way.
-			for (const int &index : p_render_data->cube_shadows) {
+			// Cube shadows are rendered in their own way. In one pass per light where possible, all those lights in
+			// one shadow session; any other cube light face by face afterwards.
+			cube_shadow_rendered.resize(p_render_data->cube_shadows.size());
+			for (uint32_t i = 0; i < cube_shadow_rendered.size(); i++) {
+				cube_shadow_rendered[i] = false;
+			}
+			if (shadow_cube_one_pass) {
+				for (uint32_t i = 0; i < p_render_data->cube_shadows.size(); i++) {
+					if (!_render_shadow_cube_gather(p_render_data, i)) {
+						continue;
+					}
+					if (!cube_shadow_batching) {
+						_render_shadow_begin();
+						cube_shadow_batching = true;
+					}
+					const int index = p_render_data->cube_shadows[i];
+					_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, CUBE_SHADOW_ALL_FACES, cube_shadow_instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
+					_render_shadow_cube_release();
+					for (uint32_t face = 0; face < 6; face++) {
+						cube_shadow_rendered[i + face] = true;
+					}
+					i += 5;
+				}
+				if (cube_shadow_batching) {
+					cube_shadow_batching = false;
+					_render_shadow_process();
+					_render_shadow_end();
+				}
+			}
+			for (uint32_t i = 0; i < p_render_data->cube_shadows.size(); i++) {
+				if (cube_shadow_rendered[i]) {
+					continue;
+				}
+				const int index = p_render_data->cube_shadows[i];
 				_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, p_render_data->render_shadows[index].pass, p_render_data->render_shadows[index].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
 			}
 		}
@@ -1956,7 +2759,7 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 		}
 
 		RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-		// Scale to ±0.5.
+		// Scale to Â±0.5.
 		Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
 		jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
 
@@ -2022,6 +2825,12 @@ void RenderForwardClustered::_prepare_fsr_frame_generation(const RenderDataRD *p
 }
 
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
+	// Helpers looking for the next parallel run leave once the scene is rendered, whichever way this returns.
+	struct ParallelHelpersDismiss {
+		RenderForwardClustered *renderer;
+		~ParallelHelpersDismiss() { renderer->parallel_epoch.increment(); }
+	} parallel_helpers_dismiss = { this };
+
 	scene_state.used_uniform_buffer_count = 0;
 
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
@@ -2215,9 +3024,14 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	_update_render_base_uniform_set();
 
 	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
-	render_list[RENDER_LIST_OPAQUE].sort_by_key();
-	render_list[RENDER_LIST_MOTION].sort_by_key();
-	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
+	const uint64_t view_key = hash_murmur3_one_64(p_render_data->reflection_probe.get_id(), hash_murmur3_one_64(uint64_t(uintptr_t(rb.ptr())), uint32_t(p_render_data->reflection_probe_pass)));
+	_sort_render_lists(view_key);
+
+	if (list_stability.enabled) {
+		_list_stability_add_main_list(view_key, RENDER_LIST_OPAQUE, LIST_STABILITY_OPAQUE);
+		_list_stability_add_main_list(view_key, RENDER_LIST_MOTION, LIST_STABILITY_MOTION);
+		_list_stability_add_main_list(view_key, RENDER_LIST_ALPHA, LIST_STABILITY_ALPHA);
+	}
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
 	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
@@ -2855,6 +3669,7 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 	bool use_pancake = false;
 	bool render_cubemap = false;
 	bool finalize_cubemap = false;
+	bool cube_layered = false;
 
 	bool flip_y = false;
 
@@ -2945,18 +3760,30 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 
 			if (light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
 				render_texture = light_storage->get_cubemap(shadow_size / 2);
-				render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass);
-
-				light_projection = light_storage->light_instance_get_shadow_camera(p_light, p_pass);
-				light_transform = light_storage->light_instance_get_shadow_transform(p_light, p_pass);
 				render_cubemap = true;
-				finalize_cubemap = p_pass == 5;
 				atlas_fb = light_storage->shadow_atlas_get_fb(p_shadow_atlas);
-
 				atlas_size = shadow_atlas_size;
 
-				if (p_pass == 0) {
-					_render_shadow_begin();
+				if (p_pass == CUBE_SHADOW_ALL_FACES) {
+					// The faces share face 0's projection; the vertex shader rotates the light's own view to each face.
+					// Face 0 is light_transform * looking_at(+X, -Y), an axis permutation: undoing it is exact.
+					render_fb = light_storage->get_cubemap_layered_fb(shadow_size / 2);
+					light_projection = light_storage->light_instance_get_shadow_camera(p_light, 0);
+					light_transform = light_storage->light_instance_get_shadow_transform(p_light, 0) * Transform3D().looking_at(Vector3(1, 0, 0), Vector3(0, -1, 0)).affine_inverse();
+					cube_layered = true;
+					finalize_cubemap = true;
+					if (!cube_shadow_batching) {
+						_render_shadow_begin();
+					}
+				} else {
+					render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass);
+					light_projection = light_storage->light_instance_get_shadow_camera(p_light, p_pass);
+					light_transform = light_storage->light_instance_get_shadow_transform(p_light, p_pass);
+					finalize_cubemap = p_pass == 5;
+
+					if (p_pass == 0) {
+						_render_shadow_begin();
+					}
 				}
 
 			} else {
@@ -3000,22 +3827,33 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 		}
 	}
 
+	shadow_append_list_key = hash_murmur3_one_64(p_light.get_id(), uint32_t(p_pass));
+	if (list_stability.enabled) {
+		const RSE::LightType light_type = light_storage->light_get_type(base);
+		shadow_append_stability_category = light_type == RSE::LIGHT_DIRECTIONAL ? LIST_STABILITY_SHADOW_DIRECTIONAL : (light_type == RSE::LIGHT_OMNI ? LIST_STABILITY_SHADOW_OMNI : LIST_STABILITY_SHADOW_SPOT);
+	}
+
 	if (render_cubemap) {
 		//rendering to cubemap
-		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, true, true, p_render_info, p_viewport_size, p_main_cam_transform);
+		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, reverse_cull_face, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, true, true, p_render_info, p_viewport_size, p_main_cam_transform, cube_layered);
 		if (finalize_cubemap) {
-			_render_shadow_process();
-			_render_shadow_end();
-			//reblit
-			Rect2 atlas_rect_norm = atlas_rect;
-			atlas_rect_norm.position /= float(atlas_size);
-			atlas_rect_norm.size /= float(atlas_size);
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false);
-			atlas_rect_norm.position += Vector2(dual_paraboloid_offset) * atlas_rect_norm.size;
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, true);
+			// Copied into the atlas by _render_shadow_end(), right after the last face's draw list.
+			CubeShadowCopy copy;
+			copy.light = p_light;
+			copy.cubemap = render_texture;
+			copy.atlas_fb = atlas_fb;
+			copy.atlas_rect = atlas_rect;
+			copy.atlas_size = atlas_size;
+			copy.dual_paraboloid_offset = dual_paraboloid_offset;
+			copy.z_near = light_projection.get_z_near();
+			copy.z_far = zfar;
+			scene_state.shadow_passes[scene_state.shadow_passes.size() - 1].cube_copy = int32_t(cube_shadow_copies.size());
+			cube_shadow_copies.push_back(copy);
 
-			//restore transform so it can be properly used
-			light_storage->light_instance_set_shadow_transform(p_light, Projection(), light_storage->light_instance_get_base_transform(p_light), zfar, 0, 0, 0);
+			if (!cube_shadow_batching) {
+				_render_shadow_process();
+				_render_shadow_end();
+			}
 		}
 
 	} else {
@@ -3024,17 +3862,56 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 	}
 }
 
+bool RenderForwardClustered::_render_shadow_cube_gather(const RenderDataRD *p_render_data, uint32_t p_first) {
+	// The culler gives a cube light's faces as 6 consecutive entries, passes 0 to 5.
+	const LocalVector<int> &cube_shadows = p_render_data->cube_shadows;
+	if (p_first + 6 > cube_shadows.size()) {
+		return false;
+	}
+	const RID light = p_render_data->render_shadows[cube_shadows[p_first]].light;
+	for (uint32_t face = 0; face < 6; face++) {
+		const RendererSceneRender::RenderShadowData &shadow = p_render_data->render_shadows[cube_shadows[p_first + face]];
+		if (shadow.light != light || shadow.pass != int(face)) {
+			return false;
+		}
+	}
+
+	cube_shadow_instances.clear();
+	for (uint32_t face = 0; face < 6; face++) {
+		const PagedArray<RenderGeometryInstance *> &instances = p_render_data->render_shadows[cube_shadows[p_first + face]].instances;
+		for (uint64_t i = 0; i < instances.size(); i++) {
+			GeometryInstanceForwardClustered *inst = static_cast<GeometryInstanceForwardClustered *>(instances[i]);
+			if (inst->cube_face_mask == 0) {
+				cube_shadow_instances.push_back(instances[i]);
+			}
+			inst->cube_face_mask |= uint8_t(1u << face);
+		}
+	}
+	return true;
+}
+
+void RenderForwardClustered::_render_shadow_cube_release() {
+	for (uint64_t i = 0; i < cube_shadow_instances.size(); i++) {
+		static_cast<GeometryInstanceForwardClustered *>(cube_shadow_instances[i])->cube_face_mask = 0;
+	}
+	cube_shadow_instances.clear();
+}
+
 void RenderForwardClustered::_render_shadow_begin() {
 	scene_state.shadow_passes.clear();
+	cube_shadow_copies.clear();
 	RD::get_singleton()->draw_command_begin_label("Shadow Setup");
 	_update_render_base_uniform_set();
 
 	render_list[RENDER_LIST_SECONDARY].clear();
 	// No need to reset scene_state.curr_gpu_ptr or scene_state.instance_buffer[RENDER_LIST_SECONDARY]
 	// because _fill_instance_data will do that if it detects p_offset == 0u.
+
+	shadow_elements.clear();
+	shadow_build_deferred = shadow_build_parallel && list_build_min_instances > 0 && list_build_max_threads > 1;
 }
 
-void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, const Rect2i &p_rect, bool p_flip_y, bool p_clear_region, bool p_begin, bool p_end, RenderingServerTypes::RenderInfo *p_render_info, const Size2i &p_viewport_size, const Transform3D &p_main_cam_transform) {
+void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, const Rect2i &p_rect, bool p_flip_y, bool p_clear_region, bool p_begin, bool p_end, RenderingServerTypes::RenderInfo *p_render_info, const Size2i &p_viewport_size, const Transform3D &p_main_cam_transform, bool p_cube_layered) {
 	SceneState::ShadowPass shadow_pass;
 
 	RenderSceneDataRD scene_data;
@@ -3072,13 +3949,33 @@ void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const Page
 		scene_data.screen_mesh_lod_threshold = p_screen_mesh_lod_threshold;
 	}
 
-	PassMode pass_mode = p_use_dp ? PASS_MODE_SHADOW_DP : PASS_MODE_SHADOW;
+	PassMode pass_mode = p_cube_layered ? PASS_MODE_SHADOW_CUBE : (p_use_dp ? PASS_MODE_SHADOW_DP : PASS_MODE_SHADOW);
 
 	uint32_t render_list_from = render_list[RENDER_LIST_SECONDARY].elements.size();
 	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode, false, false, false, true);
 	uint32_t render_list_size = render_list[RENDER_LIST_SECONDARY].elements.size() - render_list_from;
-	render_list[RENDER_LIST_SECONDARY].sort_by_key_range(render_list_from, render_list_size);
-	_fill_instance_data(RENDER_LIST_SECONDARY, p_render_info ? p_render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW] : (int *)nullptr, render_list_from, render_list_size, false);
+	int *shadow_render_info = p_render_info ? p_render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW] : (int *)nullptr;
+	const uint64_t shadow_begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	if (shadow_build_deferred) {
+		shadow_elements.resize(render_list_from + render_list_size);
+		for (uint32_t i = render_list_from; i < render_list_from + render_list_size; i++) {
+			GeometryInstanceSurfaceDataCache *surface = render_list[RENDER_LIST_SECONDARY].elements[i];
+			const GeometryInstanceForwardClustered *inst = surface->owner;
+			shadow_elements[i] = { surface->sort.sort_key1, surface->sort.sort_key2, surface, inst->flags_cache, inst->gi_offset_cache, inst->cube_face_mask };
+		}
+		if (shadow_render_info) {
+			shadow_render_info[RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME] += render_list_size;
+		}
+		if (render_list_split_stats.enabled) {
+			render_list_split_stats.shadow_copy_usec += OS::get_singleton()->get_ticks_usec() - shadow_begin_usec;
+		}
+	} else {
+		render_list[RENDER_LIST_SECONDARY].sort_by_key_range(render_list_from, render_list_size);
+		_fill_instance_data(RENDER_LIST_SECONDARY, shadow_render_info, render_list_from, render_list_size, false);
+	}
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.shadow_usec += OS::get_singleton()->get_ticks_usec() - shadow_begin_usec;
+	}
 
 	{
 		//regular forward for now
@@ -3105,12 +4002,705 @@ void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const Page
 		shadow_pass.rect = p_rect;
 
 		shadow_pass.uniform_buffer_index = uniform_buffer_index;
+		shadow_pass.render_info = shadow_render_info;
+		shadow_pass.list_key = shadow_append_list_key;
+		shadow_pass.stability_category = shadow_append_stability_category;
 
 		scene_state.shadow_passes.push_back(shadow_pass);
 	}
 }
 
+void RenderForwardClustered::_render_shadow_build() {
+	_instance_slots_flush();
+	RenderList *rl = &render_list[RENDER_LIST_SECONDARY];
+	const uint32_t element_total = rl->elements.size();
+	const uint32_t pass_count = scene_state.shadow_passes.size();
+	if (element_total == 0u || pass_count == 0u) {
+		return;
+	}
+
+	const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	uint64_t step_usec = begin_usec;
+	uint64_t statistics_usec = 0; // list_stability's own time, left out.
+	// Adds the time since the previous step to r_usec when the statistics are on.
+	auto step_done = [&](uint64_t &r_usec) {
+		if (render_list_split_stats.enabled) {
+			const uint64_t now = OS::get_singleton()->get_ticks_usec();
+			r_usec += now - step_usec;
+			step_usec = now;
+		}
+	};
+	const bool parallel = element_total >= list_build_min_instances;
+	rl->element_info.resize(element_total);
+	// As _fill_instance_data() does for the first pass (offset 0): a new buffer for this frame, mapped if needed.
+	scene_state.grow_instance_buffer(RENDER_LIST_SECONDARY, element_total, false);
+	if (!scene_state.curr_gpu_ptr[RENDER_LIST_SECONDARY]) {
+		scene_state.curr_gpu_ptr[RENDER_LIST_SECONDARY] = reinterpret_cast<SceneState::ElementData *>(scene_state.instance_buffer[RENDER_LIST_SECONDARY].map_raw_for_upload(0u));
+	}
+
+	// 1. Sort: each pass is a run, a large one is cut in runs of at least 1024 elements merged afterwards. Runs of
+	// equal keys may then come out in another order than one sort would give; it only changes which of several
+	// identical surfaces is drawn first in a depth-only pass. Without the merge (GODOT_PARALLEL_SHADOW_MERGE=0) the
+	// pass is drawn run after run: no serial step, but each run repeats the state changes and splits the instancing.
+	shadow_sort_runs.clear();
+	sort_reuse.shadow_pass_reused.resize(pass_count);
+	for (uint32_t i = 0; i < pass_count; i++) {
+		const SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[i];
+		sort_reuse.shadow_pass_reused[i] = sort_reuse.enabled ? _sort_reuse_apply(shadow_pass.list_key, shadow_elements.ptr() + shadow_pass.element_from, shadow_pass.element_count, false, sort_reuse.shadow_scratch, sort_reuse.shadow_fresh) : SORT_REUSE_NONE;
+	}
+	step_done(render_list_split_stats.shadow_check_usec);
+	bool merges = false;
+	for (uint32_t pass = 0; pass < pass_count; pass++) {
+		const SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[pass];
+		if (sort_reuse.shadow_pass_reused[pass]) {
+			continue;
+		}
+		const uint32_t cuts = parallel ? CLAMP(shadow_pass.element_count / 1024u, 1u, list_build_max_threads) : 1u;
+		merges = merges || cuts > 1;
+		for (uint32_t i = 0; i < cuts; i++) {
+			const uint32_t from = uint32_t(uint64_t(shadow_pass.element_count) * i / cuts);
+			const uint32_t to = uint32_t(uint64_t(shadow_pass.element_count) * (i + 1) / cuts);
+			shadow_sort_runs.push_back({ shadow_pass.element_from + from, to - from });
+		}
+	}
+	if (parallel && shadow_sort_runs.size() > 1) {
+		SortArray<ShadowSortRun, ShadowSortRunLarger> run_sorter;
+		run_sorter.sort(shadow_sort_runs.ptr(), shadow_sort_runs.size());
+		_parallel_run(shadow_sort_runs.size(), list_build_max_threads, &RenderForwardClustered::_render_shadow_sort_part);
+	} else {
+		for (uint32_t i = 0; i < shadow_sort_runs.size(); i++) {
+			_render_shadow_sort_part(i);
+		}
+	}
+
+	if (merges && shadow_build_merge) {
+		// Runs of the same pass are contiguous after sorting them back by position.
+		struct RunByPosition {
+			_FORCE_INLINE_ bool operator()(const ShadowSortRun &A, const ShadowSortRun &B) const { return A.from < B.from; }
+		};
+		SortArray<ShadowSortRun, RunByPosition> position_sorter;
+		position_sorter.sort(shadow_sort_runs.ptr(), shadow_sort_runs.size());
+		const ShadowElementByKey less;
+		uint32_t run = 0;
+		for (const SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
+			uint32_t first_run = run;
+			while (run < shadow_sort_runs.size() && shadow_sort_runs[run].from < shadow_pass.element_from + shadow_pass.element_count) {
+				run++;
+			}
+			const uint32_t run_count = run - first_run;
+			if (run_count < 2) {
+				continue;
+			}
+			// k-way merge, ties to the earlier run.
+			uint32_t heads[16];
+			uint32_t ends[16];
+			ERR_CONTINUE(run_count > 16);
+			for (uint32_t i = 0; i < run_count; i++) {
+				heads[i] = shadow_sort_runs[first_run + i].from;
+				ends[i] = heads[i] + shadow_sort_runs[first_run + i].count;
+			}
+			shadow_merge_buffer.resize(shadow_pass.element_count);
+			for (uint32_t out = 0; out < shadow_pass.element_count; out++) {
+				int best = -1;
+				for (uint32_t i = 0; i < run_count; i++) {
+					if (heads[i] < ends[i] && (best < 0 || less(shadow_elements[heads[i]], shadow_elements[heads[best]]))) {
+						best = int(i);
+					}
+				}
+				shadow_merge_buffer[out] = shadow_elements[heads[best]++];
+			}
+			memcpy(shadow_elements.ptr() + shadow_pass.element_from, shadow_merge_buffer.ptr(), sizeof(ShadowElement) * shadow_pass.element_count);
+		}
+	}
+
+	step_done(render_list_split_stats.shadow_sort_usec);
+	for (uint32_t i = 0; i < pass_count; i++) {
+		const SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[i];
+		const ShadowElement *elements = shadow_elements.ptr() + shadow_pass.element_from;
+		if (sort_reuse.enabled && sort_reuse.shadow_pass_reused[i] != SORT_REUSE_WHOLE) {
+			_sort_reuse_store(shadow_pass.list_key, elements, shadow_pass.element_count, false);
+		}
+#ifdef DEBUG_ENABLED
+		if (sort_reuse.shadow_pass_reused[i] && unlikely(sort_reuse.check)) {
+			_sort_reuse_verify<ShadowElement, ShadowElementByKey>(elements, shadow_pass.element_count, "shadow pass");
+		}
+#endif
+		if (render_list_split_stats.enabled && shadow_pass.element_count > 0u) {
+			render_list_split_stats.sorted_shadow_passes++;
+			render_list_split_stats.reused_shadow_passes += sort_reuse.shadow_pass_reused[i] == SORT_REUSE_WHOLE ? 1 : 0;
+			render_list_split_stats.merged_shadow_passes += sort_reuse.shadow_pass_reused[i] == SORT_REUSE_MERGED ? 1 : 0;
+		}
+	}
+
+	step_done(render_list_split_stats.shadow_store_usec);
+
+	if (list_stability.enabled) {
+		for (const SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
+			list_stability.current.resize(shadow_pass.element_count);
+			for (uint32_t i = 0; i < shadow_pass.element_count; i++) {
+				const ShadowElement &element = shadow_elements[shadow_pass.element_from + i];
+				const Transform3D &transform = element.surface->owner->transform;
+				list_stability.current[i] = { element.surface, element.sort_key1, element.sort_key2, element.cube_face_mask, hash_murmur3_buffer(&transform, sizeof(Transform3D)) };
+			}
+			_list_stability_compare(shadow_pass.list_key, shadow_pass.stability_category);
+		}
+	}
+	step_done(statistics_usec);
+
+	// 2. Instance data, element info and the marks for instancing, in ranges across all the passes.
+	shadow_repeats.resize(element_total);
+	shadow_pass_begins.resize(element_total);
+	memset(shadow_pass_begins.ptr(), 0, element_total);
+	for (const SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
+		if (shadow_pass.element_count > 0u) {
+			shadow_pass_begins[shadow_pass.element_from] = 1;
+		}
+	}
+	shadow_instance_part_count = parallel ? CLAMP(element_total / 1024u, 1u, list_build_max_threads * 2) : 1u;
+	if (shadow_instance_part_count > 1) {
+		_parallel_run(shadow_instance_part_count, list_build_max_threads, &RenderForwardClustered::_render_shadow_instance_part);
+	} else {
+		_render_shadow_instance_range(0, element_total);
+	}
+
+	step_done(render_list_split_stats.shadow_instance_usec);
+	// 3. Runs of instanced elements and draw calls, pass by pass, as _fill_instance_data() counts them.
+	for (SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
+		RenderElementInfo *element_info = rl->element_info.ptr() + shadow_pass.element_from;
+		const uint8_t *repeat = shadow_repeats.ptr() + shadow_pass.element_from;
+		const uint32_t count = shadow_pass.element_count;
+		uint32_t draw_calls = 0;
+		uint32_t repeats = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			if (repeat[i] && repeats < RenderElementInfo::MAX_REPEATS) {
+				repeats++;
+			} else {
+				for (uint32_t j = 1; j <= repeats; j++) {
+					element_info[i - j].repeat = j;
+				}
+				repeats = 1;
+				draw_calls++;
+			}
+		}
+		for (uint32_t j = 1; j <= repeats; j++) {
+			element_info[count - j].repeat = j;
+		}
+		if (shadow_pass.render_info) {
+			shadow_pass.render_info[RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME] += draw_calls;
+		}
+		if (render_list_split_stats.enabled) {
+			render_list_split_stats.shadow_draw_calls += draw_calls;
+		}
+	}
+
+	step_done(render_list_split_stats.shadow_runs_usec);
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.shadow_usec += OS::get_singleton()->get_ticks_usec() - begin_usec - statistics_usec;
+		render_list_split_stats.shadow_passes += pass_count;
+		render_list_split_stats.shadow_elements += element_total;
+		render_list_split_stats.shadow_builds += 1;
+		render_list_split_stats.parallel_builds += shadow_instance_part_count > 1 ? 1 : 0;
+	}
+}
+
+void RenderForwardClustered::_list_stability_add_main_list(uint64_t p_view_key, RenderListType p_render_list, ListStabilityCategory p_category) {
+	const RenderList &rl = render_list[p_render_list];
+	list_stability.current.resize(rl.elements.size());
+	for (uint32_t i = 0; i < rl.elements.size(); i++) {
+		const GeometryInstanceSurfaceDataCache *surface = rl.elements[i];
+		const Transform3D &transform = surface->owner->transform;
+		list_stability.current[i] = { surface, surface->sort.sort_key1, surface->sort.sort_key2, 0u, hash_murmur3_buffer(&transform, sizeof(Transform3D)) };
+	}
+	_list_stability_compare(hash_murmur3_one_64(p_view_key, uint32_t(p_category)), p_category);
+}
+
+void RenderForwardClustered::_list_stability_compare(uint64_t p_key, ListStabilityCategory p_category) {
+	ListStability &ls = list_stability;
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+	if (frame != ls.frame) {
+		ls.frame = frame;
+		ls.frames++;
+		if (ls.frames == 240) {
+			static const char *names[LIST_STABILITY_MAX] = { "opaque", "motion", "alpha", "directional shadow", "omni shadow", "spot shadow" };
+			print_line("List stability over 240 frames (per frame: lists, of them identical; elements; of them % at the same position, shifted, reordered, with other keys, entered, left; moved):");
+			for (int i = 0; i < LIST_STABILITY_MAX; i++) {
+				const ListStability::Counters &c = ls.counters[i];
+				if (c.lists == 0) {
+					continue;
+				}
+				const double elements = MAX(c.elements, uint64_t(1));
+				print_line(vformat("  %-18s %6.1f lists, %6.1f identical; %8.0f elements; %5.1f %% same position, %5.1f %% shifted, %5.1f %% reordered, %5.1f %% other keys, %5.1f %% entered, %5.1f left per frame; %5.1f %% moved.",
+						names[i], c.lists / 240.0, c.identical_lists / 240.0, c.elements / 240.0, 100.0 * c.same_position / elements, 100.0 * c.shifted / elements, 100.0 * c.reordered / elements, 100.0 * c.rekeyed / elements, 100.0 * c.entered / elements, c.left / 240.0, 100.0 * c.moved / elements));
+				ls.counters[i] = ListStability::Counters();
+			}
+			ls.frames = 0;
+		}
+		// Lists not drawn for a second are forgotten (a light out of view, a closed viewport).
+		LocalVector<uint64_t> stale;
+		for (const KeyValue<uint64_t, ListStability::History> &E : ls.histories) {
+			if (E.value.frame + 60 < frame) {
+				stale.push_back(E.key);
+			}
+		}
+		for (uint64_t key : stale) {
+			ls.histories.erase(key);
+		}
+	}
+
+	ListStability::History *history = ls.histories.getptr(p_key);
+	ListStability::Counters &c = ls.counters[p_category];
+	const LocalVector<ListStability::Element> &current = ls.current;
+	c.lists++;
+	c.elements += current.size();
+	if (!history) {
+		// A list not seen in the last second: everything entered.
+		c.entered += current.size();
+		history = &ls.histories.insert(p_key, ListStability::History())->value;
+	} else {
+		// Compared with the last time it was drawn: a shadow pass is skipped while nothing in its range changes.
+		const LocalVector<ListStability::Element> &previous = history->elements;
+		ls.previous_index.clear();
+		for (uint32_t i = 0; i < previous.size(); i++) {
+			ls.previous_index.insert(previous[i].surface, i);
+		}
+		uint32_t found = 0;
+		uint32_t same_position = 0;
+		int64_t last_kept_index = -1; // Position last frame of the last element kept with its keys.
+		for (uint32_t i = 0; i < current.size(); i++) {
+			const ListStability::Element &element = current[i];
+			const uint32_t *index = ls.previous_index.getptr(element.surface);
+			if (!index) {
+				c.entered++;
+				continue;
+			}
+			found++;
+			const ListStability::Element &before = previous[*index];
+			if (before.sort_key1 != element.sort_key1 || before.sort_key2 != element.sort_key2 || before.cube_face_mask != element.cube_face_mask) {
+				c.rekeyed++;
+			} else {
+				if (*index == i) {
+					same_position++;
+				} else if (int64_t(*index) > last_kept_index) {
+					c.shifted++;
+				} else {
+					c.reordered++;
+				}
+				last_kept_index = MAX(last_kept_index, int64_t(*index));
+			}
+			if (before.transform_hash != element.transform_hash) {
+				c.moved++;
+			}
+		}
+		c.same_position += same_position;
+		c.left += previous.size() - found;
+		if (same_position == current.size() && previous.size() == current.size()) {
+			c.identical_lists++;
+		}
+	}
+	history->frame = frame;
+	history->elements = current;
+}
+
+void RenderForwardClustered::_sort_render_lists(uint64_t p_view_key) {
+	const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	static const RenderListType main_lists[3] = { RENDER_LIST_OPAQUE, RENDER_LIST_MOTION, RENDER_LIST_ALPHA };
+	for (RenderListType list : main_lists) {
+		RenderList &rl = render_list[list];
+		// Alpha lists are sorted by depth.
+		main_sort_reused[list] = sort_reuse.enabled ? _sort_reuse_apply(hash_murmur3_one_64(p_view_key, uint32_t(list)), rl.elements.ptr(), rl.elements.size(), list == RENDER_LIST_ALPHA, sort_reuse.scratch, sort_reuse.fresh) : SORT_REUSE_NONE;
+	}
+
+	const uint32_t opaque_count = render_list[RENDER_LIST_OPAQUE].elements.size();
+	// Runs of at least 1024 elements, as many as the list building threads.
+	const uint32_t runs = (!main_sort_reused[RENDER_LIST_OPAQUE] && list_sort_parallel && list_build_max_threads > 1 && opaque_count >= 2048u) ? MIN(opaque_count / 1024u, list_build_max_threads) : 0u;
+
+	if (runs < 2u) {
+		if (!main_sort_reused[RENDER_LIST_OPAQUE]) {
+			render_list[RENDER_LIST_OPAQUE].sort_by_key();
+		}
+		if (!main_sort_reused[RENDER_LIST_MOTION]) {
+			render_list[RENDER_LIST_MOTION].sort_by_key();
+		}
+		if (!main_sort_reused[RENDER_LIST_ALPHA]) {
+			render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
+		}
+	} else {
+		opaque_sort_runs.resize(runs);
+		opaque_sort_keys.resize(opaque_count);
+		for (uint32_t i = 0; i < runs; i++) {
+			const uint32_t from = uint32_t(uint64_t(opaque_count) * i / runs);
+			const uint32_t to = uint32_t(uint64_t(opaque_count) * (i + 1) / runs);
+			opaque_sort_runs[i] = { from, to - from };
+		}
+		// The opaque runs first (the longest parts), then the motion and alpha lists whole.
+		_parallel_run(runs + 2u, list_build_max_threads, &RenderForwardClustered::_sort_render_lists_part);
+
+		// k-way merge of the opaque runs, ties to the earlier run. Equal keys may come out in another order than one
+		// sort would give (SortArray is not stable either): same mesh, material and pipeline, drawn in another order.
+		uint32_t heads[16];
+		uint32_t ends[16];
+		for (uint32_t i = 0; i < runs; i++) {
+			heads[i] = opaque_sort_runs[i].from;
+			ends[i] = heads[i] + opaque_sort_runs[i].count;
+		}
+		const RenderList::SortKeyElementLess less;
+		const RenderList::SortKeyElement *keys = opaque_sort_keys.ptr();
+		opaque_merge_keys.resize(opaque_count);
+		for (uint32_t out = 0; out < opaque_count; out++) {
+			int best = -1;
+			for (uint32_t i = 0; i < runs; i++) {
+				if (heads[i] < ends[i] && (best < 0 || less(keys[heads[i]], keys[heads[best]]))) {
+					best = int(i);
+				}
+			}
+			opaque_merge_keys[out] = keys[heads[best]++];
+		}
+		GeometryInstanceSurfaceDataCache **elements = render_list[RENDER_LIST_OPAQUE].elements.ptr();
+		for (uint32_t i = 0; i < opaque_count; i++) {
+			elements[i] = opaque_merge_keys[i].surface;
+		}
+	}
+
+	for (RenderListType list : main_lists) {
+		const RenderList &rl = render_list[list];
+		if (sort_reuse.enabled && main_sort_reused[list] != SORT_REUSE_WHOLE) {
+			_sort_reuse_store(hash_murmur3_one_64(p_view_key, uint32_t(list)), rl.elements.ptr(), rl.elements.size(), list == RENDER_LIST_ALPHA);
+		}
+#ifdef DEBUG_ENABLED
+		if (main_sort_reused[list] && unlikely(sort_reuse.check)) {
+			if (list == RENDER_LIST_ALPHA) {
+				_sort_reuse_verify<GeometryInstanceSurfaceDataCache *, RenderList::SortByReverseDepthAndPriority>(rl.elements.ptr(), rl.elements.size(), "alpha");
+			} else {
+				_sort_reuse_verify<GeometryInstanceSurfaceDataCache *, RenderList::SortByKey>(rl.elements.ptr(), rl.elements.size(), list == RENDER_LIST_OPAQUE ? "opaque" : "motion");
+			}
+		}
+#endif
+		if (render_list_split_stats.enabled && !rl.elements.is_empty()) {
+			render_list_split_stats.sorted_lists++;
+			render_list_split_stats.reused_lists += main_sort_reused[list] == SORT_REUSE_WHOLE ? 1 : 0;
+			render_list_split_stats.merged_lists += main_sort_reused[list] == SORT_REUSE_MERGED ? 1 : 0;
+		}
+	}
+
+	if (render_list_split_stats.enabled) {
+		render_list_split_stats.sort_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
+	}
+}
+
+void RenderForwardClustered::_sort_render_lists_part(uint32_t p_part) {
+	const uint32_t runs = opaque_sort_runs.size();
+	if (p_part < runs) {
+		const OpaqueSortRun &run = opaque_sort_runs[p_part];
+		RenderList::SortKeyElement *keys = opaque_sort_keys.ptr() + run.from;
+		RenderList::fill_sort_keys(render_list[RENDER_LIST_OPAQUE].elements.ptr() + run.from, run.count, keys);
+		SortArray<RenderList::SortKeyElement, RenderList::SortKeyElementLess> sorter;
+		sorter.sort(keys, run.count);
+	} else if (p_part == runs) {
+		if (!main_sort_reused[RENDER_LIST_MOTION]) {
+			render_list[RENDER_LIST_MOTION].sort_by_key();
+		}
+	} else if (!main_sort_reused[RENDER_LIST_ALPHA]) {
+		render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
+	}
+}
+
+void RenderForwardClustered::RenderList::fill_sort_keys(GeometryInstanceSurfaceDataCache *const *p_elements, uint32_t p_count, SortKeyElement *r_keys) {
+	for (uint32_t i = 0; i < p_count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = p_elements[i];
+		r_keys[i] = { surface->sort.sort_key2, surface->sort.sort_key1, surface };
+	}
+}
+
+void RenderForwardClustered::RenderList::sort_by_key_range(uint32_t p_from, uint32_t p_size) {
+	thread_local LocalVector<SortKeyElement> keys;
+	keys.resize(p_size);
+	fill_sort_keys(elements.ptr() + p_from, p_size, keys.ptr());
+	SortArray<SortKeyElement, SortKeyElementLess> sorter;
+	sorter.sort(keys.ptr(), p_size);
+	for (uint32_t i = 0; i < p_size; i++) {
+		elements[p_from + i] = keys[i].surface;
+	}
+}
+
+void RenderForwardClustered::RenderList::sort_by_reverse_depth_and_priority() {
+	thread_local LocalVector<SortDepthElement> keys;
+	const uint32_t count = elements.size();
+	keys.resize(count);
+	for (uint32_t i = 0; i < count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = elements[i];
+		keys[i] = { uint32_t(surface->sort.priority), surface->owner->depth, surface };
+	}
+	SortArray<SortDepthElement, SortDepthElementLess> sorter;
+	sorter.sort(keys.ptr(), count);
+	for (uint32_t i = 0; i < count; i++) {
+		elements[i] = keys[i].surface;
+	}
+}
+
+RenderForwardClustered::SortReuseEntry RenderForwardClustered::_sort_reuse_entry(const GeometryInstanceSurfaceDataCache *p_surface, bool p_depth) {
+	SortReuseEntry entry = { p_surface, p_surface->sort.sort_key1, p_surface->sort.sort_key2, 0u };
+	if (p_depth) {
+		memcpy(&entry.extra, &p_surface->owner->depth, sizeof(uint32_t));
+	}
+	return entry;
+}
+
+RenderForwardClustered::SortReuseEntry RenderForwardClustered::_sort_reuse_entry(const ShadowElement &p_element, bool) {
+	return { p_element.surface, p_element.sort_key1, p_element.sort_key2, p_element.cube_face_mask };
+}
+
+RenderForwardClustered::SortReuseList *RenderForwardClustered::_sort_reuse_list(uint64_t p_key) {
+	return sort_reuse.lists.getptr(p_key);
+}
+
+void RenderForwardClustered::_surface_cache_free(GeometryInstanceSurfaceDataCache *p_surface) {
+	_surface_slot_free(p_surface);
+	p_surface->compilation_dirty_element.remove_from_list();
+	p_surface->compilation_all_element.remove_from_list();
+	retired_surface_caches.push_back({ p_surface, RSG::rasterizer->get_frame_number() });
+	surface_caches_freed++;
+}
+
+void RenderForwardClustered::_sort_reuse_begin_frame() {
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+	if (frame == sort_reuse.frame) {
+		return;
+	}
+	sort_reuse.frame = frame;
+
+	// Orders not used last frame are forgotten (a light out of view, a viewport not drawn every frame). Every order
+	// left was stored or reused last frame, from surfaces still in their instances then.
+	LocalVector<uint64_t> stale;
+	for (const KeyValue<uint64_t, SortReuseList> &E : sort_reuse.lists) {
+		if (E.value.frame + 1 < frame) {
+			stale.push_back(E.key);
+		}
+	}
+	for (uint64_t key : stale) {
+		sort_reuse.lists.erase(key);
+	}
+
+	// So a surface freed two frames ago is in no order any more.
+	uint32_t released = 0;
+	while (released < retired_surface_caches.size() && retired_surface_caches[released].frame + 2 <= frame) {
+		geometry_instance_surface_alloc.free(retired_surface_caches[released].surface);
+		released++;
+	}
+	if (released > 0) {
+		const uint32_t remaining = retired_surface_caches.size() - released;
+		for (uint32_t i = 0; i < remaining; i++) {
+			retired_surface_caches[i] = retired_surface_caches[released + i];
+		}
+		retired_surface_caches.resize(remaining);
+	}
+}
+
+template <typename T>
+RenderForwardClustered::SortReuseResult RenderForwardClustered::_sort_reuse_apply(uint64_t p_key, T *p_elements, uint32_t p_count, bool p_depth, LocalVector<T> &r_scratch, LocalVector<T> &r_fresh) {
+	SortReuseList *list = _sort_reuse_list(p_key);
+	if (!list || list->entries.is_empty() || p_count == 0u) {
+		return SORT_REUSE_NONE;
+	}
+	// The kept surfaces are all allocated, even those freed since: each can be marked with its place.
+	const uint32_t kept_count = list->entries.size();
+	sort_reuse.mark = sort_reuse.mark == UINT32_MAX ? 1u : sort_reuse.mark + 1u;
+	const uint32_t mark = sort_reuse.mark;
+	for (uint32_t i = 0; i < kept_count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = const_cast<GeometryInstanceSurfaceDataCache *>(list->entries[i].surface);
+		surface->sort_reuse_mark = mark;
+		surface->sort_reuse_index = i;
+	}
+	r_scratch.resize(kept_count);
+	sort_reuse.kept.resize(kept_count);
+	memset(sort_reuse.kept.ptr(), 0, kept_count);
+	r_fresh.clear();
+	for (uint32_t i = 0; i < p_count; i++) {
+		GeometryInstanceSurfaceDataCache *surface = _sort_reuse_surface(p_elements[i]);
+		if (surface->sort_reuse_mark == mark) {
+			const uint32_t index = surface->sort_reuse_index;
+			const SortReuseEntry &kept = list->entries[index];
+			const SortReuseEntry current = _sort_reuse_entry(p_elements[i], p_depth);
+			if (kept.surface == current.surface && kept.sort_key1 == current.sort_key1 && kept.sort_key2 == current.sort_key2 && kept.extra == current.extra) {
+				surface->sort_reuse_mark = 0;
+				r_scratch[index] = p_elements[i];
+				sort_reuse.kept[index] = 1;
+				continue;
+			}
+		}
+		// New to the list, a second time, or with other inputs: sorted apart. When that is most of the list, a full sort
+		// costs less.
+		if ((r_fresh.size() + 1u) * 2u > p_count) {
+			return SORT_REUSE_NONE;
+		}
+		r_fresh.push_back(p_elements[i]);
+	}
+	list->frame = sort_reuse.frame;
+
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < kept_count; i++) {
+		if (sort_reuse.kept[i]) {
+			r_scratch[kept++] = r_scratch[i];
+		}
+	}
+	r_scratch.resize(kept);
+	if (r_fresh.is_empty()) {
+		for (uint32_t i = 0; i < kept; i++) {
+			p_elements[i] = r_scratch[i];
+		}
+		return kept == kept_count ? SORT_REUSE_WHOLE : SORT_REUSE_MERGED;
+	}
+	_sort_reuse_merge(p_elements, r_scratch, r_fresh, p_depth);
+	return SORT_REUSE_MERGED;
+}
+
+// Merges two sorted sequences, ties to the first one.
+template <typename S, typename Less>
+static void _merge_sorted(const S *p_a, uint32_t p_a_count, const S *p_b, uint32_t p_b_count, S *r_out) {
+	const Less less;
+	uint32_t a = 0;
+	uint32_t b = 0;
+	uint32_t out = 0;
+	while (a < p_a_count && b < p_b_count) {
+		r_out[out++] = less(p_b[b], p_a[a]) ? p_b[b++] : p_a[a++];
+	}
+	while (a < p_a_count) {
+		r_out[out++] = p_a[a++];
+	}
+	while (b < p_b_count) {
+		r_out[out++] = p_b[b++];
+	}
+}
+
+void RenderForwardClustered::_sort_reuse_merge(GeometryInstanceSurfaceDataCache **r_elements, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_kept, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_fresh, bool p_depth) {
+	const uint32_t kept_count = p_kept.size();
+	const uint32_t fresh_count = p_fresh.size();
+	if (p_depth) {
+		thread_local LocalVector<RenderList::SortDepthElement> keys;
+		keys.resize(kept_count + fresh_count);
+		RenderList::SortDepthElement *kept = keys.ptr();
+		RenderList::SortDepthElement *fresh = kept + kept_count;
+		for (uint32_t i = 0; i < kept_count; i++) {
+			kept[i] = { uint32_t(p_kept[i]->sort.priority), p_kept[i]->owner->depth, p_kept[i] };
+		}
+		for (uint32_t i = 0; i < fresh_count; i++) {
+			fresh[i] = { uint32_t(p_fresh[i]->sort.priority), p_fresh[i]->owner->depth, p_fresh[i] };
+		}
+		SortArray<RenderList::SortDepthElement, RenderList::SortDepthElementLess> sorter;
+		sorter.sort(fresh, fresh_count);
+		thread_local LocalVector<RenderList::SortDepthElement> out;
+		out.resize(kept_count + fresh_count);
+		_merge_sorted<RenderList::SortDepthElement, RenderList::SortDepthElementLess>(kept, kept_count, fresh, fresh_count, out.ptr());
+		for (uint32_t i = 0; i < kept_count + fresh_count; i++) {
+			r_elements[i] = out[i].surface;
+		}
+	} else {
+		thread_local LocalVector<RenderList::SortKeyElement> keys;
+		keys.resize(kept_count + fresh_count);
+		RenderList::SortKeyElement *kept = keys.ptr();
+		RenderList::SortKeyElement *fresh = kept + kept_count;
+		RenderList::fill_sort_keys(p_kept.ptr(), kept_count, kept);
+		RenderList::fill_sort_keys(p_fresh.ptr(), fresh_count, fresh);
+		SortArray<RenderList::SortKeyElement, RenderList::SortKeyElementLess> sorter;
+		sorter.sort(fresh, fresh_count);
+		thread_local LocalVector<RenderList::SortKeyElement> out;
+		out.resize(kept_count + fresh_count);
+		_merge_sorted<RenderList::SortKeyElement, RenderList::SortKeyElementLess>(kept, kept_count, fresh, fresh_count, out.ptr());
+		for (uint32_t i = 0; i < kept_count + fresh_count; i++) {
+			r_elements[i] = out[i].surface;
+		}
+	}
+}
+
+void RenderForwardClustered::_sort_reuse_merge(ShadowElement *r_elements, const LocalVector<ShadowElement> &p_kept, LocalVector<ShadowElement> &p_fresh, bool) {
+	SortArray<ShadowElement, ShadowElementByKey> sorter;
+	sorter.sort(p_fresh.ptr(), p_fresh.size());
+	_merge_sorted<ShadowElement, ShadowElementByKey>(p_kept.ptr(), p_kept.size(), p_fresh.ptr(), p_fresh.size(), r_elements);
+}
+
+template <typename T>
+void RenderForwardClustered::_sort_reuse_store(uint64_t p_key, const T *p_elements, uint32_t p_count, bool p_depth) {
+	SortReuseList *list = _sort_reuse_list(p_key);
+	if (!list) {
+		list = &sort_reuse.lists.insert(p_key, SortReuseList())->value;
+	}
+	list->entries.resize(p_count);
+	for (uint32_t i = 0; i < p_count; i++) {
+		list->entries[i] = _sort_reuse_entry(p_elements[i], p_depth);
+	}
+	list->frame = sort_reuse.frame;
+}
+
+#ifdef DEBUG_ENABLED
+template <typename T, typename Comparator>
+void RenderForwardClustered::_sort_reuse_verify(const T *p_elements, uint32_t p_count, const char *p_list) {
+	LocalVector<T> sorted;
+	sorted.resize(p_count);
+	for (uint32_t i = 0; i < p_count; i++) {
+		sorted[i] = p_elements[i];
+	}
+	SortArray<T, Comparator> sorter;
+	sorter.sort(sorted.ptr(), p_count);
+	for (uint32_t i = 0; i < p_count; i++) {
+		if (_sort_reuse_surface(sorted[i]) != _sort_reuse_surface(p_elements[i])) {
+			print_line(vformat("Sort reuse: the kept order of a %s list differs from its sort at element %d of %d (frame %d).", p_list, i, p_count, RSG::rasterizer->get_frame_number()));
+			return;
+		}
+	}
+}
+#endif
+
+void RenderForwardClustered::_render_shadow_sort_part(uint32_t p_part) {
+	// The same comparisons as RenderList::sort_by_key_range(), so the same order for a pass sorted in one run.
+	const ShadowSortRun &run = shadow_sort_runs[p_part];
+	SortArray<ShadowElement, ShadowElementByKey> sorter;
+	sorter.sort(shadow_elements.ptr() + run.from, run.count);
+}
+
+void RenderForwardClustered::_render_shadow_instance_part(uint32_t p_part) {
+	const uint32_t element_total = render_list[RENDER_LIST_SECONDARY].elements.size();
+	const uint32_t from = uint32_t(uint64_t(element_total) * p_part / shadow_instance_part_count);
+	const uint32_t to = uint32_t(uint64_t(element_total) * (p_part + 1) / shadow_instance_part_count);
+	_render_shadow_instance_range(from, to);
+}
+
+void RenderForwardClustered::_render_shadow_instance_range(uint32_t p_from, uint32_t p_to) {
+	RenderList *rl = &render_list[RENDER_LIST_SECONDARY];
+	SceneState::ElementData *gpu_ptr = scene_state.curr_gpu_ptr[RENDER_LIST_SECONDARY];
+	for (uint32_t i = p_from; i < p_to; i++) {
+		const ShadowElement &element = shadow_elements[i];
+		GeometryInstanceSurfaceDataCache *surface = element.surface;
+		const GeometryInstanceForwardClustered *inst = surface->owner;
+		rl->elements[i] = surface;
+
+#ifdef DEBUG_ENABLED
+		if (unlikely(instance_slots.check)) {
+			SceneState::InstanceData instance_data;
+			_store_instance_data(inst, surface, element.flags, element.gi_offset, &instance_data);
+			_instance_slot_check(inst, surface, instance_data);
+		}
+#endif
+		gpu_ptr[i] = { inst->instance_slot, surface->surface_slot, element.flags, element.gi_offset };
+
+		// Same as the previous element of the pass: drawn with it, instanced. Multimeshes and mesh instances never are.
+		const bool cant_repeat = element.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
+		bool repeat = false;
+		if (!shadow_pass_begins[i] && !cant_repeat) {
+			const ShadowElement &prev = shadow_elements[i - 1];
+			const GeometryInstanceForwardClustered *prev_inst = prev.surface->owner;
+			const bool prev_cant_repeat = prev.flags & INSTANCE_DATA_FLAG_MULTIMESH || prev_inst->mesh_instance.is_valid();
+			repeat = !prev_cant_repeat && prev.sort_key1 == element.sort_key1 && prev.sort_key2 == element.sort_key2 && inst->mirror == prev_inst->mirror && prev.cube_face_mask == element.cube_face_mask;
+		}
+		shadow_repeats[i] = repeat;
+		rl->element_info[i].value = uint32_t(element.sort_key1 & 0xFFF);
+		rl->element_info[i].cube_face_mask = element.cube_face_mask;
+	}
+}
+
 void RenderForwardClustered::_render_shadow_process() {
+	if (shadow_build_deferred) {
+		_render_shadow_build();
+	}
+
 	RenderingDevice *rd = RenderingDevice::get_singleton();
 	if (scene_state.instance_buffer[RENDER_LIST_SECONDARY].get_size(0u) > 0u) {
 		rd->buffer_flush(scene_state.instance_buffer[RENDER_LIST_SECONDARY]._get(0u));
@@ -3129,12 +4719,148 @@ void RenderForwardClustered::_render_shadow_process() {
 void RenderForwardClustered::_render_shadow_end() {
 	RD::get_singleton()->draw_command_begin_label("Shadow Render");
 
-	for (SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
-		RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr() + shadow_pass.element_from, render_list[RENDER_LIST_SECONDARY].element_info.ptr() + shadow_pass.element_from, shadow_pass.element_count, shadow_pass.flip_cull, shadow_pass.pass_mode, 0, true, false, shadow_pass.rp_uniform_set, false, Vector2(), shadow_pass.lod_distance_multiplier, shadow_pass.screen_mesh_lod_threshold, 1, shadow_pass.element_from);
-		_render_list_with_draw_list(&render_list_parameters, shadow_pass.framebuffer, shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+	// Every pass is cut in parts as _render_list_split() would cut it (one part below twice the range size), all parts
+	// recorded in one parallel run, each into a split reserved for its pass's draw list; the draw lists then open one
+	// after the other and take their parts in order.
+	LocalVector<SceneState::ShadowPass> &shadow_passes = scene_state.shadow_passes;
+	const uint32_t pass_count = shadow_passes.size();
+	shadow_pass_first_part.resize(pass_count);
+	shadow_pass_part_count.resize(pass_count);
+	uint32_t part_count = 0;
+	if (shadow_passes_parallel && render_list_max_splits > 1) {
+		shadow_pass_params.clear();
+		shadow_pass_params.reserve(pass_count);
+		shadow_part_pass.clear();
+		shadow_part_viewports.clear();
+		shadow_part_formats.clear();
+		shadow_part_splits.clear();
+		for (uint32_t i = 0; i < pass_count; i++) {
+			const SceneState::ShadowPass &shadow_pass = shadow_passes[i];
+			RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr() + shadow_pass.element_from, render_list[RENDER_LIST_SECONDARY].element_info.ptr() + shadow_pass.element_from, shadow_pass.element_count, shadow_pass.flip_cull, shadow_pass.pass_mode, 0, true, false, shadow_pass.rp_uniform_set, false, Vector2(), shadow_pass.lod_distance_multiplier, shadow_pass.screen_mesh_lod_threshold, 1, shadow_pass.element_from);
+			render_list_parameters.framebuffer_format = RD::get_singleton()->framebuffer_get_format(shadow_pass.framebuffer);
+			shadow_pass_params.push_back(render_list_parameters);
+			shadow_pass_first_part[i] = part_count;
+			shadow_pass_part_count[i] = 0;
+			if (shadow_pass.element_count == 0) {
+				continue;
+			}
+
+			// The viewport draw_list_begin() will give the draw list: the pass's rectangle, or the whole framebuffer.
+			const Rect2i viewport = shadow_pass.rect != Rect2i() ? shadow_pass.rect : Rect2i(Point2i(), Size2i(RD::get_singleton()->framebuffer_get_size(shadow_pass.framebuffer)));
+			const uint32_t element_count = shadow_pass.element_count;
+			const uint32_t wanted = render_list_split_min_elements > 0 ? CLAMP(element_count / render_list_split_min_elements, 1u, render_list_max_splits * 2) : 1u;
+			const RenderElementInfo *element_info = render_list_parameters.element_info;
+			uint32_t from = 0;
+			for (uint32_t k = 0; k < wanted && from < element_count; k++) {
+				// A boundary moves forward to the start of a run of repeated elements, as in _render_list_split().
+				uint32_t to = k == wanted - 1 ? element_count : uint32_t(uint64_t(element_count) * (k + 1) / wanted);
+				while (to > from && to < element_count && element_info[to - 1].repeat > 1) {
+					to++;
+				}
+				if (to <= from) {
+					continue;
+				}
+				RenderListSplit split;
+				split.from_element = from;
+				split.to_element = to;
+				shadow_part_splits.push_back(split);
+				shadow_part_pass.push_back(i);
+				shadow_part_viewports.push_back(viewport);
+				shadow_part_formats.push_back(render_list_parameters.framebuffer_format);
+				shadow_pass_part_count[i]++;
+				part_count++;
+				from = to;
+			}
+		}
+
+		if (part_count < 2) {
+			for (uint32_t i = 0; i < pass_count; i++) {
+				shadow_pass_part_count[i] = 0;
+			}
+			part_count = 0;
+		}
+	} else {
+		for (uint32_t i = 0; i < pass_count; i++) {
+			shadow_pass_part_count[i] = 0;
+		}
+	}
+
+	if (part_count > 0) {
+		const uint64_t begin_usec = render_list_split_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+		shadow_part_split_ids.resize(part_count);
+		RD::get_singleton()->draw_list_split_detached_begin(part_count, shadow_part_viewports.ptr(), shadow_part_formats.ptr(), shadow_part_split_ids.ptr());
+		for (uint32_t i = 0; i < part_count; i++) {
+			RenderListSplit &split = shadow_part_splits[i];
+			split.draw_list = shadow_part_split_ids[i];
+			split.request_redraw = false;
+			split.used_materials.clear();
+		}
+
+		_parallel_run(part_count, render_list_max_splits, &RenderForwardClustered::_render_shadow_pass_part);
+
+		bool request_redraw = false;
+		for (uint32_t i = 0; i < part_count; i++) {
+			RenderListSplit &split = shadow_part_splits[i];
+			request_redraw = request_redraw || split.request_redraw;
+			for (RendererRD::MaterialStorage::MaterialData *material : split.used_materials) {
+				material->set_as_used();
+			}
+		}
+
+		if (request_redraw) {
+			RenderingServerDefault::redraw_request();
+		}
+
+		if (render_list_split_stats.enabled) {
+			render_list_split_stats.shadow_parallel_passes += pass_count;
+			render_list_split_stats.shadow_parallel_usec += OS::get_singleton()->get_ticks_usec() - begin_usec;
+		}
+	}
+
+	for (uint32_t i = 0; i < pass_count; i++) {
+		SceneState::ShadowPass &shadow_pass = shadow_passes[i];
+		const BitField<RD::DrawFlags> draw_flags = shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL;
+		if (part_count > 0) {
+			RD::get_singleton()->draw_list_begin(shadow_pass.framebuffer, draw_flags, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+			for (uint32_t k = 0; k < shadow_pass_part_count[i]; k++) {
+				RD::get_singleton()->draw_list_split_append(shadow_part_split_ids[shadow_pass_first_part[i] + k]);
+			}
+			RD::get_singleton()->draw_list_end();
+		} else {
+			RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr() + shadow_pass.element_from, render_list[RENDER_LIST_SECONDARY].element_info.ptr() + shadow_pass.element_from, shadow_pass.element_count, shadow_pass.flip_cull, shadow_pass.pass_mode, 0, true, false, shadow_pass.rp_uniform_set, false, Vector2(), shadow_pass.lod_distance_multiplier, shadow_pass.screen_mesh_lod_threshold, 1, shadow_pass.element_from);
+			_render_list_with_draw_list(&render_list_parameters, shadow_pass.framebuffer, draw_flags, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+		}
+
+		if (shadow_pass.cube_copy >= 0) {
+			_render_shadow_cube_copy(cube_shadow_copies[shadow_pass.cube_copy]);
+		}
+	}
+
+	if (part_count > 0) {
+		RD::get_singleton()->draw_list_split_detached_end();
 	}
 
 	RD::get_singleton()->draw_command_end_label();
+}
+
+void RenderForwardClustered::_render_shadow_cube_copy(const CubeShadowCopy &p_copy) {
+	// Both halves of the dual paraboloid the atlas holds for an omni light, from the cubemap.
+	Rect2 atlas_rect_norm = p_copy.atlas_rect;
+	atlas_rect_norm.position /= float(p_copy.atlas_size);
+	atlas_rect_norm.size /= float(p_copy.atlas_size);
+	copy_effects->copy_cubemap_to_dp(p_copy.cubemap, p_copy.atlas_fb, atlas_rect_norm, p_copy.atlas_rect.size, p_copy.z_near, p_copy.z_far, false);
+	atlas_rect_norm.position += Vector2(p_copy.dual_paraboloid_offset) * atlas_rect_norm.size;
+	copy_effects->copy_cubemap_to_dp(p_copy.cubemap, p_copy.atlas_fb, atlas_rect_norm, p_copy.atlas_rect.size, p_copy.z_near, p_copy.z_far, true);
+
+	// Restore transform so it can be properly used.
+	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+	light_storage->light_instance_set_shadow_transform(p_copy.light, Projection(), light_storage->light_instance_get_base_transform(p_copy.light), p_copy.z_far, 0, 0, 0);
+}
+
+void RenderForwardClustered::_render_shadow_pass_part(uint32_t p_part) {
+	RenderListSplit &split = shadow_part_splits[p_part];
+	RenderListParameters &render_list_parameters = shadow_pass_params[shadow_part_pass[p_part]];
+	_render_list(split.draw_list, render_list_parameters.framebuffer_format, &render_list_parameters, split.from_element, split.to_element, &split);
 }
 
 void RenderForwardClustered::_render_particle_collider_heightfield(RID p_fb, const Transform3D &p_cam_transform, const Projection &p_cam_projection, const PagedArray<RenderGeometryInstance *> &p_instances) {
@@ -3609,6 +5335,25 @@ void RenderForwardClustered::_update_render_base_uniform_set() {
 	}
 }
 
+void RenderForwardClustered::_slot_buffers_append_uniforms(LocalVector<RD::Uniform> &r_uniforms) {
+	instance_slot_buffer.ensure(instance_slots.data.size());
+	surface_slot_buffer.ensure(surface_slots.data.size());
+	{
+		RD::Uniform u;
+		u.binding = 37;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
+		u.append_id(instance_slot_buffer.buffer);
+		r_uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 38;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
+		u.append_id(surface_slot_buffer.buffer);
+		r_uniforms.push_back(u);
+	}
+}
+
 RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas) {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
@@ -3653,13 +5398,14 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		if (scene_state.instance_buffer[p_render_list].get_size(0u) == 0u) {
 			// Any buffer will do since it's not used, so just create one.
 			// We can't use scene_shader.default_vec4_xform_buffer because it's not dynamic.
-			scene_state.instance_buffer[p_render_list].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::InstanceData));
+			scene_state.instance_buffer[p_render_list].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::ElementData));
 			scene_state.instance_buffer[p_render_list].prepare_for_upload();
 		}
 		RID instance_buffer = scene_state.instance_buffer[p_render_list]._get(0u);
 		u.append_id(instance_buffer);
 		uniforms.push_back(u);
 	}
+	_slot_buffers_append_uniforms(uniforms);
 	{
 		RID radiance_texture;
 		if (p_radiance_texture.is_valid()) {
@@ -4022,13 +5768,14 @@ RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_te
 		if (scene_state.instance_buffer[RENDER_LIST_SECONDARY].get_size(0u) == 0u) {
 			// Any buffer will do since it's not used, so just create one.
 			// We can't use scene_shader.default_vec4_xform_buffer because it's not dynamic.
-			scene_state.instance_buffer[RENDER_LIST_SECONDARY].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::InstanceData));
+			scene_state.instance_buffer[RENDER_LIST_SECONDARY].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::ElementData));
 			scene_state.instance_buffer[RENDER_LIST_SECONDARY].prepare_for_upload();
 		}
 		RID instance_buffer = scene_state.instance_buffer[RENDER_LIST_SECONDARY]._get(0u);
 		u.append_id(instance_buffer);
 		uniforms.push_back(u);
 	}
+	_slot_buffers_append_uniforms(uniforms);
 	{
 		// No radiance texture.
 		RID radiance_texture = texture_storage->texture_rd_get_default(is_using_radiance_octmap_array() ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
@@ -4365,7 +6112,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
 
 	while (surf) {
 		GeometryInstanceSurfaceDataCache *next = surf->next;
-		RenderForwardClustered::get_singleton()->geometry_instance_surface_alloc.free(surf);
+		RenderForwardClustered::get_singleton()->_surface_cache_free(surf);
 		surf = next;
 	}
 
@@ -4493,6 +6240,7 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
+	_surface_slot_alloc(sdcache);
 
 	if (ginstance->data->dirty_dependencies) {
 		RSG::utilities->base_update_dependency(p_mesh, &ginstance->data->dependency_tracker);
@@ -4759,6 +6507,10 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 		ginstance->data->dependency_tracker.update_end();
 		ginstance->data->dirty_dependencies = false;
 	}
+
+	// Everything _mark_dirty() rebuilds may change the instance's slot (store_transform_cache, lightmap UV scale,
+	// instance uniforms offset).
+	ginstance->_mark_instance_slot_dirty();
 
 	ginstance->dirty_list_element.remove_from_list();
 }
@@ -5042,6 +6794,12 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS;
 		pipeline_key.framebuffer_format_id = _get_shadow_cubemap_framebuffer_format_for_pipeline();
 		_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+
+		if (shadow_cube_one_pass) {
+			// Same framebuffer format: the layered framebuffer has the faces' single attachment.
+			pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_CUBE_LAYERED;
+			_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+		}
 	}
 
 	// Atlas shadowmaps (omni lights) can be in both 16-bit and 32-bit versions.
@@ -5162,6 +6920,7 @@ RenderGeometryInstance *RenderForwardClustered::geometry_instance_create(RID p_b
 	ginstance->data->dependency_tracker.changed_callback = _geometry_instance_dependency_changed;
 	ginstance->data->dependency_tracker.deleted_callback = _geometry_instance_dependency_deleted;
 
+	_instance_slot_alloc(ginstance);
 	ginstance->_mark_dirty();
 
 	return ginstance;
@@ -5203,11 +6962,19 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_transform(con
 	for (GeometryInstanceSurfaceDataCache *surf = surface_caches; surf; surf = surf->next) {
 		surf->cached_final_transform_valid = false;
 	}
+
+	_mark_instance_slot_dirty();
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::reset_motion_vectors() {
 	prev_transform = transform;
 	transform_status = TransformStatus::TELEPORTED;
+	_mark_instance_slot_dirty();
+}
+
+void RenderForwardClustered::GeometryInstanceForwardClustered::set_layer_mask(uint32_t p_layer_mask) {
+	RenderGeometryInstanceBase::set_layer_mask(p_layer_mask);
+	_mark_instance_slot_dirty();
 }
 
 bool RenderForwardClustered::GeometryInstanceForwardClustered::get_motion_history(MotionHistory &r_history) const {
@@ -5229,6 +6996,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_motion_histor
 	created_frame = p_history.created_frame;
 	last_aged_frame = p_history.last_aged_frame;
 	transform_status = TransformStatus(p_history.status);
+	_mark_instance_slot_dirty();
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::age_out_motion(uint64_t p_frame) {
@@ -5241,6 +7009,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::age_out_motion(ui
 	if (transform_status != TransformStatus::NONE && p_frame > prev_transform_change_frame && prev_transform_change_frame) {
 		prev_transform = transform;
 		transform_status = TransformStatus::NONE;
+		_mark_instance_slot_dirty();
 	}
 }
 
@@ -5314,6 +7083,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::_free_procedural_
 void RenderForwardClustered::geometry_instance_free(RenderGeometryInstance *p_geometry_instance) {
 	GeometryInstanceForwardClustered *ginstance = static_cast<GeometryInstanceForwardClustered *>(p_geometry_instance);
 	ERR_FAIL_NULL(ginstance);
+	_instance_slot_free(ginstance);
 	if (ginstance->lightmap_sh != nullptr) {
 		geometry_instance_lightmap_sh.free(ginstance->lightmap_sh);
 	}
@@ -5321,7 +7091,7 @@ void RenderForwardClustered::geometry_instance_free(RenderGeometryInstance *p_ge
 	GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches;
 	while (surf) {
 		GeometryInstanceSurfaceDataCache *next = surf->next;
-		geometry_instance_surface_alloc.free(surf);
+		_surface_cache_free(surf);
 		surf = next;
 	}
 	memdelete(ginstance->data);
@@ -5456,6 +7226,46 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 RenderForwardClustered::RenderForwardClustered() {
 	singleton = this;
 
+	// Large render lists are recorded on up to 6 threads, in ranges of at least 128 elements. GODOT_PARALLEL_DRAW_LISTS=N
+	// changes the thread count (0 or 1 records serially), GODOT_PARALLEL_DRAW_LISTS_MIN the range size;
+	// GODOT_PARALLEL_DRAW_LISTS_STATS=1 prints what was split every 240 frames.
+	{
+		const String threads_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS");
+		render_list_max_splits = threads_env.is_empty() ? 6 : uint32_t(CLAMP(threads_env.to_int(), 0, 16));
+		const String min_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS_MIN");
+		render_list_split_min_elements = min_env.is_empty() ? 128 : uint32_t(MAX(min_env.to_int(), 1));
+		render_list_split_stats.enabled = OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS_STATS") == "1";
+		list_stability.enabled = OS::get_singleton()->get_environment("GODOT_LIST_STABILITY_STATS") == "1";
+		sort_ties_by_surface = OS::get_singleton()->get_environment("GODOT_STABLE_SORT") != "0";
+#ifdef DEBUG_ENABLED
+		instance_slots.check = OS::get_singleton()->get_environment("GODOT_INSTANCE_SLOTS_CHECK") == "1";
+		sort_reuse.check = OS::get_singleton()->get_environment("GODOT_SORT_REUSE_CHECK") == "1";
+#endif
+		instance_slot_buffer.slot_size = sizeof(InstanceSlotData);
+		surface_slot_buffer.slot_size = sizeof(SurfaceSlotData);
+
+		// The render lists themselves are filled by up to 3 threads (memory bound: more threads only slow each other
+		// down), in chunks of at least 256 instances (1024 elements for the instance data). GODOT_PARALLEL_LIST_BUILD=N
+		// changes the chunk size, 0 fills them serially; GODOT_PARALLEL_LIST_BUILD_THREADS=N the thread count.
+		const String list_build_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_LIST_BUILD");
+		list_build_min_instances = list_build_env.is_empty() ? 256 : uint32_t(MAX(list_build_env.to_int(), 0));
+		const String list_build_threads_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_LIST_BUILD_THREADS");
+		list_build_max_threads = MIN(render_list_max_splits, list_build_threads_env.is_empty() ? 3u : uint32_t(CLAMP(list_build_threads_env.to_int(), 0, 16)));
+
+		// Helper threads stay GODOT_PARALLEL_LINGER_US microseconds looking for the next parallel run of the scene
+		// being rendered (0: they leave as soon as theirs is done, every run wakes its own).
+		const String linger_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_LINGER_US");
+		parallel_linger_usec = linger_env.is_empty() ? 1000 : uint64_t(MAX(linger_env.to_int(), 0));
+
+		// GODOT_PARALLEL_SHADOW_BUILD=0 sorts the shadow passes and writes their instance data one by one, as they are
+		// filled; GODOT_PARALLEL_SHADOW_MERGE=0 leaves a large pass in separately sorted runs.
+		shadow_build_parallel = OS::get_singleton()->get_environment("GODOT_PARALLEL_SHADOW_BUILD") != "0";
+		shadow_build_merge = OS::get_singleton()->get_environment("GODOT_PARALLEL_SHADOW_MERGE") != "0";
+		list_sort_parallel = OS::get_singleton()->get_environment("GODOT_PARALLEL_SORT") != "0";
+		sort_reuse.enabled = OS::get_singleton()->get_environment("GODOT_SORT_REUSE") != "0";
+		shadow_passes_parallel = OS::get_singleton()->get_environment("GODOT_PARALLEL_SHADOW_PASSES") != "0";
+	}
+
 	/* SCENE SHADER */
 
 	{
@@ -5502,6 +7312,12 @@ RenderForwardClustered::RenderForwardClustered() {
 
 		scene_shader.init(defines);
 	}
+
+#ifndef REAL_T_IS_DOUBLE
+	// The face rotation is applied to the single-precision view; double precision splits the view origin apart.
+	shadow_cube_one_pass = scene_shader.is_cube_layered_shader_group_enabled();
+#endif
+	cube_shadow_instances.set_page_pool(&cube_shadow_instance_pool);
 
 	/* shadow sampler */
 	{
@@ -5603,6 +7419,19 @@ RenderForwardClustered::RenderForwardClustered() {
 }
 
 RenderForwardClustered::~RenderForwardClustered() {
+	parallel_helpers_stop.set();
+	_parallel_release_groups(true);
+
+	cube_shadow_instances.reset();
+	cube_shadow_instance_pool.reset();
+
+	instance_slot_buffer.free();
+	surface_slot_buffer.free();
+	for (const RetiredSurfaceCache &retired : retired_surface_caches) {
+		geometry_instance_surface_alloc.free(retired.surface);
+	}
+	retired_surface_caches.clear();
+
 	if (ss_effects != nullptr) {
 		memdelete(ss_effects);
 		ss_effects = nullptr;

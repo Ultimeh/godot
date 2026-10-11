@@ -371,6 +371,9 @@ void RendererCompositorRD::begin_frame(double frame_step) {
 void RendererCompositorRD::end_frame(bool p_present) {
 	frame_draw_depth--;
 	Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_END_RENDER);
+	// The frame's driver callbacks take the HUD-less color, set after them, before the graph is replayed.
+	RendererRD::DLSSEffect::finalize_frame_callbacks();
+	RendererRD::FSRFrameGenerationEffect::finalize_frame_callbacks();
 	RD::get_singleton()->swap_buffers(p_present);
 }
 
@@ -544,6 +547,8 @@ void RendererCompositorRD::set_boot_image_with_stretch(const Ref<Image> &p_image
 
 	RD::get_singleton()->draw_list_end();
 
+	RendererRD::DLSSEffect::finalize_frame_callbacks();
+	RendererRD::FSRFrameGenerationEffect::finalize_frame_callbacks();
 	RD::get_singleton()->swap_buffers(true);
 
 	texture_storage->texture_free(texture);

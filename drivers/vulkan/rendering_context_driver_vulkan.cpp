@@ -993,13 +993,13 @@ void RenderingContextDriverVulkan::surface_set_size(SurfaceID p_surface, uint32_
 	Surface *surface = (Surface *)(p_surface);
 	surface->width = p_width;
 	surface->height = p_height;
-	surface->needs_resize = true;
+	surface->needs_resize.set();
 }
 
 void RenderingContextDriverVulkan::surface_set_vsync_mode(SurfaceID p_surface, DisplayServerEnums::VSyncMode p_vsync_mode) {
 	Surface *surface = (Surface *)(p_surface);
 	surface->vsync_mode = p_vsync_mode;
-	surface->needs_resize = true;
+	surface->needs_resize.set();
 }
 
 DisplayServerEnums::VSyncMode RenderingContextDriverVulkan::surface_get_vsync_mode(SurfaceID p_surface) const {
@@ -1010,7 +1010,7 @@ DisplayServerEnums::VSyncMode RenderingContextDriverVulkan::surface_get_vsync_mo
 void RenderingContextDriverVulkan::surface_set_hdr_output_enabled(SurfaceID p_surface, bool p_enabled) {
 	Surface *surface = (Surface *)(p_surface);
 	surface->hdr_output = p_enabled;
-	surface->needs_resize = true;
+	surface->needs_resize.set();
 }
 
 bool RenderingContextDriverVulkan::surface_get_hdr_output_enabled(SurfaceID p_surface) const {
@@ -1065,12 +1065,12 @@ uint32_t RenderingContextDriverVulkan::surface_get_height(SurfaceID p_surface) c
 
 void RenderingContextDriverVulkan::surface_set_needs_resize(SurfaceID p_surface, bool p_needs_resize) {
 	Surface *surface = (Surface *)(p_surface);
-	surface->needs_resize = p_needs_resize;
+	surface->needs_resize.set_to(p_needs_resize);
 }
 
 bool RenderingContextDriverVulkan::surface_get_needs_resize(SurfaceID p_surface) const {
 	Surface *surface = (Surface *)(p_surface);
-	return surface->needs_resize;
+	return surface->needs_resize.is_set();
 }
 
 void RenderingContextDriverVulkan::surface_destroy(SurfaceID p_surface) {

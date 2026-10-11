@@ -570,6 +570,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 
 	_register_requested_device_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME, true);
 	_register_requested_device_extension(VK_KHR_MULTIVIEW_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_EXT_FRAGMENT_DENSITY_MAP_2_EXTENSION_NAME, false);
@@ -2249,6 +2250,7 @@ void RenderingDeviceDriverVulkan::buffer_flush(BufferID p_buffer) {
 	const bool needs_flushing = !(mem_props_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
 	if (needs_flushing) {
+		MutexLock lock(pending_flushes_mutex);
 		if (buf_info->is_dynamic()) {
 			pending_flushes.allocations.push_back(buf_info->allocation.handle);
 			pending_flushes.offsets.push_back(buf_info->frame_idx * buf_info->size);
@@ -3161,6 +3163,7 @@ Error RenderingDeviceDriverVulkan::fence_wait(FenceID p_fence) {
 
 	if (fence->queue_signaled_from != nullptr) {
 		// Release all semaphores that the command queue associated to the fence waited on the last time it was submitted.
+		MutexLock lock(fence->queue_signaled_from->mutex);
 		LocalVector<Pair<Fence *, uint32_t>> &pairs = fence->queue_signaled_from->image_semaphores_for_fences;
 		uint32_t i = 0;
 		while (i < pairs.size()) {
@@ -3298,13 +3301,13 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 	wait_semaphores.clear();
 	wait_semaphores_stages.clear();
 
-	if (!command_queue->pending_semaphores_for_execute.is_empty()) {
+	{
+		MutexLock lock(command_queue->mutex);
 		for (uint32_t i = 0; i < command_queue->pending_semaphores_for_execute.size(); i++) {
 			VkSemaphore wait_semaphore = command_queue->image_semaphores[command_queue->pending_semaphores_for_execute[i]];
 			wait_semaphores.push_back(wait_semaphore);
 			wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 		}
-
 		command_queue->pending_semaphores_for_execute.clear();
 	}
 
@@ -3314,16 +3317,19 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 	}
 
-	if (!pending_flushes.allocations.is_empty()) {
-		// We must do this now, even if p_cmd_buffers is empty; because afterwards pending_flushes.allocations
-		// could become dangling. We cannot delay this call for the next frame(s).
-		err = vmaFlushAllocations(allocator, pending_flushes.allocations.size(),
-				pending_flushes.allocations.ptr(), pending_flushes.offsets.ptr(),
-				pending_flushes.sizes.ptr());
-		pending_flushes.allocations.clear();
-		pending_flushes.offsets.clear();
-		pending_flushes.sizes.clear();
-		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't flush Vulkan memory allocations (VkResult error %d).", err));
+	{
+		MutexLock lock(pending_flushes_mutex);
+		if (!pending_flushes.allocations.is_empty()) {
+			// We must do this now, even if p_cmd_buffers is empty; because afterwards pending_flushes.allocations
+			// could become dangling. We cannot delay this call for the next frame(s).
+			err = vmaFlushAllocations(allocator, pending_flushes.allocations.size(),
+					pending_flushes.allocations.ptr(), pending_flushes.offsets.ptr(),
+					pending_flushes.sizes.ptr());
+			pending_flushes.allocations.clear();
+			pending_flushes.offsets.clear();
+			pending_flushes.sizes.clear();
+			ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't flush Vulkan memory allocations (VkResult error %d).", err));
+		}
 	}
 
 	if (p_cmd_buffers.size() > 0) {
@@ -3370,6 +3376,7 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		}
 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't submit to Vulkan queue (VkResult error %d).", err));
 
+		MutexLock lock(command_queue->mutex);
 		if (fence != nullptr && !command_queue->pending_semaphores_for_fence.is_empty()) {
 			fence->queue_signaled_from = command_queue;
 
@@ -3425,6 +3432,12 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		} else {
 			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
 		}
+#elif defined(STREAMLINE_ENABLED)
+		{
+			// Latency markers set from other threads use the swap chain too.
+			MutexLock swap_chain_lock(Streamline::get_swap_chain_mutex());
+			err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
+		}
 #else
 		err = device_functions.QueuePresentKHR(device_queue.queue, &present_info);
 #endif
@@ -3432,7 +3445,9 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		device_queue.submit_mutex.unlock();
 
 #ifdef STREAMLINE_ENABLED
-		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_END_PRESENT);
+		if (Streamline::get_singleton()) {
+			Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_END_PRESENT);
+		}
 #endif
 
 		// Set the index to an invalid value. If any of the swap chains returned out of date, indicate it should be resized the next time it's acquired.
@@ -3757,6 +3772,7 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
 	}
 
 	for (uint32_t i = 0; i < swap_chain->command_queues_acquired.size(); i++) {
+		MutexLock lock(swap_chain->command_queues_acquired[i]->mutex);
 		_recreate_image_semaphore(swap_chain->command_queues_acquired[i], swap_chain->command_queues_acquired_semaphores[i], false);
 	}
 
@@ -4116,30 +4132,35 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::swap_chain_acquire_framebuffer(C
 	VkResult err;
 	VkSemaphore semaphore = VK_NULL_HANDLE;
 	uint32_t semaphore_index = 0;
-	if (command_queue->free_image_semaphores.is_empty()) {
-		// Add a new semaphore if none are free.
-		VkSemaphoreCreateInfo create_info = {};
-		create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		err = vkCreateSemaphore(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &semaphore);
-		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FramebufferID(), vformat("Couldn't create Vulkan semaphore for acquiring swapchain image (VkResult error %d).", err));
+	// The queue's lock is not held while acquiring: the acquire may wait for a present, which needs it.
+	{
+		MutexLock semaphores_lock(command_queue->mutex);
+		if (command_queue->free_image_semaphores.is_empty()) {
+			// Add a new semaphore if none are free.
+			VkSemaphoreCreateInfo create_info = {};
+			create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+			err = vkCreateSemaphore(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &semaphore);
+			ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FramebufferID(), vformat("Couldn't create Vulkan semaphore for acquiring swapchain image (VkResult error %d).", err));
 
-		semaphore_index = command_queue->image_semaphores.size();
-		command_queue->image_semaphores.push_back(semaphore);
-		command_queue->image_semaphores_swap_chains.push_back(swap_chain);
-	} else {
-		// Pick a free semaphore.
-		uint32_t free_index = command_queue->free_image_semaphores.size() - 1;
-		semaphore_index = command_queue->free_image_semaphores[free_index];
-		command_queue->image_semaphores_swap_chains[semaphore_index] = swap_chain;
-		command_queue->free_image_semaphores.remove_at(free_index);
-		semaphore = command_queue->image_semaphores[semaphore_index];
+			semaphore_index = command_queue->image_semaphores.size();
+			command_queue->image_semaphores.push_back(semaphore);
+			command_queue->image_semaphores_swap_chains.push_back(swap_chain);
+		} else {
+			// Pick a free semaphore.
+			uint32_t free_index = command_queue->free_image_semaphores.size() - 1;
+			semaphore_index = command_queue->free_image_semaphores[free_index];
+			command_queue->image_semaphores_swap_chains[semaphore_index] = swap_chain;
+			command_queue->free_image_semaphores.remove_at(free_index);
+			semaphore = command_queue->image_semaphores[semaphore_index];
+		}
+
+		// Store in the swap chain the acquired semaphore.
+		swap_chain->command_queues_acquired.push_back(command_queue);
+		swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
 	}
 
-	// Store in the swap chain the acquired semaphore.
-	swap_chain->command_queues_acquired.push_back(command_queue);
-	swap_chain->command_queues_acquired_semaphores.push_back(semaphore_index);
-
 	err = device_functions.AcquireNextImageKHR(vk_device, swap_chain->vk_swapchain, UINT64_MAX, semaphore, VK_NULL_HANDLE, &swap_chain->image_index);
+	MutexLock lock(command_queue->mutex);
 	if (err == VK_ERROR_OUT_OF_DATE_KHR) {
 		// Out of date leaves the semaphore in a signaled state that will never finish, so it's necessary to recreate it.
 		bool semaphore_recreated = _recreate_image_semaphore(command_queue, semaphore_index, true);
@@ -4292,7 +4313,7 @@ void RenderingDeviceDriverVulkan::swap_chain_free(SwapChainID p_swap_chain) {
 /**** FRAMEBUFFER ****/
 /*********************/
 
-RDD::FramebufferID RenderingDeviceDriverVulkan::framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height) {
+RDD::FramebufferID RenderingDeviceDriverVulkan::framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height, uint32_t p_layers) {
 	RenderPassInfo *render_pass = (RenderPassInfo *)(p_render_pass.id);
 
 	uint32_t fragment_density_map_offsets_layers = 0;
@@ -4309,7 +4330,7 @@ RDD::FramebufferID RenderingDeviceDriverVulkan::framebuffer_create(RenderPassID 
 	framebuffer_create_info.pAttachments = vk_img_views;
 	framebuffer_create_info.width = p_width;
 	framebuffer_create_info.height = p_height;
-	framebuffer_create_info.layers = 1;
+	framebuffer_create_info.layers = p_layers;
 
 	VkFramebuffer vk_framebuffer = VK_NULL_HANDLE;
 	VkResult err = vkCreateFramebuffer(vk_device, &framebuffer_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_FRAMEBUFFER), &vk_framebuffer);
@@ -7143,12 +7164,10 @@ void RenderingDeviceDriverVulkan::command_insert_breadcrumb(CommandBufferID p_cm
 
 	// We write to a circular buffer. If you're getting barrier sync errors here,
 	// increase the value of BREADCRUMB_BUFFER_ENTRIES.
-	vkCmdFillBuffer(command_buffer->vk_command_buffer, ((BufferInfo *)breadcrumb_buffer.id)->vk_buffer, breadcrumb_offset, sizeof(uint32_t), breadcrumb_id++);
+	const uint32_t breadcrumb = breadcrumb_id.postincrement();
+	const VkDeviceSize breadcrumb_offset = (breadcrumb % BREADCRUMB_BUFFER_ENTRIES) * sizeof(uint32_t) * 2u;
+	vkCmdFillBuffer(command_buffer->vk_command_buffer, ((BufferInfo *)breadcrumb_buffer.id)->vk_buffer, breadcrumb_offset, sizeof(uint32_t), breadcrumb);
 	vkCmdFillBuffer(command_buffer->vk_command_buffer, ((BufferInfo *)breadcrumb_buffer.id)->vk_buffer, breadcrumb_offset + sizeof(uint32_t), sizeof(uint32_t), p_data);
-	breadcrumb_offset += sizeof(uint32_t) * 2u;
-	if (breadcrumb_offset >= BREADCRUMB_BUFFER_ENTRIES * sizeof(uint32_t) * 2u) {
-		breadcrumb_offset = 0u;
-	}
 #endif
 }
 
@@ -7260,7 +7279,8 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 	if (breadcrumb_ptr && map_result == VK_SUCCESS) {
 		uint32_t last_breadcrumb_offset = 0;
 		{
-			_err_print_error_asap("Searching last breadcrumb. We've sent up to ID: " + itos(breadcrumb_id - 1u));
+			const uint32_t breadcrumbs_sent = breadcrumb_id.get();
+			_err_print_error_asap("Searching last breadcrumb. We've sent up to ID: " + itos(breadcrumbs_sent - 1u));
 
 			// Scan the whole buffer to find the offset with the highest ID.
 			// That means that was the last one to be written.
@@ -7274,7 +7294,7 @@ void RenderingDeviceDriverVulkan::print_lost_device_info() {
 			const uint32_t *breadcrumb_ptr32 = reinterpret_cast<const uint32_t *>(breadcrumb_ptr);
 			for (size_t i = 0u; i < BREADCRUMB_BUFFER_ENTRIES; ++i) {
 				const uint32_t id = breadcrumb_ptr32[i * 2u];
-				const uint32_t id_diff = breadcrumb_id - id;
+				const uint32_t id_diff = breadcrumbs_sent - id;
 				if (id_diff < smallest_id_diff) {
 					biggest_id = i;
 					smallest_id_diff = id_diff;
@@ -7647,6 +7667,8 @@ bool RenderingDeviceDriverVulkan::has_feature(Features p_feature) {
 			return framebuffer_depth_resolve;
 		case SUPPORTS_POINT_SIZE:
 			return true;
+		case SUPPORTS_SHADER_OUTPUT_LAYER:
+			return enabled_device_extension_names.has(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
 		case SUPPORTS_RAY_QUERY:
 			return acceleration_structure_capabilities.acceleration_structure_support && ray_query_support;
 		case SUPPORTS_RAYTRACING_PIPELINE:

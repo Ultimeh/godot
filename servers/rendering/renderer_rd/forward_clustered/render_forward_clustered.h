@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/object/worker_thread_pool.h"
 #include "core/templates/paged_allocator.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
@@ -218,6 +219,7 @@ protected:
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
 		PASS_MODE_DEPTH_MATERIAL,
 		PASS_MODE_SDF,
+		PASS_MODE_SHADOW_CUBE, // The 6 faces of a cube shadow in one pass, into a layered framebuffer.
 		PASS_MODE_MAX
 	};
 
@@ -249,6 +251,7 @@ protected:
 		bool use_directional_soft_shadow = false;
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
 
+		RenderListParameters() = default;
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}) {
 			elements = p_elements;
 			element_info = p_element_info;
@@ -268,6 +271,174 @@ protected:
 			base_specialization = p_base_specialization;
 		}
 	};
+
+	// A range of a render list recorded on its own thread into a split of the draw list (RD::draw_list_split_begin()).
+	// What the recording would change outside the draw list waits in here for the render thread.
+	struct RenderListSplit {
+		uint32_t from_element = 0;
+		uint32_t to_element = 0;
+		RD::DrawListID draw_list = 0;
+		bool request_redraw = false;
+		LocalVector<RendererRD::MaterialStorage::MaterialData *> used_materials;
+		uint64_t begin_usec = 0; // Stats only.
+		uint64_t end_usec = 0;
+	};
+
+	LocalVector<RenderListSplit> render_list_splits;
+	LocalVector<RD::DrawListID> render_list_split_ids;
+	RenderListParameters *render_list_split_params = nullptr;
+
+	// Every shadow pass of a _render_shadow_end() (often many: one per cube light, 6 per light without one-pass cubes),
+	// cut in parts as a draw list split would be, recorded in one _parallel_run into splits reserved ahead of their
+	// draw lists (RD::draw_list_split_detached_begin()); the draw lists then open in order and take their parts.
+	// GODOT_PARALLEL_SHADOW_PASSES=0 records them pass after pass, each split on its own if large.
+	bool shadow_passes_parallel = true;
+	LocalVector<uint32_t> shadow_pass_first_part; // Per shadow pass: its parts [first, first + count); count 0: none.
+	LocalVector<uint32_t> shadow_pass_part_count;
+	LocalVector<RenderListParameters> shadow_pass_params;
+	LocalVector<uint32_t> shadow_part_pass; // Per part: its pass.
+	LocalVector<Rect2i> shadow_part_viewports;
+	LocalVector<RD::FramebufferFormatID> shadow_part_formats;
+	LocalVector<RenderListSplit> shadow_part_splits;
+	LocalVector<RD::DrawListID> shadow_part_split_ids;
+
+	void _render_shadow_pass_part(uint32_t p_part);
+
+	// Work cut in parts that helper threads and the render thread take in turn (_parallel_run()). The claim holds the
+	// run's generation (high 32 bits) and the next part (low 32 bits); a run is closed (low bits all set) while the
+	// next one is published, and a claim made on a stale value fails its compare-exchange.
+	// Helpers are WorkerThreadPool tasks that stay a while (parallel_linger_usec) looking for the next run once theirs
+	// is done: waking a pool thread costs the render thread ~20 us (the pool notifies under its mutex), and a frame has
+	// a dozen runs close together. A run only wakes the helpers it lacks; each run says how many may join it.
+	// _render_scene() dismisses them when it returns (parallel_epoch): the graph replay that follows needs the cores.
+	typedef void (RenderForwardClustered::*ParallelPart)(uint32_t p_part);
+	std::atomic<uint64_t> parallel_claim = { 0xFFFFFFFF };
+	SafeNumeric<uint32_t> parallel_part_count;
+	SafeNumeric<uint32_t> parallel_parts_done;
+	uint32_t parallel_generation = 0;
+	ParallelPart parallel_part = nullptr;
+	std::atomic<uint32_t> parallel_run_workers = { 0 }; // Helpers allowed in the current run.
+	SafeNumeric<uint32_t> parallel_run_joined; // Helpers that joined it.
+	SafeNumeric<uint32_t> parallel_helpers; // Helper tasks running or about to.
+	SafeFlag parallel_helpers_stop;
+	SafeNumeric<uint32_t> parallel_epoch; // Helpers woken in an older epoch leave once idle.
+	uint64_t parallel_linger_usec = 0;
+	LocalVector<WorkerThreadPool::GroupID> parallel_groups;
+	uint32_t render_list_max_splits = 0;
+	uint32_t render_list_split_min_elements = 0;
+
+	struct RenderListSplitStats {
+		bool enabled = false;
+		uint64_t frame = 0;
+		uint32_t frames = 0;
+		uint32_t split_lists = 0;
+		uint32_t splits = 0;
+		uint64_t split_elements = 0;
+		uint64_t split_usec = 0;
+		uint64_t split_wait_usec = 0;
+		uint64_t split_join_usec = 0;
+		uint64_t split_parts_usec = 0;
+		uint64_t split_start_usec = 0;
+		uint32_t serial_lists = 0;
+		uint64_t serial_elements = 0;
+		uint64_t serial_usec = 0;
+		uint64_t fill_usec = 0; // _fill_render_list
+		uint64_t instance_data_usec = 0; // _fill_instance_data
+		uint32_t parallel_builds = 0; // Calls of either that used several threads.
+		uint32_t shadow_builds = 0; // _render_shadow_build(): calls, shadow passes, elements.
+		uint32_t shadow_passes = 0;
+		uint64_t shadow_elements = 0;
+		uint64_t shadow_usec = 0; // Sorting the shadow passes and writing their instance data, either path.
+		uint64_t shadow_draw_calls = 0; // Deferred builds only.
+		// Deferred shadow builds, step by step: copying each pass's elements as it is filled, checking for a kept order,
+		// sorting, keeping the new orders, writing the instance data, counting the instancing runs.
+		uint64_t shadow_copy_usec = 0;
+		uint64_t shadow_check_usec = 0;
+		uint64_t shadow_sort_usec = 0;
+		uint64_t shadow_store_usec = 0;
+		uint64_t shadow_instance_usec = 0;
+		uint64_t shadow_runs_usec = 0;
+		// What skipping unchanged instances in the fill could save: fills of the main view and of shadow passes whose
+		// camera (transform, projection, LOD settings) is the one of their previous fill, and the filled instances that
+		// moved this frame.
+		struct FillChanges {
+			uint32_t fills = 0;
+			uint32_t camera_still = 0;
+			uint64_t instances = 0;
+			uint64_t moved = 0;
+		} fill_changes[2]; // Main view, shadow passes.
+		HashMap<uint64_t, uint32_t> fill_cameras; // By view or shadow pass: the camera of its previous fill.
+		uint64_t sort_usec = 0; // Sorting the main view's opaque, motion and alpha lists, either path.
+		uint32_t sorted_lists = 0; // Main lists and deferred shadow passes, and how many of them kept their last order.
+		uint32_t reused_lists = 0;
+		uint32_t merged_lists = 0;
+		uint32_t sorted_shadow_passes = 0;
+		uint32_t reused_shadow_passes = 0;
+		uint32_t merged_shadow_passes = 0;
+		uint64_t surface_caches_freed = 0; // surface_caches_freed when these statistics started.
+		uint32_t shadow_parallel_passes = 0; // Shadow passes recorded together ahead of their draw lists, and the time it took.
+		uint64_t shadow_parallel_usec = 0;
+		// _parallel_run(), all uses: parts, those run by the calling thread, sum of the parts' durations, wall time.
+		SafeNumeric<uint64_t> run_parts;
+		SafeNumeric<uint64_t> run_parts_on_caller;
+		SafeNumeric<uint64_t> run_parts_usec;
+		uint64_t run_usec = 0;
+		uint32_t runs = 0;
+		uint32_t helpers_woken = 0;
+	} render_list_split_stats;
+
+	// GODOT_LIST_STABILITY_STATS=1 prints every 240 frames how much of each sorted list matches the same list the last
+	// time it was drawn (by view for the main lists, by light and pass for shadow passes). Statistics only.
+	enum ListStabilityCategory {
+		LIST_STABILITY_OPAQUE,
+		LIST_STABILITY_MOTION,
+		LIST_STABILITY_ALPHA,
+		LIST_STABILITY_SHADOW_DIRECTIONAL,
+		LIST_STABILITY_SHADOW_OMNI,
+		LIST_STABILITY_SHADOW_SPOT,
+		LIST_STABILITY_MAX,
+	};
+
+	struct ListStability {
+		struct Element {
+			const void *surface = nullptr;
+			uint64_t sort_key1 = 0;
+			uint64_t sort_key2 = 0;
+			uint32_t cube_face_mask = 0;
+			uint32_t transform_hash = 0;
+		};
+		struct History {
+			LocalVector<Element> elements;
+			uint64_t frame = 0;
+		};
+		struct Counters {
+			uint64_t lists = 0;
+			uint64_t identical_lists = 0; // Same elements, keys and order: what a cached list would reuse whole.
+			uint64_t elements = 0;
+			uint64_t same_position = 0;
+			uint64_t shifted = 0; // Same keys and order, another position: something entered, left or moved above it.
+			uint64_t reordered = 0; // Same keys, out of order with the elements kept before it.
+			uint64_t rekeyed = 0; // In the previous list with other keys.
+			uint64_t entered = 0;
+			uint64_t left = 0;
+			uint64_t moved = 0; // Kept, but the instance has another transform.
+		};
+		bool enabled = false;
+		uint64_t frame = 0;
+		uint32_t frames = 0;
+		HashMap<uint64_t, History> histories;
+		Counters counters[LIST_STABILITY_MAX];
+		LocalVector<Element> current; // Filled by the caller of _list_stability_compare().
+		HashMap<const void *, uint32_t> previous_index;
+	} list_stability;
+
+	// Which light and pass the next _render_shadow_append() draws, set by _render_shadow_pass(): the pass's key for
+	// sort_reuse and list_stability.
+	uint64_t shadow_append_list_key = 0;
+	ListStabilityCategory shadow_append_stability_category = LIST_STABILITY_SHADOW_DIRECTIONAL;
+
+	void _list_stability_compare(uint64_t p_key, ListStabilityCategory p_category);
+	void _list_stability_add_main_list(uint64_t p_view_key, RenderListType p_render_list, ListStabilityCategory p_category);
 
 	struct LightmapData {
 		float normal_xform[12];
@@ -404,6 +575,16 @@ protected:
 		static_assert(std::is_trivially_destructible_v<InstanceData>);
 		static_assert(std::is_trivially_constructible_v<InstanceData>);
 
+		// Per drawn element, in sorted order: the data that depends on the pass, and the slots holding the rest.
+		// Matches ElementData in scene_forward_clustered_inc.glsl.
+		struct ElementData {
+			uint32_t instance_slot;
+			uint32_t surface_slot;
+			uint32_t flags;
+			uint32_t gi_offset;
+		};
+		static_assert(sizeof(ElementData) == 16);
+
 		UBO ubo;
 
 		LocalVector<RID> uniform_buffers;
@@ -418,7 +599,7 @@ protected:
 		RID lightmap_buffer;
 
 		MultiUmaBuffer<1u> instance_buffer[RENDER_LIST_MAX] = { MultiUmaBuffer<1u>("RENDER_LIST_OPAQUE"), MultiUmaBuffer<1u>("RENDER_LIST_MOTION"), MultiUmaBuffer<1u>("RENDER_LIST_ALPHA"), MultiUmaBuffer<1u>("RENDER_LIST_SECONDARY") };
-		InstanceData *curr_gpu_ptr[RENDER_LIST_MAX] = {};
+		ElementData *curr_gpu_ptr[RENDER_LIST_MAX] = {};
 
 		LightmapCaptureData *lightmap_captures = nullptr;
 		uint32_t max_lightmap_captures;
@@ -449,6 +630,13 @@ protected:
 			bool flip_cull;
 
 			uint32_t uniform_buffer_index;
+
+			int *render_info = nullptr; // Shadow render info of the pass, for its draw calls.
+			uint32_t draw_calls = 0;
+			int32_t cube_copy = -1; // The cube shadow to copy into the atlas once this pass is drawn (cube_shadow_copies).
+
+			uint64_t list_key = 0; // Light and pass: sort_reuse and list_stability.
+			ListStabilityCategory stability_category = LIST_STABILITY_SHADOW_DIRECTIONAL;
 		};
 
 		LocalVector<ShadowPass> shadow_passes;
@@ -472,6 +660,7 @@ protected:
 				uint32_t uses_projector : 1;
 				uint32_t uses_forward_gi : 1;
 				uint32_t uses_lightmap : 1;
+				uint32_t cube_face_mask : 6; // PASS_MODE_SHADOW_CUBE: the faces that see the element.
 			};
 			uint32_t value;
 		};
@@ -482,12 +671,84 @@ protected:
 	static_assert(std::is_trivially_constructible_v<RenderElementInfo>);
 
 	template <PassMode p_pass_mode, uint32_t p_color_pass_flags = 0>
-	_FORCE_INLINE_ void _render_list_template(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element);
-	void _render_list(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element);
+	_FORCE_INLINE_ void _render_list_template(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element, RenderListSplit *p_split);
+	void _render_list(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element, RenderListSplit *p_split = nullptr);
+	uint32_t _render_list_get_split_count(const RenderListParameters *p_params);
+	void _render_list_split(RenderListParameters *p_params, uint32_t p_split_count);
+	void _render_list_split_part(uint32_t p_part);
+
+	uint64_t _parallel_run(uint32_t p_part_count, uint32_t p_thread_count, ParallelPart p_part);
+	void _parallel_helper_task(uint32_t p_index, uint32_t p_epoch);
+	bool _parallel_run_claimed(bool p_caller);
+	void _parallel_release_groups(bool p_wait);
 	void _render_list_with_draw_list(RenderListParameters *p_params, RID p_framebuffer, BitField<RD::DrawFlags> p_draw_flags = RD::DRAW_DEFAULT_ALL, const Vector<Color> &p_clear_color_values = Vector<Color>(), float p_clear_depth_value = 0.0, uint32_t p_clear_stencil_value = 0, const Rect2 &p_region = Rect2());
 
 	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true);
 	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false, bool p_alpha_only = false);
+
+	class GeometryInstanceForwardClustered;
+
+	// _fill_render_list() over a range of the culled instances. Every instance and surface is written by its own
+	// chunk only; what the list, the scene state and the render info get is kept in the chunk and merged in order.
+	struct FillRenderListChunk {
+		enum {
+			USED_SSS = 1 << 0,
+			USED_SCREEN_TEXTURE = 1 << 1,
+			USED_NORMAL_TEXTURE = 1 << 2,
+			USED_DEPTH_TEXTURE = 1 << 3,
+			USED_LIGHTMAP = 1 << 4,
+			USED_OPAQUE_STENCIL = 1 << 5,
+		};
+
+		uint32_t from_instance = 0;
+		uint32_t to_instance = 0;
+		LocalVector<GeometryInstanceSurfaceDataCache *> elements; // For the list being filled.
+		LocalVector<GeometryInstanceSurfaceDataCache *> alpha_elements;
+		LocalVector<GeometryInstanceSurfaceDataCache *> motion_elements;
+		LocalVector<GeometryInstanceForwardClustered *> lightmap_captures; // Their index in the frame is set by the merge.
+		uint32_t used = 0;
+		int64_t visible_primitives = 0;
+		int64_t shadow_primitives = 0;
+		char padding[64]; // Each thread writes its own chunk: keep the next chunk's fields off this one's cache lines.
+	};
+
+	struct FillRenderListParameters {
+		RenderListType render_list = RENDER_LIST_OPAQUE;
+		const RenderDataRD *render_data = nullptr;
+		PassMode pass_mode = PASS_MODE_COLOR;
+		bool using_sdfgi = false;
+		bool using_opaque_gi = false;
+		bool using_motion_pass = false;
+		bool alpha_only = false;
+		Plane near_plane;
+		float z_max = 0.0;
+		uint32_t max_lightmap_captures = 0; // Per chunk: the merge checks the total.
+		uint64_t frame = 0;
+	} fill_render_list_params;
+
+	LocalVector<FillRenderListChunk> fill_render_list_chunks;
+	uint32_t list_build_min_instances = 0; // Smallest chunk of instances worth a thread; 0 builds serially.
+	uint32_t list_build_max_threads = 0;
+
+	void _fill_render_list_chunk(FillRenderListChunk &p_chunk);
+	void _fill_render_list_part(uint32_t p_part);
+
+	// _fill_instance_data() over ranges of elements; whether each element can be drawn with the one before it goes in
+	// fill_instance_data_repeats, the runs are counted afterwards in order.
+	struct FillInstanceDataParameters {
+		RenderListType render_list = RENDER_LIST_OPAQUE;
+		uint32_t offset = 0;
+		uint32_t count = 0;
+		uint32_t part_count = 0;
+	} fill_instance_data_params;
+	LocalVector<uint8_t> fill_instance_data_repeats;
+
+	void _fill_instance_data_range(RenderListType p_render_list, uint32_t p_offset, uint32_t p_from, uint32_t p_to);
+	void _fill_instance_data_part(uint32_t p_part);
+#ifdef DEBUG_ENABLED
+	// The record the scene shaders used to read per element, built only to check the slots.
+	_FORCE_INLINE_ void _store_instance_data(const GeometryInstanceForwardClustered *p_inst, const GeometryInstanceSurfaceDataCache *p_surface, uint32_t p_flags, uint32_t p_gi_offset, SceneState::InstanceData *r_instance_data);
+#endif
 
 	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
@@ -563,6 +824,12 @@ protected:
 
 		mutable RID rt_deformed_handle;
 
+		uint32_t surface_slot = UINT32_MAX; // Its place in surface_slots.
+
+		// Set by _sort_reuse_apply(): the check that last marked it, and its place in the order kept for that list.
+		uint32_t sort_reuse_mark = 0;
+		uint32_t sort_reuse_index = 0;
+
 		GeometryInstanceSurfaceDataCache *next = nullptr;
 		GeometryInstanceForwardClustered *owner = nullptr;
 		SelfList<GeometryInstanceSurfaceDataCache> compilation_dirty_element;
@@ -586,6 +853,7 @@ protected:
 		//used during rendering
 
 		uint32_t gi_offset_cache = 0;
+		uint8_t cube_face_mask = 0; // Faces of the cube shadow being gathered that see it (_render_shadow_cube_gather()).
 		bool store_transform_cache = true;
 		RID transforms_uniform_set;
 		uint32_t instance_count = 0;
@@ -614,10 +882,16 @@ protected:
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
 		SelfList<GeometryInstanceForwardClustered> dirty_list_element;
 
+		uint32_t instance_slot = UINT32_MAX; // Its place in instance_slots.
+		bool instance_slot_dirty = false;
+
 		GeometryInstanceForwardClustered() :
 				dirty_list_element(this) {}
 
 		virtual void _mark_dirty() override;
+		void _mark_instance_slot_dirty();
+
+		virtual void set_layer_mask(uint32_t p_layer_mask) override;
 
 		virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) override;
 		virtual void reset_motion_vectors() override;
@@ -642,6 +916,99 @@ protected:
 
 		void age_out_motion(uint64_t p_frame);
 	};
+
+	// Data that belongs to the geometry instance, one slot per instance, rewritten only when it changes. Matches
+	// InstanceSlotData in scene_forward_clustered_inc.glsl.
+	struct InstanceSlotData {
+		float transform[12];
+		float prev_transform[12];
+		uint32_t layer_mask;
+		uint32_t instance_uniforms_ofs;
+		uint32_t pad[2];
+		float lightmap_uv_scale[4];
+#ifdef REAL_T_IS_DOUBLE
+		float model_precision[4];
+		float prev_model_precision[4];
+#endif
+	};
+
+	struct InstanceSlots {
+		LocalVector<InstanceSlotData> data;
+		LocalVector<GeometryInstanceForwardClustered *> owners;
+		LocalVector<uint32_t> free_slots;
+		LocalVector<uint32_t> dirty;
+		SpinLock dirty_lock;
+
+#ifdef DEBUG_ENABLED
+		// GODOT_INSTANCE_SLOTS_CHECK=1: every element is also built the per-frame way (InstanceData) and compared
+		// with its slots; a difference is a change that marked nothing. Reported every 240 frames.
+		bool check = false;
+		uint64_t frame = 0;
+		uint32_t frames = 0;
+		uint64_t slots_written = 0;
+		SafeNumeric<uint64_t> checked;
+		SafeNumeric<uint64_t> mismatches;
+		Mutex first_mismatch_mutex;
+		String first_mismatch;
+#endif
+	} instance_slots;
+
+	// Data that belongs to the mesh surface, one slot per surface cache, written when the cache is built (a mesh change
+	// rebuilds the caches). Matches SurfaceSlotData in scene_forward_clustered_inc.glsl.
+	struct SurfaceSlotData {
+		float compressed_aabb_position[4];
+		float compressed_aabb_size[4];
+		float uv_scale[4];
+	};
+
+#ifdef REAL_T_IS_DOUBLE
+	static_assert(sizeof(InstanceSlotData) == 160);
+#else
+	static_assert(sizeof(InstanceSlotData) == 128);
+#endif
+	static_assert(sizeof(SurfaceSlotData) == 48);
+
+	struct SurfaceSlots {
+		LocalVector<SurfaceSlotData> data;
+		LocalVector<uint32_t> free_slots;
+		LocalVector<uint32_t> dirty; // Built since the last upload.
+	} surface_slots;
+
+	// Slots on the GPU: a persistently mapped buffer with one copy per frame in flight. A copy is brought up to date
+	// with the slots written since it was last mapped. Mapped once per frame, by the first list fill, before any draw
+	// of the frame is recorded.
+	struct SlotUploadBuffer {
+		uint32_t slot_size = 0;
+		RID buffer;
+		uint32_t capacity = 0;
+		uint8_t *mapped = nullptr;
+		uint64_t mapped_frame = UINT64_MAX;
+		LocalVector<LocalVector<uint32_t>> written; // Slots written in each of the last maps (one per copy).
+		uint32_t map_index = 0;
+		uint32_t full_writes = 0; // Maps left that must write every slot (after the buffer was created or grown).
+
+		void ensure(uint32_t p_slot_count);
+		void begin_frame(uint32_t p_slot_count, const uint8_t *p_slots, uint64_t p_frame);
+		void write(uint32_t p_slot, const uint8_t *p_slots);
+		void free();
+	};
+	SlotUploadBuffer instance_slot_buffer;
+	SlotUploadBuffer surface_slot_buffer;
+	LocalVector<uint32_t> instance_slots_written; // Scratch of _instance_slots_flush().
+
+	void _slot_buffers_upload();
+	void _slot_buffers_append_uniforms(LocalVector<RD::Uniform> &r_uniforms);
+
+	void _surface_slot_alloc(GeometryInstanceSurfaceDataCache *p_surface);
+	void _surface_slot_free(GeometryInstanceSurfaceDataCache *p_surface);
+
+	void _instance_slot_alloc(GeometryInstanceForwardClustered *p_instance);
+	void _instance_slot_free(GeometryInstanceForwardClustered *p_instance);
+	void _instance_slots_flush();
+	static void _instance_slot_compute(const GeometryInstanceForwardClustered *p_instance, InstanceSlotData &r_data);
+#ifdef DEBUG_ENABLED
+	void _instance_slot_check(const GeometryInstanceForwardClustered *p_instance, const GeometryInstanceSurfaceDataCache *p_surface, const SceneState::InstanceData &p_data);
+#endif
 
 	// These are not used in the Forward+ path, it has different light clustering tech.
 	virtual uint32_t get_max_lights_total() override { return 0; }
@@ -719,6 +1086,11 @@ protected:
 
 	/* Render List */
 
+	// Ties (equal sort keys, or equal priority and depth in the alpha list) are ordered by surface address, so the same
+	// surfaces sort the same way every frame; SortArray is not stable. Equal keys stay contiguous: instancing is
+	// unchanged. GODOT_STABLE_SORT=0 leaves ties unordered.
+	static inline bool sort_ties_by_surface = true;
+
 	struct RenderList {
 		LocalVector<GeometryInstanceSurfaceDataCache *> elements;
 		LocalVector<RenderElementInfo> element_info;
@@ -728,9 +1100,18 @@ protected:
 			element_info.clear();
 		}
 
-		// The sorts compare copies of the keys (SortKeyElement, SortDepthElement), read once per element: comparing through
-		// the pointers reads the surfaces again at every comparison, and they are spread in memory. The comparisons are
-		// those of sorting the pointers, so the order is the same.
+		// The order of the lists. The sorts below give the same order but compare copies of the keys
+		// (SortKeyElement, SortDepthElement), read once per element: comparing through the pointers reads the surfaces
+		// again at every comparison, and they are spread in memory.
+		struct SortByKey {
+			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
+				if (A->sort.sort_key2 == B->sort.sort_key2 && A->sort.sort_key1 == B->sort.sort_key1) {
+					return sort_ties_by_surface && A < B;
+				}
+				return (A->sort.sort_key2 == B->sort.sort_key2) ? (A->sort.sort_key1 < B->sort.sort_key1) : (A->sort.sort_key2 < B->sort.sort_key2);
+			}
+		};
+
 		struct SortKeyElement {
 			uint64_t sort_key2;
 			uint64_t sort_key1;
@@ -739,9 +1120,14 @@ protected:
 
 		struct SortKeyElementLess {
 			_FORCE_INLINE_ bool operator()(const SortKeyElement &A, const SortKeyElement &B) const {
+				if (A.sort_key2 == B.sort_key2 && A.sort_key1 == B.sort_key1) {
+					return sort_ties_by_surface && A.surface < B.surface;
+				}
 				return (A.sort_key2 == B.sort_key2) ? (A.sort_key1 < B.sort_key1) : (A.sort_key2 < B.sort_key2);
 			}
 		};
+
+		static void fill_sort_keys(GeometryInstanceSurfaceDataCache *const *p_elements, uint32_t p_count, SortKeyElement *r_keys);
 
 		void sort_by_key() {
 			sort_by_key_range(0, elements.size());
@@ -761,6 +1147,15 @@ protected:
 			sorter.sort(elements.ptr(), elements.size());
 		}
 
+		struct SortByReverseDepthAndPriority {
+			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
+				if (A->sort.priority == B->sort.priority && A->owner->depth == B->owner->depth) {
+					return sort_ties_by_surface && A < B;
+				}
+				return (A->sort.priority == B->sort.priority) ? (A->owner->depth > B->owner->depth) : (A->sort.priority < B->sort.priority);
+			}
+		};
+
 		struct SortDepthElement {
 			uint32_t priority;
 			float depth;
@@ -769,6 +1164,9 @@ protected:
 
 		struct SortDepthElementLess {
 			_FORCE_INLINE_ bool operator()(const SortDepthElement &A, const SortDepthElement &B) const {
+				if (A.priority == B.priority && A.depth == B.depth) {
+					return sort_ties_by_surface && A.surface < B.surface;
+				}
 				return (A.priority == B.priority) ? (A.depth > B.depth) : (A.priority < B.priority);
 			}
 		};
@@ -781,6 +1179,139 @@ protected:
 	};
 
 	RenderList render_list[RENDER_LIST_MAX];
+
+	// Shadow passes are filled one after the other: filling writes per-pass values on instances and surfaces that
+	// several passes share. Sorting them and writing their instance data only reads a few of those values, copied per
+	// element as each pass is filled; that part runs later for all the passes at once (_render_shadow_build()):
+	// sorts on several threads (a large pass in sorted runs merged afterwards), then the instance data in ranges.
+	struct ShadowElement {
+		uint64_t sort_key1;
+		uint64_t sort_key2;
+		GeometryInstanceSurfaceDataCache *surface;
+		uint32_t flags;
+		uint32_t gi_offset;
+		uint32_t cube_face_mask; // PASS_MODE_SHADOW_CUBE.
+	};
+
+	struct ShadowElementByKey {
+		_FORCE_INLINE_ bool operator()(const ShadowElement &A, const ShadowElement &B) const {
+			// Equal keys then by cube face mask (only elements seen by the same faces draw instanced together), then by surface.
+			if (A.sort_key2 == B.sort_key2 && A.sort_key1 == B.sort_key1) {
+				if (A.cube_face_mask != B.cube_face_mask) {
+					return A.cube_face_mask < B.cube_face_mask;
+				}
+				return sort_ties_by_surface && A.surface < B.surface;
+			}
+			return (A.sort_key2 == B.sort_key2) ? (A.sort_key1 < B.sort_key1) : (A.sort_key2 < B.sort_key2);
+		}
+	};
+
+	struct ShadowSortRun {
+		uint32_t from = 0;
+		uint32_t count = 0;
+	};
+
+	struct ShadowSortRunLarger {
+		_FORCE_INLINE_ bool operator()(const ShadowSortRun &A, const ShadowSortRun &B) const {
+			return A.count != B.count ? A.count > B.count : A.from < B.from;
+		}
+	};
+
+	LocalVector<ShadowElement> shadow_elements; // Parallel to render_list[RENDER_LIST_SECONDARY].elements.
+	LocalVector<ShadowElement> shadow_merge_buffer;
+	LocalVector<ShadowSortRun> shadow_sort_runs; // Largest first, so the long sorts start first.
+	LocalVector<uint8_t> shadow_repeats; // Per element: drawn with the previous one.
+	LocalVector<uint8_t> shadow_pass_begins; // Per element: first of its pass.
+	uint32_t shadow_instance_part_count = 0;
+	bool shadow_build_parallel = true;
+	bool shadow_build_merge = true; // Off: a pass cut in several sort runs is drawn run after run, unmerged.
+
+	// The main view's lists sorted together (_sort_render_lists()): a large opaque list in runs merged afterwards, the
+	// motion and alpha lists whole, each a _parallel_run part. GODOT_PARALLEL_SORT=0 sorts them one after the other.
+	struct OpaqueSortRun {
+		uint32_t from = 0;
+		uint32_t count = 0;
+	};
+	bool list_sort_parallel = true;
+	LocalVector<OpaqueSortRun> opaque_sort_runs;
+	LocalVector<RenderList::SortKeyElement> opaque_sort_keys; // The runs, sorted in place, then merged.
+	LocalVector<RenderList::SortKeyElement> opaque_merge_keys;
+
+	uint8_t main_sort_reused[RENDER_LIST_MAX] = {}; // SortReuseResult.
+
+	void _sort_render_lists(uint64_t p_view_key);
+	void _sort_render_lists_part(uint32_t p_part);
+
+	// Each sorted list keeps the order it had the last time it was sorted (main lists by view, shadow passes by light
+	// and pass). When it holds the same surfaces with the same sort inputs, that order is what sorting would give: every
+	// comparison breaks ties by surface, so there is only one. When some elements are new or have other inputs, the
+	// others keep their kept order (a subsequence of a sorted list), the new ones are sorted apart and both are merged.
+	// GODOT_SORT_REUSE=0 sorts every list again.
+	// A kept order is forgotten when its list is not sorted for a frame, and a freed surface cache stays allocated two
+	// frames (retired_surface_caches): every kept order then points to allocated surfaces, which a check may mark, and
+	// a freed surface's address cannot come back as another surface while an order still holds it.
+	struct SortReuseEntry {
+		const GeometryInstanceSurfaceDataCache *surface = nullptr;
+		uint64_t sort_key1 = 0;
+		uint64_t sort_key2 = 0;
+		uint32_t extra = 0; // Alpha lists: the instance's depth (its bits). Shadow passes: the cube face mask.
+	};
+	struct SortReuseList {
+		LocalVector<SortReuseEntry> entries;
+		uint64_t frame = 0;
+	};
+	enum SortReuseResult : uint8_t {
+		SORT_REUSE_NONE, // Sorted from scratch.
+		SORT_REUSE_WHOLE, // The kept order as it was.
+		SORT_REUSE_MERGED, // The kept order of the elements that kept their inputs, merged with the others sorted apart.
+	};
+	struct SortReuse {
+		bool enabled = true;
+#ifdef DEBUG_ENABLED
+		bool check = false; // GODOT_SORT_REUSE_CHECK=1: sorts every reused list anyway and compares the orders.
+#endif
+		uint32_t mark = 0;
+		uint64_t frame = 0;
+		HashMap<uint64_t, SortReuseList> lists;
+		LocalVector<GeometryInstanceSurfaceDataCache *> scratch;
+		LocalVector<GeometryInstanceSurfaceDataCache *> fresh;
+		LocalVector<ShadowElement> shadow_scratch;
+		LocalVector<ShadowElement> shadow_fresh;
+		LocalVector<uint8_t> kept; // Per kept element: still in the list with the same inputs.
+		LocalVector<uint8_t> shadow_pass_reused; // SortReuseResult.
+	} sort_reuse;
+
+	struct RetiredSurfaceCache {
+		GeometryInstanceSurfaceDataCache *surface = nullptr;
+		uint64_t frame = 0;
+	};
+	LocalVector<RetiredSurfaceCache> retired_surface_caches; // In the order they were freed.
+	uint64_t surface_caches_freed = 0; // For the statistics.
+
+	void _surface_cache_free(GeometryInstanceSurfaceDataCache *p_surface);
+	void _sort_reuse_begin_frame();
+
+	static _FORCE_INLINE_ GeometryInstanceSurfaceDataCache *_sort_reuse_surface(GeometryInstanceSurfaceDataCache *p_surface) { return p_surface; }
+	static _FORCE_INLINE_ GeometryInstanceSurfaceDataCache *_sort_reuse_surface(const ShadowElement &p_element) { return p_element.surface; }
+	static SortReuseEntry _sort_reuse_entry(const GeometryInstanceSurfaceDataCache *p_surface, bool p_depth);
+	static SortReuseEntry _sort_reuse_entry(const ShadowElement &p_element, bool p_depth);
+	SortReuseList *_sort_reuse_list(uint64_t p_key);
+	template <typename T>
+	SortReuseResult _sort_reuse_apply(uint64_t p_key, T *p_elements, uint32_t p_count, bool p_depth, LocalVector<T> &r_scratch, LocalVector<T> &r_fresh);
+	static void _sort_reuse_merge(GeometryInstanceSurfaceDataCache **r_elements, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_kept, const LocalVector<GeometryInstanceSurfaceDataCache *> &p_fresh, bool p_depth);
+	static void _sort_reuse_merge(ShadowElement *r_elements, const LocalVector<ShadowElement> &p_kept, LocalVector<ShadowElement> &p_fresh, bool p_depth);
+	template <typename T>
+	void _sort_reuse_store(uint64_t p_key, const T *p_elements, uint32_t p_count, bool p_depth);
+#ifdef DEBUG_ENABLED
+	template <typename T, typename Comparator>
+	void _sort_reuse_verify(const T *p_elements, uint32_t p_count, const char *p_list);
+#endif
+	bool shadow_build_deferred = false;
+
+	void _render_shadow_build();
+	void _render_shadow_sort_part(uint32_t p_part);
+	void _render_shadow_instance_part(uint32_t p_part);
+	void _render_shadow_instance_range(uint32_t p_from, uint32_t p_to);
 
 	virtual void _update_shader_quality_settings() override;
 
@@ -814,7 +1345,35 @@ protected:
 
 	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
 	void _render_shadow_begin();
-	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
+	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D(), bool p_cube_layered = false);
+
+	// Cube omni shadows with their 6 faces in one pass (SHADER_GROUP_CUBE_LAYERED): the culler's 6 caster lists of a
+	// light merged into cube_shadow_instances, each instance once with the faces that see it (cube_face_mask), drawn as
+	// _render_shadow_pass(CUBE_SHADOW_ALL_FACES). GODOT_SHADOW_CUBE_ONE_PASS=0 renders the faces one by one.
+	enum {
+		CUBE_SHADOW_ALL_FACES = 6,
+	};
+	bool shadow_cube_one_pass = false;
+	// The gathered cube lights share one shadow session (one _render_shadow_end(), one parallel recording); each
+	// light's cubemap is copied into the atlas right after its draw list, before the next light reuses the cubemap.
+	bool cube_shadow_batching = false;
+	struct CubeShadowCopy {
+		RID light;
+		RID cubemap;
+		RID atlas_fb;
+		Rect2i atlas_rect;
+		uint32_t atlas_size = 1;
+		Vector2i dual_paraboloid_offset;
+		float z_near = 0.0;
+		float z_far = 0.0;
+	};
+	LocalVector<CubeShadowCopy> cube_shadow_copies;
+	void _render_shadow_cube_copy(const CubeShadowCopy &p_copy);
+	PagedArrayPool<RenderGeometryInstance *> cube_shadow_instance_pool;
+	PagedArray<RenderGeometryInstance *> cube_shadow_instances;
+	LocalVector<bool> cube_shadow_rendered; // Per entry of RenderDataRD::cube_shadows, this frame.
+	bool _render_shadow_cube_gather(const RenderDataRD *p_render_data, uint32_t p_first);
+	void _render_shadow_cube_release();
 	void _render_shadow_process();
 	void _render_shadow_end();
 

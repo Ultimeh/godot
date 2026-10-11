@@ -375,6 +375,14 @@ Error RenderingDeviceDriverD3D12::DescriptorHeap::initialize(ID3D12Device *p_dev
 }
 
 Error RenderingDeviceDriverD3D12::DescriptorHeap::allocate(uint32_t p_descriptor_count, Allocation &r_allocation) {
+	if (mutex != nullptr) {
+		MutexLock lock(*mutex);
+		return _allocate(p_descriptor_count, r_allocation);
+	}
+	return _allocate(p_descriptor_count, r_allocation);
+}
+
+Error RenderingDeviceDriverD3D12::DescriptorHeap::_allocate(uint32_t p_descriptor_count, Allocation &r_allocation) {
 	D3D12MA::VIRTUAL_ALLOCATION_DESC desc = {};
 	desc.Size = p_descriptor_count;
 
@@ -400,7 +408,12 @@ void RenderingDeviceDriverD3D12::DescriptorHeap::free(const Allocation &p_alloca
 	D3D12MA::VirtualAllocation virtual_alloc = {};
 	virtual_alloc.AllocHandle = p_allocation.virtual_alloc_handle;
 
-	virtual_block->FreeAllocation(virtual_alloc);
+	if (mutex != nullptr) {
+		MutexLock lock(*mutex);
+		virtual_block->FreeAllocation(virtual_alloc);
+	} else {
+		virtual_block->FreeAllocation(virtual_alloc);
+	}
 }
 
 void RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type) {
@@ -2719,6 +2732,9 @@ void RenderingDeviceDriverD3D12::command_pool_free(CommandPoolID p_cmd_pool) {
 		resource_descriptor_heap_pool.free(cmd_buf_info->uav_alloc);
 		rtv_descriptor_heap_pool.free(cmd_buf_info->rtv_alloc);
 		dsv_descriptor_heap_pool.free(cmd_buf_info->dsv_alloc);
+		for (const DescriptorHeap::Allocation &allocation : cmd_buf_info->clear_descriptor_allocations) {
+			resource_descriptor_heap.free(allocation);
+		}
 
 		VersatileResource::free(resources_allocator, cmd_buf_info);
 	}
@@ -2796,7 +2812,8 @@ RDD::CommandBufferID RenderingDeviceDriverD3D12::command_buffer_create(CommandPo
 }
 
 bool RenderingDeviceDriverD3D12::command_buffer_begin(CommandBufferID p_cmd_buffer) {
-	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
+	cmd_buf_info->clear_descriptor_allocation_count = 0;
 	HRESULT res = cmd_buf_info->cmd_allocator->Reset();
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
@@ -2805,7 +2822,8 @@ bool RenderingDeviceDriverD3D12::command_buffer_begin(CommandBufferID p_cmd_buff
 }
 
 bool RenderingDeviceDriverD3D12::command_buffer_begin_secondary(CommandBufferID p_cmd_buffer, RenderPassID p_render_pass, uint32_t p_subpass, FramebufferID p_framebuffer) {
-	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
+	cmd_buf_info->clear_descriptor_allocation_count = 0;
 	HRESULT res = cmd_buf_info->cmd_allocator->Reset();
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
@@ -3409,7 +3427,8 @@ RDD::FramebufferID RenderingDeviceDriverD3D12::_framebuffer_create(RenderPassID 
 	return FramebufferID(fb_info);
 }
 
-RDD::FramebufferID RenderingDeviceDriverD3D12::framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height) {
+RDD::FramebufferID RenderingDeviceDriverD3D12::framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height, uint32_t p_layers) {
+	// The render target and depth views already cover every layer of the attachments: nothing to do for p_layers.
 	return _framebuffer_create(p_render_pass, p_attachments, p_width, p_height, false);
 }
 
@@ -4046,8 +4065,6 @@ void RenderingDeviceDriverD3D12::command_uniform_set_prepare_for_use(CommandBuff
 }
 
 void RenderingDeviceDriverD3D12::_command_check_descriptor_sets(CommandBufferID p_cmd_buffer) {
-	DEV_ASSERT(segment_begun && "Unable to use commands that rely on descriptors because a segment was never begun.");
-
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	if (!cmd_buf_info->descriptor_heaps_set) {
 		// Set descriptor heaps for the command buffer if they haven't been set yet.
@@ -4065,12 +4082,9 @@ void RenderingDeviceDriverD3D12::_command_check_descriptor_sets(CommandBufferID 
 /**** TRANSFER ****/
 /******************/
 
-RenderingDeviceDriverD3D12::DescriptorHeap::Allocation RenderingDeviceDriverD3D12::_command_allocate_per_frame_descriptor() {
-	FrameInfo &f = frames[frame_idx];
-	if (f.descriptor_allocation_count < f.descriptor_allocations.size()) {
-		uint32_t allocation_index = f.descriptor_allocation_count;
-		++f.descriptor_allocation_count;
-		return f.descriptor_allocations[allocation_index];
+RenderingDeviceDriverD3D12::DescriptorHeap::Allocation RenderingDeviceDriverD3D12::_command_allocate_clear_descriptor(CommandBufferInfo *p_cmd_buf_info) {
+	if (p_cmd_buf_info->clear_descriptor_allocation_count < p_cmd_buf_info->clear_descriptor_allocations.size()) {
+		return p_cmd_buf_info->clear_descriptor_allocations[p_cmd_buf_info->clear_descriptor_allocation_count++];
 	} else {
 		DescriptorHeap::Allocation descriptor_allocation = {};
 
@@ -4080,8 +4094,8 @@ RenderingDeviceDriverD3D12::DescriptorHeap::Allocation RenderingDeviceDriverD3D1
 
 		ERR_FAIL_COND_V_MSG(err != OK, DescriptorHeap::Allocation(), "Failed to allocate per frame descriptor.");
 
-		f.descriptor_allocations.push_back(descriptor_allocation);
-		f.descriptor_allocation_count = f.descriptor_allocations.size();
+		p_cmd_buf_info->clear_descriptor_allocations.push_back(descriptor_allocation);
+		p_cmd_buf_info->clear_descriptor_allocation_count = p_cmd_buf_info->clear_descriptor_allocations.size();
 
 		return descriptor_allocation;
 	}
@@ -4112,7 +4126,7 @@ void RenderingDeviceDriverD3D12::command_clear_buffer(CommandBufferID p_cmd_buff
 			&uav_desc,
 			cmd_buf_info->uav_alloc.cpu_handle);
 
-	DescriptorHeap::Allocation shader_visible_descriptor_allocation = _command_allocate_per_frame_descriptor();
+	DescriptorHeap::Allocation shader_visible_descriptor_allocation = _command_allocate_clear_descriptor(cmd_buf_info);
 	ERR_FAIL_COND(shader_visible_descriptor_allocation.virtual_alloc_handle == 0);
 
 	device->CopyDescriptorsSimple(
@@ -4263,7 +4277,7 @@ void RenderingDeviceDriverD3D12::command_clear_color_texture(CommandBufferID p_c
 					&uav_desc,
 					cmd_buf_info->uav_alloc.cpu_handle);
 
-			DescriptorHeap::Allocation shader_visible_descriptor_allocation = _command_allocate_per_frame_descriptor();
+			DescriptorHeap::Allocation shader_visible_descriptor_allocation = _command_allocate_clear_descriptor(cmd_buf_info);
 			ERR_FAIL_COND(shader_visible_descriptor_allocation.virtual_alloc_handle == 0);
 
 			device->CopyDescriptorsSimple(
@@ -4904,6 +4918,59 @@ void RenderingDeviceDriverD3D12::command_end_render_pass(CommandBufferID p_cmd_b
 	cmd_buf_info->render_pass_state.current_subpass = UINT32_MAX;
 }
 
+void RenderingDeviceDriverD3D12::command_suspend_render_pass(CommandBufferID p_cmd_buffer) {
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
+	DEV_ASSERT(cmd_buf_info->render_pass_state.current_subpass != UINT32_MAX);
+
+	const FramebufferInfo *fb_info = cmd_buf_info->render_pass_state.fb_info;
+	if (fb_info->vrs_attachment && fsr_capabilities.attachment_supported) {
+		cmd_buf_info->cmd_list_5->RSSetShadingRateImage(nullptr);
+	}
+
+	// The attachments stay in the subpass layouts for the command buffer that resumes the pass.
+	cmd_buf_info->render_pass_state.current_subpass = UINT32_MAX;
+}
+
+void RenderingDeviceDriverD3D12::command_resume_render_pass(CommandBufferID p_cmd_buffer, RenderPassID p_render_pass, FramebufferID p_framebuffer, const Rect2i &p_rect) {
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
+	const RenderPassInfo *pass_info = (const RenderPassInfo *)p_render_pass.id;
+	const FramebufferInfo *fb_info = (const FramebufferInfo *)p_framebuffer.id;
+
+	DEV_ASSERT(cmd_buf_info->render_pass_state.current_subpass == UINT32_MAX);
+	DEV_ASSERT(!fb_info->is_screen && "Screen framebuffers transition on the CPU-tracked path and can't be resumed.");
+
+	cmd_buf_info->render_pass_state.region_rect = CD3DX12_RECT(
+			p_rect.position.x,
+			p_rect.position.y,
+			p_rect.position.x + p_rect.size.x,
+			p_rect.position.y + p_rect.size.y);
+	cmd_buf_info->render_pass_state.region_is_all = (cmd_buf_info->render_pass_state.region_rect.left == 0 &&
+			cmd_buf_info->render_pass_state.region_rect.top == 0 &&
+			cmd_buf_info->render_pass_state.region_rect.right == fb_info->size.x &&
+			cmd_buf_info->render_pass_state.region_rect.bottom == fb_info->size.y);
+
+	cmd_buf_info->render_pass_state.attachment_layouts.resize(pass_info->attachments.size());
+	for (uint32_t i = 0; i < pass_info->attachments.size(); i++) {
+		for (RenderPassState::AttachmentLayout::AspectLayout &aspect_layout : cmd_buf_info->render_pass_state.attachment_layouts[i].aspect_layouts) {
+			aspect_layout.cur_layout = pass_info->attachments[i].initial_layout;
+			aspect_layout.expected_layout = pass_info->attachments[i].initial_layout;
+		}
+	}
+
+	if (fb_info->vrs_attachment && fsr_capabilities.attachment_supported) {
+		static const D3D12_SHADING_RATE_COMBINER COMBINERS[D3D12_RS_SET_SHADING_RATE_COMBINER_COUNT] = {
+			D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+			D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+		};
+		cmd_buf_info->cmd_list_5->RSSetShadingRate(D3D12_SHADING_RATE_1X1, COMBINERS);
+	}
+
+	cmd_buf_info->render_pass_state.current_subpass = 0;
+	cmd_buf_info->render_pass_state.fb_info = fb_info;
+	cmd_buf_info->render_pass_state.pass_info = pass_info;
+	_render_pass_begin_subpass(p_cmd_buffer, true);
+}
+
 void RenderingDeviceDriverD3D12::command_next_render_subpass(CommandBufferID p_cmd_buffer, CommandBufferType p_cmd_buffer_type) {
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 
@@ -4914,6 +4981,11 @@ void RenderingDeviceDriverD3D12::command_next_render_subpass(CommandBufferID p_c
 		cmd_buf_info->render_pass_state.current_subpass++;
 	}
 
+	_render_pass_begin_subpass(p_cmd_buffer, false);
+}
+
+void RenderingDeviceDriverD3D12::_render_pass_begin_subpass(CommandBufferID p_cmd_buffer, bool p_resumed) {
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	const FramebufferInfo *fb_info = cmd_buf_info->render_pass_state.fb_info;
 	const RenderPassInfo *pass_info = cmd_buf_info->render_pass_state.pass_info;
 	const Subpass &subpass = pass_info->subpasses[cmd_buf_info->render_pass_state.current_subpass];
@@ -4971,7 +5043,16 @@ void RenderingDeviceDriverD3D12::command_next_render_subpass(CommandBufferID p_c
 		}
 	}
 
-	_render_pass_enhanced_barriers_flush(p_cmd_buffer);
+	if (p_resumed) {
+		// The command buffer that suspended the pass already moved the attachments to these layouts.
+		for (RenderPassState::AttachmentLayout &attachment_layout : cmd_buf_info->render_pass_state.attachment_layouts) {
+			for (RenderPassState::AttachmentLayout::AspectLayout &aspect_layout : attachment_layout.aspect_layouts) {
+				aspect_layout.cur_layout = aspect_layout.expected_layout;
+			}
+		}
+	} else {
+		_render_pass_enhanced_barriers_flush(p_cmd_buffer);
+	}
 
 	cmd_buf_info->cmd_list->OMSetRenderTargets(subpass.color_references.size(), rtv_handles, false, dsv_handle.ptr ? &dsv_handle : nullptr);
 }
@@ -5985,24 +6066,14 @@ void RenderingDeviceDriverD3D12::command_buffer_invalidate_state_cache(CommandBu
 
 void RenderingDeviceDriverD3D12::begin_segment(uint32_t p_frame_index, uint32_t p_frames_drawn) {
 	frame_idx = p_frame_index;
-	frames[frame_idx].descriptor_allocation_count = 0;
 
 	frames_drawn = p_frames_drawn;
 	allocator->SetCurrentFrameIndex(p_frames_drawn);
-
-	segment_begun = true;
 }
 
 void RenderingDeviceDriverD3D12::end_segment() {
-	FrameInfo &f = frames[frame_idx];
-
-	// Free leftover descriptors.
-	for (uint32_t i = f.descriptor_allocation_count; i < f.descriptor_allocations.size(); i++) {
-		resource_descriptor_heap.free(f.descriptor_allocations[i]);
-	}
-	f.descriptor_allocations.resize(f.descriptor_allocation_count);
-
-	segment_begun = false;
+	// Nothing to do: the command buffers carry their own descriptors (clear_descriptor_allocations), and with the
+	// replay thread the next frame's segment is begun on the render thread before this one ends on the replay thread.
 }
 
 /**************/
@@ -6198,6 +6269,9 @@ uint64_t RenderingDeviceDriverD3D12::api_trait_get(ApiTrait p_trait) {
 	switch (p_trait) {
 		case API_TRAIT_HONORS_PIPELINE_BARRIERS:
 			return barrier_capabilities.enhanced_barriers_supported;
+		case API_TRAIT_RESUMABLE_RENDER_PASSES:
+			// The legacy path tracks resource states on the CPU in recording order.
+			return barrier_capabilities.enhanced_barriers_supported;
 		case API_TRAIT_SHADER_CHANGE_INVALIDATION:
 			return (uint64_t)SHADER_CHANGE_INVALIDATION_ALL_OR_NONE_ACCORDING_TO_LAYOUT_HASH;
 		case API_TRAIT_TEXTURE_TRANSFER_ALIGNMENT:
@@ -6235,6 +6309,8 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 			return false;
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
+		case SUPPORTS_SHADER_OUTPUT_LAYER:
+			return misc_features_support.shader_output_layer_supported;
 		default:
 			return false;
 	}
@@ -6290,11 +6366,6 @@ RenderingDeviceDriverD3D12::RenderingDeviceDriverD3D12(RenderingContextDriverD3D
 RenderingDeviceDriverD3D12::~RenderingDeviceDriverD3D12() {
 	rtv_descriptor_heap_pool.free(null_rtv_alloc);
 
-	for (FrameInfo &f : frames) {
-		for (DescriptorHeap::Allocation &alloc : f.descriptor_allocations) {
-			resource_descriptor_heap.free(alloc);
-		}
-	}
 
 	if (Streamline::get_singleton()) {
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY);
@@ -6516,6 +6587,7 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 	res = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_UNAVAILABLE, "CheckFeatureSupport failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	ERR_FAIL_COND_V_MSG(!options.TypedUAVLoadAdditionalFormats, ERR_UNAVAILABLE, "No support for Typed UAV Load Additional Formats has been found.");
+	misc_features_support.shader_output_layer_supported = options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation;
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1 = {};
 	res = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1));
@@ -6704,6 +6776,8 @@ Error RenderingDeviceDriverD3D12::_initialize_frames(uint32_t p_frame_count) {
 	uint32_t num_resource_descriptors = GLOBAL_GET("rendering/rendering_device/d3d12/max_resource_descriptors");
 	uint32_t num_sampler_descriptors = GLOBAL_GET("rendering/rendering_device/d3d12/max_sampler_descriptors");
 
+	resource_descriptor_heap.mutex = &shader_visible_heaps_mutex;
+	sampler_descriptor_heap.mutex = &shader_visible_heaps_mutex;
 	Error err = resource_descriptor_heap.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, num_resource_descriptors, true);
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 	resource_descriptor_heap_capacity = num_resource_descriptors;

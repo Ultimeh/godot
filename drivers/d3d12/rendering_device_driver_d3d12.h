@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/os/mutex.h"
 #include "core/templates/a_hash_map.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/paged_allocator.h"
@@ -103,6 +104,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 
 	struct MiscFeaturesSupport {
 		bool depth_bounds_supported = false;
+		bool shader_output_layer_supported = false; // SV_RenderTargetArrayIndex written by a vertex shader.
 	};
 
 	struct SamplerCapabilities {
@@ -142,10 +144,14 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 		uint32_t increment_size = 0;
 
 		Microsoft::WRL::ComPtr<D3D12MA::VirtualBlock> virtual_block;
+		// D3D12MA virtual blocks are not synchronized. The shader-visible heaps are allocated from by the render
+		// thread (uniform sets) and by the graph replay (clears), which may run on another thread: they lock this.
+		Mutex *mutex = nullptr;
 
 		Error initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible);
 
 		Error allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
+		Error _allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
 		void free(const Allocation &p_allocation);
 	};
 
@@ -526,6 +532,12 @@ private:
 		CPUDescriptorHeapPool::Allocation uav_alloc;
 		CPUDescriptorHeapPool::Allocation rtv_alloc;
 		CPUDescriptorHeapPool::Allocation dsv_alloc;
+
+		// Shader-visible descriptors of the clears recorded into this command buffer, reused from the start once it is
+		// begun again (the GPU is done with it by then): no need to know which frame is being recorded, which another
+		// thread may be on (RD-REPLAY-THREAD-STUDY.md, step 1c).
+		LocalVector<DescriptorHeap::Allocation> clear_descriptor_allocations;
+		uint32_t clear_descriptor_allocation_count = 0;
 	};
 
 public:
@@ -595,7 +607,7 @@ private:
 	FramebufferID _framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height, bool p_is_screen);
 
 public:
-	virtual FramebufferID framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height) override final;
+	virtual FramebufferID framebuffer_create(RenderPassID p_render_pass, VectorView<TextureID> p_attachments, uint32_t p_width, uint32_t p_height, uint32_t p_layers = 1) override final;
 	virtual void framebuffer_free(FramebufferID p_framebuffer) override final;
 
 	/****************/
@@ -710,7 +722,9 @@ public:
 
 private:
 	void _command_check_descriptor_sets(CommandBufferID p_cmd_buffer);
-	DescriptorHeap::Allocation _command_allocate_per_frame_descriptor();
+	// Locked: command buffers may be recorded on several threads at once.
+	Mutex shader_visible_heaps_mutex; // See DescriptorHeap::mutex.
+	DescriptorHeap::Allocation _command_allocate_clear_descriptor(CommandBufferInfo *p_cmd_buf_info);
 
 public:
 	/******************/
@@ -783,9 +797,12 @@ public:
 private:
 	void _render_pass_enhanced_barriers_flush(CommandBufferID p_cmd_buffer);
 	void _end_render_pass(CommandBufferID p_cmd_buffer);
+	void _render_pass_begin_subpass(CommandBufferID p_cmd_buffer, bool p_resumed);
 
 public:
 	virtual void command_end_render_pass(CommandBufferID p_cmd_buffer) override final;
+	virtual void command_suspend_render_pass(CommandBufferID p_cmd_buffer) override final;
+	virtual void command_resume_render_pass(CommandBufferID p_cmd_buffer, RenderPassID p_render_pass, FramebufferID p_framebuffer, const Rect2i &p_rect) override final;
 	virtual void command_next_render_subpass(CommandBufferID p_cmd_buffer, CommandBufferType p_cmd_buffer_type) override final;
 	virtual void command_render_set_viewport(CommandBufferID p_cmd_buffer, VectorView<Rect2i> p_viewports) override final;
 	virtual void command_render_set_scissor(CommandBufferID p_cmd_buffer, VectorView<Rect2i> p_scissors) override final;
@@ -922,13 +939,10 @@ public:
 	/********************/
 private:
 	struct FrameInfo {
-		LocalVector<DescriptorHeap::Allocation> descriptor_allocations;
-		uint32_t descriptor_allocation_count = 0;
 	};
 	TightLocalVector<FrameInfo> frames;
 	uint32_t frame_idx = 0;
 	uint32_t frames_drawn = 0;
-	bool segment_begun = false;
 	HashMap<uint64_t, bool> has_comp_alpha;
 
 public:

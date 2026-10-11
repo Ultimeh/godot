@@ -163,7 +163,7 @@ public:
 		uint32_t width = 0;
 		uint32_t height = 0;
 		DisplayServerEnums::VSyncMode vsync_mode = DisplayServerEnums::VSYNC_ENABLED;
-		bool needs_resize = false;
+		SafeFlag needs_resize; // Set at present (submission thread), read at acquire (render thread).
 
 		bool hdr_output = false;
 		// BT.2408 recommendation of 203 nits for HDR Reference White, rounded to 200

@@ -370,6 +370,8 @@ layout(set = 1, binding = 1, std430) buffer restrict readonly InstanceDataBuffer
 }
 instances;
 
+#define INSTANCE_TRANSFORM instances.data[instance_index].transform
+
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
 
 layout(set = 1, binding = 2) uniform texture2DArray radiance_octmap;

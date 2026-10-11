@@ -82,6 +82,10 @@ void RenderingServerDefault::_draw(bool p_swap_buffers, double frame_step, uint6
 	// The Streamline token this draw was issued with, see draw(). Read on this thread only.
 	StreamlineContext::get().render_token = (sl::FrameToken *)p_frame_token;
 #endif
+	if (RenderingDevice::get_singleton() != nullptr) {
+		RenderingDevice::get_singleton()->frame_stats_draw_begin();
+	}
+
 	GodotProfileZoneGroupedFirst(_profile_zone, "rasterizer->begin_frame");
 	RSG::rasterizer->begin_frame(frame_step);
 
@@ -431,6 +435,10 @@ void RenderingServerDefault::_thread_exit() {
 }
 
 void RenderingServerDefault::_thread_loop() {
+	// A pool thread taken for good: named as other engines name theirs (Unreal's "RenderThread 0"), not "WorkerThread N",
+	// so profilers and debuggers tell it apart.
+	Thread::set_name("RenderThread");
+
 	DisplayServer::get_singleton()->gl_window_make_current(DisplayServerEnums::MAIN_WINDOW_ID); // Move GL to this thread.
 
 	while (!exit) {

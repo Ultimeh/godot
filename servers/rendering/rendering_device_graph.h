@@ -238,6 +238,7 @@ public:
 	struct FramebufferCache {
 		uint32_t width = 0;
 		uint32_t height = 0;
+		uint32_t layers = 1; // More than one: a layered framebuffer (RenderingDevice::framebuffer_create(), p_layers).
 		LocalVector<RDD::TextureID> textures;
 		LocalVector<ResourceTracker *> trackers;
 		HashMap<uint64_t, FramebufferStorage> storage_map;
@@ -252,6 +253,12 @@ public:
 		LocalVector<RDD::CommandBufferID> buffers;
 		LocalVector<RDD::SemaphoreID> semaphores;
 		uint32_t buffers_used = 0;
+
+		// Recorded concurrently by RenderingDeviceGraph and submitted right after the frame's main command buffer, in
+		// the same submission and in this order. Each one has its own pool, since a pool is not thread-safe.
+		LocalVector<RDD::CommandPoolID> parallel_pools;
+		LocalVector<RDD::CommandBufferID> parallel_buffers;
+		uint32_t parallel_buffers_used = 0;
 	};
 
 	struct WorkaroundsState {
@@ -265,6 +272,24 @@ public:
 		ATTACHMENT_OPERATION_CLEAR,
 		// Ignore any contents from the attachment.
 		ATTACHMENT_OPERATION_IGNORE,
+	};
+
+	// Part of a draw list recorded on another thread. Its instructions and resource usages are kept aside, then appended to
+	// the draw list in order by add_draw_list_split(), on the thread that owns the draw list.
+	struct DrawListSplit {
+		LocalVector<uint8_t> data;
+		LocalVector<ResourceTracker *> trackers;
+		LocalVector<ResourceUsage> usages;
+		BitField<RDD::PipelineStageBits> stages = {};
+		uint32_t pipeline_count = 0;
+
+		void clear() {
+			data.clear();
+			trackers.clear();
+			usages.clear();
+			stages.clear();
+			pipeline_count = 0;
+		}
 	};
 
 private:
@@ -305,6 +330,17 @@ private:
 		uint32_t breadcrumb;
 #endif
 		bool split_cmd_buffer = false;
+		bool resumable = true; // No subpasses nor secondary command buffers: can be suspended and resumed.
+		uint32_t pipeline_count = 0;
+
+		// Instructions recorded by splits, inserted at main_offset of data when the draw list ends: they are only
+		// copied once, into the recorded command. The splits keep their data until then.
+		struct SplitSegment {
+			uint32_t main_offset = 0;
+			const uint8_t *data = nullptr;
+			uint32_t size = 0;
+		};
+		LocalVector<SplitSegment> split_segments;
 	};
 
 	struct RecordedCommandSort {
@@ -431,6 +467,7 @@ private:
 		RDD::FramebufferID framebuffer;
 		RDD::RenderPassID render_pass;
 		uint32_t instruction_data_size = 0;
+		uint32_t pipeline_count = 0; // Pipelines bound by the instructions, for the cost of recording them.
 		RDD::CommandBufferType command_buffer_type;
 		Rect2i region;
 		uint32_t clear_values_count = 0;
@@ -440,6 +477,7 @@ private:
 		uint32_t breadcrumb = 0;
 #endif
 		bool split_cmd_buffer = false;
+		bool resumable = false;
 
 		_FORCE_INLINE_ RDD::RenderPassClearValue *clear_values() {
 			return reinterpret_cast<RDD::RenderPassClearValue *>(&this[1]);
@@ -558,6 +596,8 @@ private:
 
 	struct DrawListBindPipelineInstruction : DrawListInstruction {
 		RDD::PipelineID pipeline;
+		uint32_t first_unbound_set = UINT32_MAX; // Sets from this index on lost their binding (UINT32_MAX: none).
+		bool layout_reset = false; // The push constants were lost too.
 	};
 
 	struct DrawListBindUniformSetsInstruction : DrawListInstruction {
@@ -820,10 +860,48 @@ private:
 		uint32_t secondary_command_buffers_used = 0;
 	};
 
+	// An instruction of a draw list replayed where a part of it resumes in another command buffer.
+	struct DrawListReplay {
+		uint32_t offset = 0;
+		uint32_t size = 0;
+	};
+
+	struct DrawListReplayOffsetComparator {
+		_FORCE_INLINE_ bool operator()(const DrawListReplay &p_a, const DrawListReplay &p_b) const { return p_a.offset < p_b.offset; }
+	};
+
+	// A contiguous range of the sorted commands, recorded into its own command buffer. It may begin and end inside a draw
+	// list: the render pass is then resumed with the state the draw list had at that point, or suspended.
+	struct ParallelSlice {
+		uint32_t start = 0;
+		uint32_t start_offset = 0; // Where the slice resumes the draw list `start`, in bytes of its instructions (0: its beginning).
+		uint32_t end = 0;
+		uint32_t end_offset = 0; // When not 0, the slice also records the draw list `end` up to there and suspends it.
+		uint32_t replay_start = 0; // Instructions replayed when resuming, in parallel_replays.
+		uint32_t replay_count = 0;
+		RDD::CommandBufferID command_buffer;
+		bool begin_command_buffer = false;
+		bool end_command_buffer = false;
+		bool pinned_to_calling_thread = false; // Holds a driver callback.
+		bool recorded_on_calling_thread = false;
+		uint64_t cost = 0;
+		uint64_t begin_usec = 0;
+		uint64_t end_usec = 0;
+		// What the slice recorded (GODOT_PARALLEL_RECORDING_STATS).
+		uint32_t draws = 0;
+		uint32_t pipelines = 0;
+		uint32_t uniform_set_binds = 0;
+		uint32_t push_constants = 0;
+		uint32_t copies = 0;
+		uint32_t other_commands = 0;
+		BarrierGroup barrier_group;
+	};
+
 	RDD *driver = nullptr;
 	RDD::DriverWorkarounds driver_workarounds;
 	RenderPassCreationFunction render_pass_creation_function = nullptr;
-	int64_t tracking_frame = 0;
+	int64_t tracking_frame = 0; // Unique among all graphs (tracking_frame_counter): two graphs alternate frames (replay thread).
+	static SafeNumeric<int64_t> tracking_frame_counter;
 	LocalVector<uint8_t> command_data;
 	LocalVector<uint32_t> command_data_offsets;
 	LocalVector<RDD::TextureBarrier> command_normalization_barriers;
@@ -852,6 +930,62 @@ private:
 	WorkaroundsState workarounds_state;
 	TightLocalVector<Frame> frames;
 	uint32_t frame = 0;
+	// Parallel recording of the sorted commands (GODOT_PARALLEL_RECORDING, see initialize()).
+	RDD::CommandQueueFamilyID command_queue_family;
+	uint32_t parallel_slice_count = 0;
+	uint32_t parallel_min_size = 0;
+	LocalVector<ParallelSlice> parallel_slices;
+	LocalVector<DrawListReplay> parallel_replays;
+	bool parallel_split_draw_lists = false;
+	LocalVector<uint32_t> parallel_claimable_slices;
+	// Generation of the run in the high half, next claimable slice in the low half: a worker that starts after its
+	// run is over, or during a later one, claims nothing (its generation no longer matches).
+	std::atomic<uint64_t> parallel_claim = { 0 };
+	std::atomic<uint32_t> parallel_claimable_count = { 0 };
+	uint32_t parallel_generation = 0;
+	SafeNumeric<uint32_t> parallel_slices_done;
+	// The calling thread records whatever the workers have not claimed and waits for the claimed slices only, never
+	// for the group tasks: those may not start for a long time (every worker busy, or blocked on the RenderingDevice
+	// lock that the render thread holds while it waits for this replay). They are reaped once completed.
+	LocalVector<WorkerThreadPool::GroupID> parallel_groups;
+	// GODOT_PARALLEL_RECORDING_STATS: totals over the last frames, printed every 240 frames.
+	struct ParallelStats {
+		static constexpr uint32_t MAX_SLICES = 16;
+		uint32_t frames = 0;
+		uint32_t split_frames = 0;
+		uint64_t end_usec = 0; // All of end().
+		uint64_t prepare_usec = 0; // Sorting, priorities, planning: until recording starts.
+		uint64_t calling_usec = 0; // Slices recorded by the calling thread.
+		uint64_t wait_usec = 0; // Waiting for the worker slices.
+		uint64_t serial_usec = 0; // Serial recording (the whole frame when not split, the tail otherwise).
+		uint64_t callback_usec = 0; // Driver callbacks (Streamline), whichever slice holds them.
+		uint64_t join_usec = 0; // From the end of the last worker slice to the calling thread's return from the wait.
+		uint64_t buffer_updates = 0; // Buffer update commands, their copies and the distinct buffers they write.
+		uint64_t buffer_update_copies = 0;
+		uint64_t buffer_update_targets = 0;
+		uint64_t size = 0;
+		uint64_t slices = 0;
+		uint64_t calling_slices = 0;
+		uint64_t draw_list_cuts = 0;
+		uint64_t slice_usec[MAX_SLICES] = {};
+		uint64_t slice_delay_usec[MAX_SLICES] = {};
+		uint64_t slice_size[MAX_SLICES] = {};
+		uint32_t slice_count[MAX_SLICES] = {};
+		uint64_t slice_draws[MAX_SLICES] = {};
+		uint64_t slice_pipelines[MAX_SLICES] = {};
+		uint64_t slice_uniform_set_binds[MAX_SLICES] = {};
+		uint64_t slice_push_constants[MAX_SLICES] = {};
+		uint64_t slice_copies[MAX_SLICES] = {};
+		uint64_t slice_other_commands[MAX_SLICES] = {};
+		uint32_t slice_on_calling_thread[MAX_SLICES] = {};
+	};
+	bool parallel_stats = false;
+	ParallelStats parallel_stats_data;
+	uint64_t stats_callback_usec = 0; // This frame's driver callbacks; they are all recorded by the calling thread.
+	uint64_t parallel_launch_usec = 0;
+	const RecordedCommandSort *parallel_commands_sorted = nullptr;
+	uint32_t parallel_commands_count = 0;
+	bool parallel_full_barriers = false;
 
 #ifdef DEV_ENABLED
 	RBMap<ResourceTracker *, uint32_t> write_dependency_counters;
@@ -868,7 +1002,8 @@ private:
 	int32_t _add_to_slice_read_list(int32_t p_command_index, Rect2i p_subresources, int32_t p_list_index);
 	int32_t _add_to_write_list(int32_t p_command_index, Rect2i p_subresources, int32_t p_list_index, bool p_partial_coverage);
 	RecordedCommand *_allocate_command(uint32_t p_command_size, int32_t &r_command_index);
-	DrawListInstruction *_allocate_draw_list_instruction(uint32_t p_instruction_size);
+	DrawListInstruction *_allocate_draw_list_instruction(uint32_t p_instruction_size, DrawListSplit *p_split = nullptr);
+	_FORCE_INLINE_ BitField<RDD::PipelineStageBits> &_draw_list_stages(DrawListSplit *p_split) { return p_split != nullptr ? p_split->stages : draw_instruction_list.stages; }
 	ComputeListInstruction *_allocate_compute_list_instruction(uint32_t p_instruction_size);
 	void _check_discardable_attachment_dependency(ResourceTracker *p_resource_tracker, int32_t p_previous_command_index, int32_t p_command_index);
 	RaytracingListInstruction *_allocate_raytracing_list_instruction(uint32_t p_instruction_size);
@@ -888,7 +1023,15 @@ private:
 	void _run_render_commands(int32_t p_level, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool, int32_t &r_current_label_index, int32_t &r_current_label_level);
 	void _run_label_command_change(RDD::CommandBufferID p_command_buffer, int32_t p_new_label_index, int32_t p_new_level, bool p_ignore_previous_value, bool p_use_label_for_empty, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, int32_t &r_current_label_index, int32_t &r_current_label_level);
 	void _boost_priority_for_render_commands(RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, uint32_t &r_boosted_priority);
-	void _group_barriers_for_render_commands(RDD::CommandBufferID p_command_buffer, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, bool p_full_memory_barrier);
+	void _group_barriers_for_render_commands(BarrierGroup &r_barrier_group, RDD::CommandBufferID p_command_buffer, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, bool p_full_memory_barrier);
+	uint32_t _plan_parallel_slices(const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, CommandBufferPool &r_command_buffer_pool);
+	static uint32_t _draw_list_instruction_size(const DrawListInstruction *p_instruction);
+	void _run_draw_list_part(RDD::CommandBufferID p_command_buffer, const RecordedDrawListCommand *p_draw_list_command, uint32_t p_from, uint32_t p_to, const ParallelSlice &p_slice);
+	void _run_parallel_slice(ParallelSlice &p_slice);
+	void _count_parallel_slice(ParallelSlice &p_slice);
+	void _run_parallel_slice_task(uint32_t p_index, uint32_t p_generation);
+	void _run_claimed_parallel_slices(bool p_calling_thread, uint32_t p_generation);
+	void _release_parallel_groups(bool p_wait);
 	void _print_render_commands(const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count);
 	void _print_draw_list(const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
 	void _print_compute_list(const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
@@ -920,7 +1063,7 @@ public:
 	void add_compute_list_begin(RDD::BreadcrumbMarker p_phase = RDD::BreadcrumbMarker::NONE, uint32_t p_breadcrumb_data = 0);
 	void add_compute_list_bind_pipeline(RDD::PipelineID p_pipeline);
 	void add_compute_list_bind_uniform_set(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index);
-	void add_compute_list_bind_uniform_sets(RDD::ShaderID p_shader, VectorView<RDD::UniformSetID> p_uniform_set, uint32_t p_first_set_index, uint32_t p_set_count);
+	void add_compute_list_bind_uniform_sets(RDD::ShaderID p_shader, VectorView<RDD::UniformSetID> p_uniform_set, uint32_t p_first_set_index, uint32_t p_set_count, bool p_dynamic_buffers = true);
 	void add_compute_list_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups);
 	void add_compute_list_dispatch_indirect(RDD::BufferID p_buffer, uint32_t p_offset);
 	void add_compute_list_set_push_constant(RDD::ShaderID p_shader, const void *p_data, uint32_t p_data_size);
@@ -930,26 +1073,27 @@ public:
 	void add_compute_list_end();
 	void add_draw_list_begin(FramebufferCache *p_framebuffer_cache, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb = 0, bool p_split_cmd_buffer = false);
 	void add_draw_list_begin(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb = 0, bool p_split_cmd_buffer = false);
-	void add_draw_list_bind_index_buffer(RDD::BufferID p_buffer, RDD::IndexBufferFormat p_format, uint32_t p_offset);
-	void add_draw_list_bind_pipeline(RDD::PipelineID p_pipeline, BitField<RDD::PipelineStageBits> p_pipeline_stage_bits);
-	void add_draw_list_bind_uniform_set(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index);
-	void add_draw_list_bind_uniform_sets(RDD::ShaderID p_shader, VectorView<RDD::UniformSetID> p_uniform_set, uint32_t p_first_index, uint32_t p_set_count);
-	void add_draw_list_bind_vertex_buffers(Span<RDD::BufferID> p_vertex_buffers, Span<uint64_t> p_vertex_buffer_offsets);
-	void add_draw_list_clear_attachments(VectorView<RDD::AttachmentClear> p_attachments_clear, VectorView<Rect2i> p_attachments_clear_rect);
-	void add_draw_list_draw(uint32_t p_vertex_count, uint32_t p_instance_count);
-	void add_draw_list_draw_indexed(uint32_t p_index_count, uint32_t p_instance_count, uint32_t p_first_index);
-	void add_draw_list_draw_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride);
-	void add_draw_list_draw_indexed_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride);
+	void add_draw_list_bind_index_buffer(RDD::BufferID p_buffer, RDD::IndexBufferFormat p_format, uint32_t p_offset, DrawListSplit *p_split = nullptr);
+	void add_draw_list_bind_pipeline(RDD::PipelineID p_pipeline, BitField<RDD::PipelineStageBits> p_pipeline_stage_bits, uint32_t p_first_unbound_set = UINT32_MAX, bool p_layout_reset = false, DrawListSplit *p_split = nullptr);
+	void add_draw_list_bind_uniform_set(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index, DrawListSplit *p_split = nullptr);
+	void add_draw_list_bind_uniform_sets(RDD::ShaderID p_shader, VectorView<RDD::UniformSetID> p_uniform_set, uint32_t p_first_index, uint32_t p_set_count, bool p_dynamic_buffers = true, DrawListSplit *p_split = nullptr);
+	void add_draw_list_bind_vertex_buffers(Span<RDD::BufferID> p_vertex_buffers, Span<uint64_t> p_vertex_buffer_offsets, bool p_dynamic_buffers = true, DrawListSplit *p_split = nullptr);
+	void add_draw_list_clear_attachments(VectorView<RDD::AttachmentClear> p_attachments_clear, VectorView<Rect2i> p_attachments_clear_rect, DrawListSplit *p_split = nullptr);
+	void add_draw_list_draw(uint32_t p_vertex_count, uint32_t p_instance_count, DrawListSplit *p_split = nullptr);
+	void add_draw_list_draw_indexed(uint32_t p_index_count, uint32_t p_instance_count, uint32_t p_first_index, DrawListSplit *p_split = nullptr);
+	void add_draw_list_draw_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride, DrawListSplit *p_split = nullptr);
+	void add_draw_list_draw_indexed_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride, DrawListSplit *p_split = nullptr);
 	void add_draw_list_execute_commands(RDD::CommandBufferID p_command_buffer);
 	void add_draw_list_next_subpass(RDD::CommandBufferType p_command_buffer_type);
-	void add_draw_list_set_blend_constants(const Color &p_color);
-	void add_draw_list_set_line_width(float p_width);
-	void add_draw_list_set_push_constant(RDD::ShaderID p_shader, const void *p_data, uint32_t p_data_size);
-	void add_draw_list_set_scissor(Rect2i p_rect);
-	void add_draw_list_set_viewport(Rect2i p_rect);
-	void add_draw_list_uniform_set_prepare_for_use(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index);
-	void add_draw_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage);
-	void add_draw_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages);
+	void add_draw_list_set_blend_constants(const Color &p_color, DrawListSplit *p_split = nullptr);
+	void add_draw_list_set_line_width(float p_width, DrawListSplit *p_split = nullptr);
+	void add_draw_list_set_push_constant(RDD::ShaderID p_shader, const void *p_data, uint32_t p_data_size, DrawListSplit *p_split = nullptr);
+	void add_draw_list_set_scissor(Rect2i p_rect, DrawListSplit *p_split = nullptr);
+	void add_draw_list_set_viewport(Rect2i p_rect, DrawListSplit *p_split = nullptr);
+	void add_draw_list_uniform_set_prepare_for_use(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index, DrawListSplit *p_split = nullptr);
+	void add_draw_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage, DrawListSplit *p_split = nullptr);
+	void add_draw_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages, DrawListSplit *p_split = nullptr);
+	void add_draw_list_split(DrawListSplit &p_split);
 	void add_draw_list_end();
 	void add_texture_clear_color(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, const Color &p_color, const RDD::TextureSubresourceRange &p_range);
 	void add_texture_clear_depth_stencil(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, float p_depth, uint8_t p_stencil, const RDD::TextureSubresourceRange &p_range);

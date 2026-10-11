@@ -39,9 +39,14 @@
 #include "core/os/os.h"
 #include "core/profiling/profiling.h"
 #include "core/templates/fixed_vector.h"
+#include "drivers/streamline/streamline.h"
 #include "servers/rendering/rendering_device_binds.h"
 #include "servers/rendering/rendering_shader_container.h"
 #include "servers/rendering/shader_include_db.h"
+
+#ifndef XR_DISABLED
+#include "servers/xr/xr_server.h"
+#endif
 
 #include "modules/modules_enabled.gen.h"
 
@@ -59,6 +64,7 @@
 #define ERR_RENDER_THREAD_MSG String("This function (") + String(__func__) + String(") can only be called from the render thread. ")
 #define ERR_RENDER_THREAD_GUARD() ERR_FAIL_COND_MSG(render_thread_id != Thread::get_caller_id(), ERR_RENDER_THREAD_MSG);
 #define ERR_RENDER_THREAD_GUARD_V(m_ret) ERR_FAIL_COND_V_MSG(render_thread_id != Thread::get_caller_id(), (m_ret), ERR_RENDER_THREAD_MSG);
+#define ERR_DRAW_LIST_THREAD_GUARD(m_list) ERR_FAIL_COND_MSG(!_is_split_draw_list(m_list) && render_thread_id != Thread::get_caller_id(), ERR_RENDER_THREAD_MSG);
 
 /**************************/
 /**** HELPER FUNCTIONS ****/
@@ -504,7 +510,7 @@ Error RenderingDevice::blas_build(RID p_blas) {
 	Error err = _acceleration_structure_scratch_buffer_create(blas);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph.add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	draw_graph->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -525,7 +531,7 @@ Error RenderingDevice::blas_update(RID p_blas) {
 	Error err = _acceleration_structure_scratch_buffer_create(blas);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph.add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	draw_graph->add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -639,7 +645,7 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 	memcpy(instance_buffer.data_ptr + instance_buffer_offset, shadow_buffer.ptr(), instance_size * p_instances.size());
 
-	draw_graph.add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer.driver_id, instance_buffer_offset, p_instances.size(), tlas->draw_tracker, draw_trackers);
+	draw_graph->add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer.driver_id, instance_buffer_offset, p_instances.size(), tlas->draw_tracker, draw_trackers);
 
 	tlas->invalidated = false;
 
@@ -1074,13 +1080,13 @@ Error RenderingDevice::_staging_buffer_allocate(StagingBuffers &p_staging_buffer
 	return OK;
 }
 
-void RenderingDevice::_staging_buffer_execute_required_action(StagingBuffers &p_staging_buffers, StagingRequiredAction p_required_action) {
+void RenderingDevice::_staging_buffer_execute_required_action(StagingBuffers &p_staging_buffers, StagingRequiredAction p_required_action, const char *p_caller) {
 	switch (p_required_action) {
 		case STAGING_REQUIRED_ACTION_NONE: {
 			// Do nothing.
 		} break;
 		case STAGING_REQUIRED_ACTION_FLUSH_AND_STALL_ALL: {
-			_flush_and_stall_for_all_frames();
+			_flush_and_stall_for_all_frames(true, p_caller);
 
 			// Clear the whole staging buffer.
 			for (int i = 0; i < p_staging_buffers.blocks.size(); i++) {
@@ -1092,7 +1098,11 @@ void RenderingDevice::_staging_buffer_execute_required_action(StagingBuffers &p_
 			p_staging_buffers.blocks.write[p_staging_buffers.current].frame_used = frames_drawn;
 		} break;
 		case STAGING_REQUIRED_ACTION_STALL_PREVIOUS: {
+			const uint64_t stall_begin_usec = frame_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
 			_stall_for_previous_frames();
+			if (frame_stats.enabled) {
+				_frame_stats_sync("staging stall", p_caller, OS::get_singleton()->get_ticks_usec() - stall_begin_usec);
+			}
 
 			for (int i = 0; i < p_staging_buffers.blocks.size(); i++) {
 				// Clear all blocks but the ones from this frame.
@@ -1149,10 +1159,10 @@ Error RenderingDevice::buffer_copy(RID p_src_buffer, RID p_dst_buffer, uint32_t 
 
 	if (_buffer_make_mutable(dst_buffer, p_dst_buffer)) {
 		// The destination buffer must be mutable to be used as a copy destination.
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_buffer_copy(src_buffer->driver_id, src_buffer->draw_tracker, dst_buffer->driver_id, dst_buffer->draw_tracker, region);
+	draw_graph->add_buffer_copy(src_buffer->driver_id, src_buffer->draw_tracker, dst_buffer->driver_id, dst_buffer->draw_tracker, region);
 
 	return OK;
 }
@@ -1193,14 +1203,14 @@ Error RenderingDevice::_buffer_update(Buffer *p_buffer, RID p_buffer_id, uint32_
 		if (!command_buffer_copies_vector.is_empty() && required_action == STAGING_REQUIRED_ACTION_FLUSH_AND_STALL_ALL) {
 			if (_buffer_make_mutable(p_buffer, p_buffer_id)) {
 				// The buffer must be mutable to be used as a copy destination.
-				draw_graph.add_synchronization();
+				draw_graph->add_synchronization();
 			}
 
-			draw_graph.add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
+			draw_graph->add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
 			command_buffer_copies_vector.clear();
 		}
 
-		_staging_buffer_execute_required_action(upload_staging_buffers, required_action);
+		_staging_buffer_execute_required_action(upload_staging_buffers, required_action, __func__);
 
 		// Copy to staging buffer.
 		memcpy(upload_staging_buffers.blocks[upload_staging_buffers.current].data_ptr + block_write_offset, src_data + submit_from, block_write_amount);
@@ -1225,10 +1235,10 @@ Error RenderingDevice::_buffer_update(Buffer *p_buffer, RID p_buffer_id, uint32_
 	if (!command_buffer_copies_vector.is_empty()) {
 		if (_buffer_make_mutable(p_buffer, p_buffer_id)) {
 			// The buffer must be mutable to be used as a copy destination.
-			draw_graph.add_synchronization();
+			draw_graph->add_synchronization();
 		}
 
-		draw_graph.add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
+		draw_graph->add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
 	}
 
 	gpu_copy_count++;
@@ -1280,7 +1290,7 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void 
 						ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, vformat("Argument %d is not a valid buffer of any type.", i));
 					}
 					if (_buffer_make_mutable(buffer, cr.rid)) {
-						draw_graph.add_synchronization();
+						draw_graph->add_synchronization();
 					}
 					trackers[i] = buffer->draw_tracker;
 					usages[i] = (RDG::ResourceUsage)cr.usage;
@@ -1291,7 +1301,7 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void 
 						ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, vformat("Argument %d is not a valid texture.", i));
 					}
 					if (_texture_make_mutable(texture, cr.rid)) {
-						draw_graph.add_synchronization();
+						draw_graph->add_synchronization();
 					}
 					trackers[i] = texture->draw_tracker;
 					usages[i] = (RDG::ResourceUsage)cr.usage;
@@ -1303,7 +1313,7 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void 
 		}
 	}
 
-	draw_graph.add_driver_callback(p_callback, p_userdata, trackers, usages);
+	draw_graph->add_driver_callback(p_callback, p_userdata, trackers, usages);
 
 	return OK;
 }
@@ -1355,10 +1365,10 @@ Error RenderingDevice::buffer_clear(RID p_buffer, uint32_t p_offset, uint32_t p_
 
 	if (_buffer_make_mutable(buffer, p_buffer)) {
 		// The destination buffer must be mutable to be used as a clear destination.
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_buffer_clear(buffer->driver_id, buffer->draw_tracker, p_offset, p_size);
+	draw_graph->add_buffer_clear(buffer->driver_id, buffer->draw_tracker, p_offset, p_size);
 
 	return OK;
 }
@@ -1383,7 +1393,7 @@ Vector<uint8_t> RenderingDevice::buffer_get_data(RID p_buffer, uint32_t p_offset
 	ERR_FAIL_COND_V(!tmp_buffer, Vector<uint8_t>());
 
 	// Flush everything so memory can be safely mapped.
-	_flush_and_stall_for_all_frames();
+	_flush_and_stall_for_all_frames(true, __func__);
 
 	return _buffer_get_data_read(tmp_buffer, p_size);
 }
@@ -1412,7 +1422,7 @@ Vector<Vector<uint8_t>> RenderingDevice::buffers_get_data(Span<RID> p_buffers) {
 	}
 
 	// One flush for all of them: each one is a full frame cycle.
-	_flush_and_stall_for_all_frames();
+	_flush_and_stall_for_all_frames(true, __func__);
 
 	Vector<Vector<uint8_t>> buffer_data;
 	buffer_data.resize(p_buffers.size());
@@ -1434,7 +1444,7 @@ RDD::BufferID RenderingDevice::_buffer_get_data_record(Buffer *p_buffer, uint32_
 	region.src_offset = p_offset;
 	region.size = p_size;
 
-	draw_graph.add_buffer_get_data(p_buffer->driver_id, p_buffer->draw_tracker, tmp_buffer, region);
+	draw_graph->add_buffer_get_data(p_buffer->driver_id, p_buffer->draw_tracker, tmp_buffer, region);
 	return tmp_buffer;
 }
 
@@ -1490,16 +1500,16 @@ Error RenderingDevice::buffer_get_data_async(RID p_buffer, const Callable &p_cal
 		if (flush_frames) {
 			if (_buffer_make_mutable(buffer, p_buffer)) {
 				// The buffer must be mutable to be used as a copy source.
-				draw_graph.add_synchronization();
+				draw_graph->add_synchronization();
 			}
 
 			for (uint32_t i = 0; i < get_data_request.frame_local_count; i++) {
 				uint32_t local_index = get_data_request.frame_local_index + i;
-				draw_graph.add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
+				draw_graph->add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
 			}
 		}
 
-		_staging_buffer_execute_required_action(download_staging_buffers, required_action);
+		_staging_buffer_execute_required_action(download_staging_buffers, required_action, __func__);
 
 		if (flush_frames) {
 			get_data_request.frame_local_count = 0;
@@ -1524,12 +1534,12 @@ Error RenderingDevice::buffer_get_data_async(RID p_buffer, const Callable &p_cal
 	if (get_data_request.frame_local_count > 0) {
 		if (_buffer_make_mutable(buffer, p_buffer)) {
 			// The buffer must be mutable to be used as a copy source.
-			draw_graph.add_synchronization();
+			draw_graph->add_synchronization();
 		}
 
 		for (uint32_t i = 0; i < get_data_request.frame_local_count; i++) {
 			uint32_t local_index = get_data_request.frame_local_index + i;
-			draw_graph.add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
+			draw_graph->add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
 		}
 
 		frames[frame].download_buffer_get_data_requests.push_back(get_data_request);
@@ -2452,15 +2462,15 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 					if (!command_buffer_to_texture_copies_vector.is_empty() && required_action == STAGING_REQUIRED_ACTION_FLUSH_AND_STALL_ALL) {
 						if (_texture_make_mutable(texture, p_texture)) {
 							// The texture must be mutable to be used as a copy destination.
-							draw_graph.add_synchronization();
+							draw_graph->add_synchronization();
 						}
 
 						// If the staging buffer requires flushing everything, we submit the command early and clear the current vector.
-						draw_graph.add_texture_update(texture->driver_id, texture->draw_tracker, command_buffer_to_texture_copies_vector);
+						draw_graph->add_texture_update(texture->driver_id, texture->draw_tracker, command_buffer_to_texture_copies_vector);
 						command_buffer_to_texture_copies_vector.clear();
 					}
 
-					_staging_buffer_execute_required_action(upload_staging_buffers, required_action);
+					_staging_buffer_execute_required_action(upload_staging_buffers, required_action, __func__);
 
 					uint8_t *write_ptr = upload_staging_buffers.blocks[upload_staging_buffers.current].data_ptr + alloc_offset;
 
@@ -2495,10 +2505,10 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 
 	if (_texture_make_mutable(texture, p_texture)) {
 		// The texture must be mutable to be used as a copy destination.
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_texture_update(texture->driver_id, texture->draw_tracker, command_buffer_to_texture_copies_vector);
+	draw_graph->add_texture_update(texture->driver_id, texture->draw_tracker, command_buffer_to_texture_copies_vector);
 
 	return OK;
 }
@@ -2567,7 +2577,7 @@ void RenderingDevice::_texture_copy_shared(RID p_src_texture_rid, Texture *p_src
 	bool src_made_mutable = _texture_make_mutable(p_src_texture, p_src_texture_rid);
 	bool dst_made_mutable = _texture_make_mutable(p_dst_texture, p_dst_texture_rid);
 	if (src_made_mutable || dst_made_mutable) {
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
 	if (p_dst_texture->shared_fallback->raw_reinterpretation) {
@@ -2647,8 +2657,8 @@ void RenderingDevice::_texture_copy_shared(RID p_src_texture_rid, Texture *p_src
 
 		DEV_ASSERT(buffer_size <= driver->buffer_get_allocation_size(shared_buffer));
 
-		draw_graph.add_texture_get_data(p_src_texture->driver_id, p_src_texture->draw_tracker, shared_buffer, get_data_vector, shared_buffer_tracker);
-		draw_graph.add_texture_update(p_dst_texture->shared_fallback->texture, p_dst_texture->shared_fallback->texture_tracker, update_vector, shared_buffer_tracker);
+		draw_graph->add_texture_get_data(p_src_texture->driver_id, p_src_texture->draw_tracker, shared_buffer, get_data_vector, shared_buffer_tracker);
+		draw_graph->add_texture_update(p_dst_texture->shared_fallback->texture, p_dst_texture->shared_fallback->texture_tracker, update_vector, shared_buffer_tracker);
 	} else {
 		// Raw reinterpretation is not required. Use a regular texture copy.
 		RDD::TextureCopyRegion copy_region;
@@ -2672,7 +2682,7 @@ void RenderingDevice::_texture_copy_shared(RID p_src_texture_rid, Texture *p_src
 			region_vector.push_back(copy_region);
 		}
 
-		draw_graph.add_texture_copy(p_src_texture->driver_id, p_src_texture->draw_tracker, p_dst_texture->shared_fallback->texture, p_dst_texture->shared_fallback->texture_tracker, region_vector);
+		draw_graph->add_texture_copy(p_src_texture->driver_id, p_src_texture->draw_tracker, p_dst_texture->shared_fallback->texture, p_dst_texture->shared_fallback->texture_tracker, region_vector);
 	}
 }
 
@@ -2751,10 +2761,10 @@ void RenderingDevice::_texture_clear_color(RID p_texture_rid, Texture *p_texture
 
 	if (_texture_make_mutable(p_texture, p_texture_rid)) {
 		// The texture must be mutable to be used as a clear destination.
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_texture_clear_color(p_texture->driver_id, p_texture->draw_tracker, p_color, range);
+	draw_graph->add_texture_clear_color(p_texture->driver_id, p_texture->draw_tracker, p_color, range);
 }
 
 void RenderingDevice::_texture_clear_depth_stencil(RID p_texture_rid, Texture *p_texture, float p_depth, uint8_t p_stencil, uint32_t p_base_mipmap, uint32_t p_mipmaps, uint32_t p_base_layer, uint32_t p_layers) {
@@ -2777,10 +2787,10 @@ void RenderingDevice::_texture_clear_depth_stencil(RID p_texture_rid, Texture *p
 
 	if (_texture_make_mutable(p_texture, p_texture_rid)) {
 		// The texture must be mutable to be used as a clear destination.
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_texture_clear_depth_stencil(p_texture->driver_id, p_texture->draw_tracker, p_depth, p_stencil, range);
+	draw_graph->add_texture_clear_depth_stencil(p_texture->driver_id, p_texture->draw_tracker, p_depth, p_stencil, range);
 }
 
 Vector<uint8_t> RenderingDevice::texture_get_data(RID p_texture, uint32_t p_layer) {
@@ -2841,13 +2851,13 @@ Vector<uint8_t> RenderingDevice::texture_get_data(RID p_texture, uint32_t p_laye
 
 		if (_texture_make_mutable(tex, p_texture)) {
 			// The texture must be mutable to be used as a copy source due to layout transitions.
-			draw_graph.add_synchronization();
+			draw_graph->add_synchronization();
 		}
 
-		draw_graph.add_texture_get_data(tex->driver_id, tex->draw_tracker, tmp_buffer, copy_regions);
+		draw_graph->add_texture_get_data(tex->driver_id, tex->draw_tracker, tmp_buffer, copy_regions);
 
 		// Flush everything so memory can be safely mapped.
-		_flush_and_stall_for_all_frames();
+		_flush_and_stall_for_all_frames(true, __func__);
 
 		const uint8_t *read_ptr = driver->buffer_map(tmp_buffer);
 		ERR_FAIL_NULL_V(read_ptr, Vector<uint8_t>());
@@ -2919,7 +2929,7 @@ Error RenderingDevice::texture_get_data_async(RID p_texture, uint32_t p_layer, c
 
 	if (_texture_make_mutable(tex, p_texture)) {
 		// The texture must be mutable to be used as a copy source due to layout transitions.
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
 	TextureGetDataRequest get_data_request;
@@ -2969,11 +2979,11 @@ Error RenderingDevice::texture_get_data_async(RID p_texture, uint32_t p_layer, c
 					if (flush_frames) {
 						for (uint32_t j = 0; j < get_data_request.frame_local_count; j++) {
 							uint32_t local_index = get_data_request.frame_local_index + j;
-							draw_graph.add_texture_get_data(tex->driver_id, tex->draw_tracker, frames[frame].download_texture_staging_buffers[local_index], frames[frame].download_buffer_texture_copy_regions[local_index]);
+							draw_graph->add_texture_get_data(tex->driver_id, tex->draw_tracker, frames[frame].download_texture_staging_buffers[local_index], frames[frame].download_buffer_texture_copy_regions[local_index]);
 						}
 					}
 
-					_staging_buffer_execute_required_action(download_staging_buffers, required_action);
+					_staging_buffer_execute_required_action(download_staging_buffers, required_action, __func__);
 
 					if (flush_frames) {
 						get_data_request.frame_local_count = 0;
@@ -3006,7 +3016,7 @@ Error RenderingDevice::texture_get_data_async(RID p_texture, uint32_t p_layer, c
 	if (get_data_request.frame_local_count > 0) {
 		for (uint32_t i = 0; i < get_data_request.frame_local_count; i++) {
 			uint32_t local_index = get_data_request.frame_local_index + i;
-			draw_graph.add_texture_get_data(tex->driver_id, tex->draw_tracker, frames[frame].download_texture_staging_buffers[local_index], frames[frame].download_buffer_texture_copy_regions[local_index]);
+			draw_graph->add_texture_get_data(tex->driver_id, tex->draw_tracker, frames[frame].download_texture_staging_buffers[local_index], frames[frame].download_buffer_texture_copy_regions[local_index]);
 		}
 
 		frames[frame].download_texture_get_data_requests.push_back(get_data_request);
@@ -3140,10 +3150,10 @@ Error RenderingDevice::texture_copy(RID p_from_texture, RID p_to_texture, const 
 	bool src_made_mutable = _texture_make_mutable(src_tex, p_from_texture);
 	bool dst_made_mutable = _texture_make_mutable(dst_tex, p_to_texture);
 	if (src_made_mutable || dst_made_mutable) {
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_texture_copy(src_tex->driver_id, src_tex->draw_tracker, dst_tex->driver_id, dst_tex->draw_tracker, copy_region);
+	draw_graph->add_texture_copy(src_tex->driver_id, src_tex->draw_tracker, dst_tex->driver_id, dst_tex->draw_tracker, copy_region);
 
 	return OK;
 }
@@ -3193,10 +3203,10 @@ Error RenderingDevice::texture_resolve_multisample(RID p_from_texture, RID p_to_
 	bool src_made_mutable = _texture_make_mutable(src_tex, p_from_texture);
 	bool dst_made_mutable = _texture_make_mutable(dst_tex, p_to_texture);
 	if (src_made_mutable || dst_made_mutable) {
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
-	draw_graph.add_texture_resolve(src_tex->driver_id, src_tex->draw_tracker, dst_tex->driver_id, dst_tex->draw_tracker, src_tex->base_layer, src_tex->base_mipmap, dst_tex->base_layer, dst_tex->base_mipmap);
+	draw_graph->add_texture_resolve(src_tex->driver_id, src_tex->draw_tracker, dst_tex->driver_id, dst_tex->draw_tracker, src_tex->base_layer, src_tex->base_mipmap, dst_tex->base_layer, dst_tex->base_mipmap);
 
 	return OK;
 }
@@ -3738,7 +3748,7 @@ RID RenderingDevice::framebuffer_create_empty(const Size2i &p_size, TextureSampl
 	return id;
 }
 
-RID RenderingDevice::framebuffer_create(const Vector<RID> &p_texture_attachments, FramebufferFormatID p_format_check, uint32_t p_view_count) {
+RID RenderingDevice::framebuffer_create(const Vector<RID> &p_texture_attachments, FramebufferFormatID p_format_check, uint32_t p_view_count, uint32_t p_layers) {
 	_THREAD_SAFE_METHOD_
 
 	FramebufferPass pass;
@@ -3746,7 +3756,7 @@ RID RenderingDevice::framebuffer_create(const Vector<RID> &p_texture_attachments
 	for (int i = 0; i < p_texture_attachments.size(); i++) {
 		Texture *texture = texture_owner.get_or_null(p_texture_attachments[i]);
 
-		ERR_FAIL_COND_V_MSG(texture && texture->layers != p_view_count, RID(), "Layers of our texture doesn't match view count for this framebuffer");
+		ERR_FAIL_COND_V_MSG(texture && texture->layers != (p_layers > 1 ? p_layers : p_view_count), RID(), "Layers of our texture doesn't match view count for this framebuffer");
 
 		if (texture != nullptr) {
 			_check_transfer_worker_texture(texture);
@@ -3770,11 +3780,14 @@ RID RenderingDevice::framebuffer_create(const Vector<RID> &p_texture_attachments
 	Vector<FramebufferPass> passes;
 	passes.push_back(pass);
 
-	return framebuffer_create_multipass(p_texture_attachments, passes, p_format_check, p_view_count);
+	return framebuffer_create_multipass(p_texture_attachments, passes, p_format_check, p_view_count, p_layers);
 }
 
-RID RenderingDevice::framebuffer_create_multipass(const Vector<RID> &p_texture_attachments, const Vector<FramebufferPass> &p_passes, FramebufferFormatID p_format_check, uint32_t p_view_count) {
+RID RenderingDevice::framebuffer_create_multipass(const Vector<RID> &p_texture_attachments, const Vector<FramebufferPass> &p_passes, FramebufferFormatID p_format_check, uint32_t p_view_count, uint32_t p_layers) {
 	_THREAD_SAFE_METHOD_
+
+	ERR_FAIL_COND_V_MSG(p_layers > 1 && p_view_count != 1, RID(), "A layered framebuffer has a single view.");
+	ERR_FAIL_COND_V_MSG(p_layers > 1 && !has_feature(SUPPORTS_SHADER_OUTPUT_LAYER), RID(), "Layered framebuffers need a vertex shader able to choose the layer, which this device doesn't support.");
 
 	Vector<AttachmentFormat> attachments;
 	LocalVector<RDD::TextureID> textures;
@@ -3790,7 +3803,7 @@ RID RenderingDevice::framebuffer_create_multipass(const Vector<RID> &p_texture_a
 			af.usage_flags = AttachmentFormat::UNUSED_ATTACHMENT;
 			trackers.push_back(nullptr);
 		} else {
-			ERR_FAIL_COND_V_MSG(texture->layers != p_view_count, RID(), "Layers of our texture doesn't match view count for this framebuffer");
+			ERR_FAIL_COND_V_MSG(texture->layers != (p_layers > 1 ? p_layers : p_view_count), RID(), "Layers of our texture doesn't match view count for this framebuffer");
 
 			_check_transfer_worker_texture(texture);
 
@@ -3843,6 +3856,7 @@ RID RenderingDevice::framebuffer_create_multipass(const Vector<RID> &p_texture_a
 	RDG::FramebufferCache *framebuffer_cache = RDG::framebuffer_cache_create();
 	framebuffer_cache->width = size.width;
 	framebuffer_cache->height = size.height;
+	framebuffer_cache->layers = p_layers;
 	framebuffer_cache->textures = textures;
 	framebuffer_cache->trackers = trackers;
 	framebuffer.framebuffer_cache = framebuffer_cache;
@@ -4093,6 +4107,7 @@ RID RenderingDevice::vertex_array_create(uint32_t p_vertex_count, VertexFormatID
 		}
 
 		vertex_array.buffers.write[atf.binding] = buffer->driver_id;
+		vertex_array.has_dynamic_buffers = vertex_array.has_dynamic_buffers || buffer->usage.has_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
 		if (unique_buffers.has(buf)) {
 			// No need to add dependencies multiple times.
@@ -4687,7 +4702,7 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 
 					if (_texture_make_mutable(texture, texture_id)) {
 						// The texture must be mutable as a layout transition will be required.
-						draw_graph.add_synchronization();
+						draw_graph->add_synchronization();
 					}
 
 					if (texture->draw_tracker != nullptr) {
@@ -4722,7 +4737,7 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 
 					if (set_uniform.writable && _buffer_make_mutable(buffer, buffer_id)) {
 						// The buffer must be mutable if it's used for writing.
-						draw_graph.add_synchronization();
+						draw_graph->add_synchronization();
 					}
 
 					if (buffer->draw_tracker != nullptr) {
@@ -4822,7 +4837,7 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 
 				if (set_uniform.writable && _buffer_make_mutable(buffer, buffer_id)) {
 					// The buffer must be mutable if it's used for writing.
-					draw_graph.add_synchronization();
+					draw_graph->add_synchronization();
 				}
 
 				if (buffer->draw_tracker != nullptr) {
@@ -4893,6 +4908,11 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 	ERR_FAIL_COND_V(!driver_uniform_set, RID());
 
 	UniformSet uniform_set;
+	for (uint32_t i = 0; i < p_uniforms.size(); i++) {
+		if (p_uniforms[i].uniform_type == UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC || p_uniforms[i].uniform_type == UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC) {
+			uniform_set.has_dynamic_buffers = true;
+		}
+	}
 	uniform_set.driver_id = driver_uniform_set;
 	uniform_set.format = shader->set_formats[p_shader_set];
 	uniform_set.attachable_textures = attachable_textures;
@@ -4923,9 +4943,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 }
 
 bool RenderingDevice::uniform_set_is_valid(RID p_uniform_set) {
-	_THREAD_SAFE_METHOD_
-
-	return uniform_set_owner.owns(p_uniform_set);
+	// Draw lists ask this for every material, from several threads at once: the lookup without lock (the one bind
+	// functions use) does not make them wait on the owner's lock.
+	return uniform_set_owner.get_or_null(p_uniform_set) != nullptr;
 }
 
 void RenderingDevice::uniform_set_set_invalidation_callback(RID p_uniform_set, InvalidationCallback p_callback, void *p_userdata) {
@@ -5529,6 +5549,14 @@ Error RenderingDevice::screen_prepare_for_drawing(DisplayServerEnums::WindowID p
 	// Erase the framebuffer corresponding to this screen from the map in case any of the operations fail.
 	screen_framebuffers.erase(p_screen);
 
+	// The previous frame's present moves the back buffer index the acquisition reads, and nothing may use the main
+	// queue or the swap chain behind the submission thread's back (this waits for the replay thread's frames too).
+	const uint64_t drain_begin_usec = frame_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	_submit_thread_drain();
+	if (frame_stats.enabled) {
+		frame_stats.screen_drain_usec += OS::get_singleton()->get_ticks_usec() - drain_begin_usec;
+	}
+
 	// If this frame has already queued this swap chain for presentation, we present it and remove it from the pending list.
 	uint32_t to_present_index = 0;
 	while (to_present_index < frames[frame].swap_chains_to_present.size()) {
@@ -5544,7 +5572,7 @@ Error RenderingDevice::screen_prepare_for_drawing(DisplayServerEnums::WindowID p
 	RDD::FramebufferID framebuffer = driver->swap_chain_acquire_framebuffer(main_queue, it->value, resize_required);
 	if (resize_required) {
 		// Flush everything so nothing can be using the swap chain before resizing it.
-		_flush_and_stall_for_all_frames();
+		_flush_and_stall_for_all_frames(true, __func__);
 
 		Error err = driver->swap_chain_resize(main_queue, it->value, _get_swap_chain_desired_count());
 		if (err != OK) {
@@ -5648,7 +5676,7 @@ Error RenderingDevice::screen_free(DisplayServerEnums::WindowID p_screen) {
 	ERR_FAIL_COND_V_MSG(it == screen_swap_chains.end(), FAILED, "Screen was never created.");
 
 	// Flush everything so nothing can be using the swap chain before erasing it.
-	_flush_and_stall_for_all_frames();
+	_flush_and_stall_for_all_frames(true, __func__);
 
 	const DisplayServerEnums::WindowID screen = it->key;
 	const RDD::SwapChainID swap_chain = it->value;
@@ -5689,10 +5717,10 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin_for_screen(DisplayS
 	clear_value.color = p_clear_color;
 
 	RDD::RenderPassID render_pass = driver->swap_chain_get_render_pass(sc_it->value);
-	draw_graph.add_draw_list_begin(render_pass, fb_it->value, viewport, RDG::ATTACHMENT_OPERATION_CLEAR, clear_value, RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, RDD::BreadcrumbMarker::BLIT_PASS, split_swapchain_into_its_own_cmd_buffer);
+	draw_graph->add_draw_list_begin(render_pass, fb_it->value, viewport, RDG::ATTACHMENT_OPERATION_CLEAR, clear_value, RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, RDD::BreadcrumbMarker::BLIT_PASS, split_swapchain_into_its_own_cmd_buffer);
 
-	draw_graph.add_draw_list_set_viewport(viewport);
-	draw_graph.add_draw_list_set_scissor(viewport);
+	draw_graph->add_draw_list_set_viewport(viewport);
+	draw_graph->add_draw_list_set_scissor(viewport);
 
 	return int64_t(ID_TYPE_DRAW_LIST) << ID_BASE_SHIFT;
 }
@@ -5796,8 +5824,8 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 		clear_values[i] = clear_value;
 	}
 
-	draw_graph.add_draw_list_begin(framebuffer->framebuffer_cache, Rect2i(viewport_offset, viewport_size), operations, clear_values, stages, p_breadcrumb);
-	draw_graph.add_draw_list_usages(resource_trackers, resource_usages);
+	draw_graph->add_draw_list_begin(framebuffer->framebuffer_cache, Rect2i(viewport_offset, viewport_size), operations, clear_values, stages, p_breadcrumb);
+	draw_graph->add_draw_list_usages(resource_trackers, resource_usages);
 
 	// Mark textures as bound.
 	draw_list_bound_textures.clear();
@@ -5820,8 +5848,8 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 	draw_list_subpass_count = framebuffer_key->passes.size();
 
 	Rect2i viewport_rect(viewport_offset, viewport_size);
-	draw_graph.add_draw_list_set_viewport(viewport_rect);
-	draw_graph.add_draw_list_set_scissor(viewport_rect);
+	draw_graph->add_draw_list_set_viewport(viewport_rect);
+	draw_graph->add_draw_list_set_scissor(viewport_rect);
 
 	return int64_t(ID_TYPE_DRAW_LIST) << ID_BASE_SHIFT;
 }
@@ -5833,43 +5861,60 @@ Error RenderingDevice::draw_list_begin_split(RID p_framebuffer, uint32_t p_split
 #endif
 
 void RenderingDevice::draw_list_set_blend_constants(DrawListID p_list, const Color &p_color) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
 
-	draw_graph.add_draw_list_set_blend_constants(p_color);
+	ERR_FAIL_COND(!dl->active);
+
+	draw_graph->add_draw_list_set_blend_constants(p_color, graph_split);
 }
 
 void RenderingDevice::draw_list_bind_render_pipeline(DrawListID p_list, RID p_render_pipeline) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	const RenderPipeline *pipeline = render_pipeline_owner.get_or_null(p_render_pipeline);
 	ERR_FAIL_NULL(pipeline);
 #ifdef DEBUG_ENABLED
-	ERR_FAIL_COND(pipeline->validation.framebuffer_format != draw_list_framebuffer_format && pipeline->validation.render_pass != draw_list_current_subpass);
+	if (split != nullptr) {
+		ERR_FAIL_COND(pipeline->validation.framebuffer_format != split->framebuffer_format && pipeline->validation.render_pass != 0);
+	} else {
+		ERR_FAIL_COND(pipeline->validation.framebuffer_format != draw_list_framebuffer_format && pipeline->validation.render_pass != draw_list_current_subpass);
+	}
 #endif
 
-	if (p_render_pipeline == draw_list.state.pipeline) {
+	if (p_render_pipeline == dl->state.pipeline) {
 		return; // Redundant state, return.
 	}
 
-	draw_list.state.pipeline = p_render_pipeline;
+	dl->state.pipeline = p_render_pipeline;
 
-	draw_graph.add_draw_list_bind_pipeline(pipeline->driver_id, pipeline->stage_bits);
+	// The first set this pipeline leaves unbound and whether it drops the push constants (a new pipeline layout), for
+	// the graph to know which earlier bindings still apply.
+	uint32_t first_unbound_set = UINT32_MAX;
+	bool layout_reset = false;
 
-	if (draw_list.state.pipeline_shader != pipeline->shader) {
+	if (dl->state.pipeline_shader != pipeline->shader) {
 		// Shader changed, so descriptor sets may become incompatible.
 
 		uint32_t pcount = pipeline->set_formats.size(); // Formats count in this pipeline.
-		draw_list.state.set_count = MAX(draw_list.state.set_count, pcount);
+		dl->state.set_count = MAX(dl->state.set_count, pcount);
 		const uint32_t *pformats = pipeline->set_formats.ptr(); // Pipeline set formats.
 
 		uint32_t first_invalid_set = UINT32_MAX; // All valid by default.
-		if (pipeline->push_constant_size != draw_list.state.pipeline_push_constant_size) {
+		if (pipeline->push_constant_size != dl->state.pipeline_push_constant_size) {
 			// All sets must be invalidated as the pipeline layout is not compatible if the push constant range is different.
-			draw_list.state.pipeline_push_constant_size = pipeline->push_constant_size;
+			dl->state.pipeline_push_constant_size = pipeline->push_constant_size;
 			first_invalid_set = 0;
 		} else {
 			switch (driver->api_trait_get(RDD::API_TRAIT_SHADER_CHANGE_INVALIDATION)) {
@@ -5878,14 +5923,14 @@ void RenderingDevice::draw_list_bind_render_pipeline(DrawListID p_list, RID p_re
 				} break;
 				case RDD::SHADER_CHANGE_INVALIDATION_INCOMPATIBLE_SETS_PLUS_CASCADE: {
 					for (uint32_t i = 0; i < pcount; i++) {
-						if (draw_list.state.sets[i].pipeline_expected_format != pformats[i]) {
+						if (dl->state.sets[i].pipeline_expected_format != pformats[i]) {
 							first_invalid_set = i;
 							break;
 						}
 					}
 				} break;
 				case RDD::SHADER_CHANGE_INVALIDATION_ALL_OR_NONE_ACCORDING_TO_LAYOUT_HASH: {
-					if (draw_list.state.pipeline_shader_layout_hash != pipeline->shader_layout_hash) {
+					if (dl->state.pipeline_shader_layout_hash != pipeline->shader_layout_hash) {
 						first_invalid_set = 0;
 					}
 				} break;
@@ -5894,60 +5939,69 @@ void RenderingDevice::draw_list_bind_render_pipeline(DrawListID p_list, RID p_re
 
 		if (pipeline->push_constant_size) {
 #ifdef DEBUG_ENABLED
-			draw_list.validation.pipeline_push_constant_supplied = false;
+			dl->validation.pipeline_push_constant_supplied = false;
 #endif
 		}
 
 		for (uint32_t i = 0; i < pcount; i++) {
-			draw_list.state.sets[i].bound = draw_list.state.sets[i].bound && i < first_invalid_set;
-			draw_list.state.sets[i].pipeline_expected_format = pformats[i];
+			dl->state.sets[i].bound = dl->state.sets[i].bound && i < first_invalid_set;
+			dl->state.sets[i].pipeline_expected_format = pformats[i];
 		}
 
-		for (uint32_t i = pcount; i < draw_list.state.set_count; i++) {
+		for (uint32_t i = pcount; i < dl->state.set_count; i++) {
 			// Unbind the ones above (not used) if exist.
-			draw_list.state.sets[i].bound = false;
+			dl->state.sets[i].bound = false;
 		}
 
-		draw_list.state.set_count = pcount; // Update set count.
+		dl->state.set_count = pcount; // Update set count.
 
-		draw_list.state.pipeline_shader = pipeline->shader;
-		draw_list.state.pipeline_shader_driver_id = pipeline->shader_driver_id;
-		draw_list.state.pipeline_shader_layout_hash = pipeline->shader_layout_hash;
+		dl->state.pipeline_shader = pipeline->shader;
+		dl->state.pipeline_shader_driver_id = pipeline->shader_driver_id;
+		dl->state.pipeline_shader_layout_hash = pipeline->shader_layout_hash;
+
+		first_unbound_set = MIN(first_invalid_set, pcount);
+		layout_reset = first_invalid_set == 0;
 	}
+
+	draw_graph->add_draw_list_bind_pipeline(pipeline->driver_id, pipeline->stage_bits, first_unbound_set, layout_reset, graph_split);
 
 #ifdef DEBUG_ENABLED
 	// Update render pass pipeline info.
-	draw_list.validation.pipeline_active = true;
-	draw_list.validation.pipeline_dynamic_state = pipeline->validation.dynamic_state;
-	draw_list.validation.pipeline_vertex_format = pipeline->validation.vertex_format;
-	draw_list.validation.pipeline_uses_restart_indices = pipeline->validation.uses_restart_indices;
-	draw_list.validation.pipeline_primitive_divisor = pipeline->validation.primitive_divisor;
-	draw_list.validation.pipeline_primitive_minimum = pipeline->validation.primitive_minimum;
-	draw_list.validation.pipeline_push_constant_size = pipeline->push_constant_size;
+	dl->validation.pipeline_active = true;
+	dl->validation.pipeline_dynamic_state = pipeline->validation.dynamic_state;
+	dl->validation.pipeline_vertex_format = pipeline->validation.vertex_format;
+	dl->validation.pipeline_uses_restart_indices = pipeline->validation.uses_restart_indices;
+	dl->validation.pipeline_primitive_divisor = pipeline->validation.primitive_divisor;
+	dl->validation.pipeline_primitive_minimum = pipeline->validation.primitive_minimum;
+	dl->validation.pipeline_push_constant_size = pipeline->push_constant_size;
 #endif
 }
 
 void RenderingDevice::draw_list_bind_uniform_set(DrawListID p_list, RID p_uniform_set, uint32_t p_index) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
+
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
 
 #ifdef DEBUG_ENABLED
 	ERR_FAIL_COND_MSG(p_index >= driver->limit_get(LIMIT_MAX_BOUND_UNIFORM_SETS) || p_index >= MAX_UNIFORM_SETS,
 			"Attempting to bind a descriptor set (" + itos(p_index) + ") greater than what the hardware supports (" + itos(driver->limit_get(LIMIT_MAX_BOUND_UNIFORM_SETS)) + ").");
 #endif
 
-	ERR_FAIL_COND(!draw_list.active);
+	ERR_FAIL_COND(!dl->active);
 
 	const UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
 	ERR_FAIL_NULL(uniform_set);
 
-	if (p_index > draw_list.state.set_count) {
-		draw_list.state.set_count = p_index;
+	if (p_index > dl->state.set_count) {
+		dl->state.set_count = p_index;
 	}
 
-	draw_list.state.sets[p_index].uniform_set_driver_id = uniform_set->driver_id; // Update set pointer.
-	draw_list.state.sets[p_index].bound = false; // Needs rebind.
-	draw_list.state.sets[p_index].uniform_set_format = uniform_set->format;
-	draw_list.state.sets[p_index].uniform_set = p_uniform_set;
+	dl->state.sets[p_index].uniform_set_driver_id = uniform_set->driver_id; // Update set pointer.
+	dl->state.sets[p_index].bound = false; // Needs rebind.
+	dl->state.sets[p_index].uniform_set_format = uniform_set->format;
+	dl->state.sets[p_index].uniform_set = p_uniform_set;
 
 #ifdef DEBUG_ENABLED
 	{ // Validate that textures bound are not attached as framebuffer bindings.
@@ -5966,38 +6020,48 @@ void RenderingDevice::draw_list_bind_uniform_set(DrawListID p_list, RID p_unifor
 }
 
 void RenderingDevice::draw_list_bind_vertex_array(DrawListID p_list, RID p_vertex_array) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	VertexArray *vertex_array = vertex_array_owner.get_or_null(p_vertex_array);
 	ERR_FAIL_NULL(vertex_array);
 
-	if (draw_list.state.vertex_array == p_vertex_array) {
+	if (dl->state.vertex_array == p_vertex_array) {
 		return; // Already set.
 	}
 
-	_check_transfer_worker_vertex_array(vertex_array);
+	_draw_list_check_transfer_worker_vertex_array(split, vertex_array);
 
-	draw_list.state.vertex_array = p_vertex_array;
+	dl->state.vertex_array = p_vertex_array;
 
 #ifdef DEBUG_ENABLED
-	draw_list.validation.vertex_format = vertex_array->description;
-	draw_list.validation.vertex_max_instances_allowed = vertex_array->max_instances_allowed;
+	dl->validation.vertex_format = vertex_array->description;
+	dl->validation.vertex_max_instances_allowed = vertex_array->max_instances_allowed;
 #endif
-	draw_list.validation.vertex_array_size = vertex_array->vertex_count;
+	dl->validation.vertex_array_size = vertex_array->vertex_count;
 
-	draw_graph.add_draw_list_bind_vertex_buffers(vertex_array->buffers, vertex_array->offsets);
+	draw_graph->add_draw_list_bind_vertex_buffers(vertex_array->buffers, vertex_array->offsets, vertex_array->has_dynamic_buffers, graph_split);
 
 	for (int i = 0; i < vertex_array->draw_trackers.size(); i++) {
-		draw_graph.add_draw_list_usage(vertex_array->draw_trackers[i], RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ);
+		draw_graph->add_draw_list_usage(vertex_array->draw_trackers[i], RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ, graph_split);
 	}
 }
 
 void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, VertexFormatID p_vertex_format, uint32_t p_vertex_count, const Span<RID> &p_vertex_buffers, const Span<uint64_t> &p_offsets) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	const VertexDescriptionCache *vertex_description;
 	{
@@ -6018,6 +6082,7 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 
 	FixedVector<RDD::BufferID, 32> driver_buffers;
 	driver_buffers.resize_initialized(p_vertex_buffers.size());
+	bool has_dynamic_buffers = false;
 
 	FixedVector<RDG::ResourceTracker *, 32> draw_trackers;
 
@@ -6036,7 +6101,7 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 		Buffer *buffer = vertex_buffer_owner.get_or_null(buffer_rid);
 		ERR_FAIL_NULL(buffer);
 
-		_check_transfer_worker_buffer(buffer);
+		_draw_list_check_transfer_worker_buffer(split, buffer);
 
 #if DEBUG_ENABLED
 		uint64_t binding_offset = offsets_span[i];
@@ -6072,193 +6137,216 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 #endif
 
 		driver_buffers[i] = buffer->driver_id;
+		has_dynamic_buffers = has_dynamic_buffers || buffer->usage.has_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
 		if (buffer->draw_tracker != nullptr) {
 			draw_trackers.push_back(buffer->draw_tracker);
 		}
 	}
 
-	draw_list.state.vertex_array = RID();
+	dl->state.vertex_array = RID();
 
-	draw_graph.add_draw_list_bind_vertex_buffers(driver_buffers, offsets_span);
+	draw_graph->add_draw_list_bind_vertex_buffers(driver_buffers, offsets_span, has_dynamic_buffers, graph_split);
 
 	for (RDG::ResourceTracker *tracker : draw_trackers) {
-		draw_graph.add_draw_list_usage(tracker, RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ);
+		draw_graph->add_draw_list_usage(tracker, RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ, graph_split);
 	}
 
-	draw_list.validation.vertex_array_size = p_vertex_count;
+	dl->validation.vertex_array_size = p_vertex_count;
 
 #ifdef DEBUG_ENABLED
-	draw_list.validation.vertex_format = p_vertex_format;
-	draw_list.validation.vertex_max_instances_allowed = max_instances_allowed;
+	dl->validation.vertex_format = p_vertex_format;
+	dl->validation.vertex_max_instances_allowed = max_instances_allowed;
 #endif
 }
 
 void RenderingDevice::draw_list_bind_index_array(DrawListID p_list, RID p_index_array) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	IndexArray *index_array = index_array_owner.get_or_null(p_index_array);
 	ERR_FAIL_NULL(index_array);
 
-	if (draw_list.state.index_array == p_index_array) {
+	if (dl->state.index_array == p_index_array) {
 		return; // Already set.
 	}
 
-	_check_transfer_worker_index_array(index_array);
+	_draw_list_check_transfer_worker_index_array(split, index_array);
 
-	draw_list.state.index_array = p_index_array;
+	dl->state.index_array = p_index_array;
 #ifdef DEBUG_ENABLED
-	draw_list.validation.index_array_max_index = index_array->max_index;
+	dl->validation.index_array_max_index = index_array->max_index;
 #endif
-	draw_list.validation.index_array_count = index_array->indices;
+	dl->validation.index_array_count = index_array->indices;
 
 	const uint64_t offset_bytes = index_array->offset * (index_array->format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t));
-	draw_graph.add_draw_list_bind_index_buffer(index_array->driver_id, index_array->format, offset_bytes);
+	draw_graph->add_draw_list_bind_index_buffer(index_array->driver_id, index_array->format, offset_bytes, graph_split);
 
 	if (index_array->draw_tracker != nullptr) {
-		draw_graph.add_draw_list_usage(index_array->draw_tracker, RDG::RESOURCE_USAGE_INDEX_BUFFER_READ);
+		draw_graph->add_draw_list_usage(index_array->draw_tracker, RDG::RESOURCE_USAGE_INDEX_BUFFER_READ, graph_split);
 	}
 }
 
 void RenderingDevice::draw_list_set_line_width(DrawListID p_list, float p_width) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
 
-	draw_graph.add_draw_list_set_line_width(p_width);
+	ERR_FAIL_COND(!dl->active);
+
+	draw_graph->add_draw_list_set_line_width(p_width, graph_split);
 }
 
 void RenderingDevice::draw_list_set_push_constant(DrawListID p_list, const void *p_data, uint32_t p_data_size) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 #ifdef DEBUG_ENABLED
-	ERR_FAIL_COND_MSG(p_data_size != draw_list.validation.pipeline_push_constant_size,
-			"This render pipeline requires (" + itos(draw_list.validation.pipeline_push_constant_size) + ") bytes of push constant data, supplied: (" + itos(p_data_size) + ")");
+	ERR_FAIL_COND_MSG(p_data_size != dl->validation.pipeline_push_constant_size,
+			"This render pipeline requires (" + itos(dl->validation.pipeline_push_constant_size) + ") bytes of push constant data, supplied: (" + itos(p_data_size) + ")");
 #endif
 
-	draw_graph.add_draw_list_set_push_constant(draw_list.state.pipeline_shader_driver_id, p_data, p_data_size);
+	draw_graph->add_draw_list_set_push_constant(dl->state.pipeline_shader_driver_id, p_data, p_data_size, graph_split);
 
 #ifdef DEBUG_ENABLED
-	draw_list.validation.pipeline_push_constant_supplied = true;
+	dl->validation.pipeline_push_constant_supplied = true;
 #endif
 }
 
 void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint32_t p_instances, uint32_t p_procedural_vertices) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 #ifdef DEBUG_ENABLED
-	ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_active,
+	ERR_FAIL_COND_MSG(!dl->validation.pipeline_active,
 			"No render pipeline was set before attempting to draw.");
-	if (draw_list.validation.pipeline_vertex_format != INVALID_ID) {
+	if (dl->validation.pipeline_vertex_format != INVALID_ID) {
 		// Pipeline uses vertices, validate format.
-		ERR_FAIL_COND_MSG(draw_list.validation.vertex_format == INVALID_ID,
+		ERR_FAIL_COND_MSG(dl->validation.vertex_format == INVALID_ID,
 				"No vertex array was bound, and render pipeline expects vertices.");
 		// Make sure format is right.
-		ERR_FAIL_COND_MSG(draw_list.validation.pipeline_vertex_format != draw_list.validation.vertex_format,
+		ERR_FAIL_COND_MSG(dl->validation.pipeline_vertex_format != dl->validation.vertex_format,
 				"The vertex format used to create the pipeline does not match the vertex format bound.");
 		// Make sure number of instances is valid.
-		ERR_FAIL_COND_MSG(p_instances > draw_list.validation.vertex_max_instances_allowed,
-				"Number of instances requested (" + itos(p_instances) + " is larger than the maximum number supported by the bound vertex array (" + itos(draw_list.validation.vertex_max_instances_allowed) + ").");
+		ERR_FAIL_COND_MSG(p_instances > dl->validation.vertex_max_instances_allowed,
+				"Number of instances requested (" + itos(p_instances) + " is larger than the maximum number supported by the bound vertex array (" + itos(dl->validation.vertex_max_instances_allowed) + ").");
 	}
 
-	if (draw_list.validation.pipeline_push_constant_size > 0) {
+	if (dl->validation.pipeline_push_constant_size > 0) {
 		// Using push constants, check that they were supplied.
-		ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_push_constant_supplied,
+		ERR_FAIL_COND_MSG(!dl->validation.pipeline_push_constant_supplied,
 				"The shader in this pipeline requires a push constant to be set before drawing, but it's not present.");
 	}
 
 #endif
 
 #ifdef DEBUG_ENABLED
-	for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
-		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+	for (uint32_t i = 0; i < dl->state.set_count; i++) {
+		if (dl->state.sets[i].pipeline_expected_format == 0) {
 			// Nothing expected by this pipeline.
 			continue;
 		}
 
-		if (draw_list.state.sets[i].pipeline_expected_format != draw_list.state.sets[i].uniform_set_format) {
-			if (draw_list.state.sets[i].uniform_set_format == 0) {
+		if (dl->state.sets[i].pipeline_expected_format != dl->state.sets[i].uniform_set_format) {
+			if (dl->state.sets[i].uniform_set_format == 0) {
 				ERR_FAIL_MSG(vformat("Uniforms were never supplied for set (%d) at the time of drawing, which are required by the pipeline.", i));
-			} else if (uniform_set_owner.owns(draw_list.state.sets[i].uniform_set)) {
-				UniformSet *us = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
+			} else if (uniform_set_owner.owns(dl->state.sets[i].uniform_set)) {
+				UniformSet *us = uniform_set_owner.get_or_null(dl->state.sets[i].uniform_set);
 				const String us_info = us ? vformat("(%d):\n%s\n", i, _shader_uniform_debug(us->shader_id, us->shader_set)) : vformat("(%d, which was just freed) ", i);
-				ERR_FAIL_MSG(vformat("Uniforms supplied for set %sare not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", us_info, _shader_uniform_debug(draw_list.state.pipeline_shader)));
+				ERR_FAIL_MSG(vformat("Uniforms supplied for set %sare not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", us_info, _shader_uniform_debug(dl->state.pipeline_shader)));
 			} else {
-				ERR_FAIL_MSG(vformat("Uniforms supplied for set (%d, which was just freed) are not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", i, _shader_uniform_debug(draw_list.state.pipeline_shader)));
+				ERR_FAIL_MSG(vformat("Uniforms supplied for set (%d, which was just freed) are not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", i, _shader_uniform_debug(dl->state.pipeline_shader)));
 			}
 		}
 	}
 #endif
 	thread_local LocalVector<RDD::UniformSetID> valid_descriptor_ids;
 	valid_descriptor_ids.clear();
-	valid_descriptor_ids.resize(draw_list.state.set_count);
+	valid_descriptor_ids.resize(dl->state.set_count);
 	uint32_t valid_set_count = 0;
 	uint32_t first_set_index = 0;
 	uint32_t last_set_index = 0;
 	bool found_first_set = false;
+	bool batch_has_dynamic_buffers = false; // Whether the sets batched so far need the driver's dynamic offsets.
 
-	for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
-		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+	for (uint32_t i = 0; i < dl->state.set_count; i++) {
+		if (dl->state.sets[i].pipeline_expected_format == 0) {
 			continue; // Nothing expected by this pipeline.
 		}
 
-		if (!draw_list.state.sets[i].bound && !found_first_set) {
+		if (!dl->state.sets[i].bound && !found_first_set) {
 			first_set_index = i;
 			found_first_set = true;
 		}
 		// Prepare descriptor sets if the API doesn't use pipeline barriers.
 		if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
-			draw_graph.add_draw_list_uniform_set_prepare_for_use(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_draw_list_uniform_set_prepare_for_use(dl->state.pipeline_shader_driver_id, dl->state.sets[i].uniform_set_driver_id, i, graph_split);
 		}
 	}
 
 	// Bind descriptor sets.
-	for (uint32_t i = first_set_index; i < draw_list.state.set_count; i++) {
-		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+	for (uint32_t i = first_set_index; i < dl->state.set_count; i++) {
+		if (dl->state.sets[i].pipeline_expected_format == 0) {
 			continue; // Nothing expected by this pipeline.
 		}
 
-		if (!draw_list.state.sets[i].bound) {
+		if (!dl->state.sets[i].bound) {
 			// Batch contiguous descriptor sets in a single call.
 			if (descriptor_set_batching) {
 				// All good, see if this requires re-binding.
 				if (i - last_set_index > 1) {
 					// If the descriptor sets are not contiguous, bind the previous ones and start a new batch.
-					draw_graph.add_draw_list_bind_uniform_sets(draw_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+					draw_graph->add_draw_list_bind_uniform_sets(dl->state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, batch_has_dynamic_buffers, graph_split);
 
 					first_set_index = i;
 					valid_set_count = 1;
-					valid_descriptor_ids[0] = draw_list.state.sets[i].uniform_set_driver_id;
+					valid_descriptor_ids[0] = dl->state.sets[i].uniform_set_driver_id;
+					batch_has_dynamic_buffers = false;
 				} else {
 					// Otherwise, keep storing in the current batch.
-					valid_descriptor_ids[valid_set_count] = draw_list.state.sets[i].uniform_set_driver_id;
+					valid_descriptor_ids[valid_set_count] = dl->state.sets[i].uniform_set_driver_id;
 					valid_set_count++;
 				}
 
-				UniformSet *uniform_set = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
+				UniformSet *uniform_set = uniform_set_owner.get_or_null(dl->state.sets[i].uniform_set);
 				ERR_FAIL_NULL(uniform_set);
-				_uniform_set_update_shared(uniform_set);
-				_uniform_set_update_clears(uniform_set);
+				_draw_list_uniform_set_bound(split, uniform_set);
+				batch_has_dynamic_buffers = batch_has_dynamic_buffers || uniform_set->has_dynamic_buffers;
 
-				draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
-				draw_list.state.sets[i].bound = true;
+				draw_graph->add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage, graph_split);
+				dl->state.sets[i].bound = true;
 
 				last_set_index = i;
 			} else {
-				draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+				draw_graph->add_draw_list_bind_uniform_set(dl->state.pipeline_shader_driver_id, dl->state.sets[i].uniform_set_driver_id, i, graph_split);
 			}
 		}
 	}
 
 	// Bind the remaining batch.
 	if (descriptor_set_batching && valid_set_count > 0) {
-		draw_graph.add_draw_list_bind_uniform_sets(draw_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+		draw_graph->add_draw_list_bind_uniform_sets(dl->state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, batch_has_dynamic_buffers, graph_split);
 	}
 
 	if (p_use_indices) {
@@ -6266,23 +6354,23 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 		ERR_FAIL_COND_MSG(p_procedural_vertices > 0,
 				"Procedural vertices can't be used together with indices.");
 
-		ERR_FAIL_COND_MSG(!draw_list.validation.index_array_count,
+		ERR_FAIL_COND_MSG(!dl->validation.index_array_count,
 				"Draw command requested indices, but no index buffer was set.");
 
-		ERR_FAIL_COND_MSG(draw_list.validation.pipeline_uses_restart_indices != draw_list.validation.index_buffer_uses_restart_indices,
+		ERR_FAIL_COND_MSG(dl->validation.pipeline_uses_restart_indices != dl->validation.index_buffer_uses_restart_indices,
 				"The usage of restart indices in index buffer does not match the render primitive in the pipeline.");
 #endif
-		uint32_t to_draw = draw_list.validation.index_array_count;
+		uint32_t to_draw = dl->validation.index_array_count;
 
 #ifdef DEBUG_ENABLED
-		ERR_FAIL_COND_MSG(to_draw < draw_list.validation.pipeline_primitive_minimum,
-				"Too few indices (" + itos(to_draw) + ") for the render primitive set in the render pipeline (" + itos(draw_list.validation.pipeline_primitive_minimum) + ").");
+		ERR_FAIL_COND_MSG(to_draw < dl->validation.pipeline_primitive_minimum,
+				"Too few indices (" + itos(to_draw) + ") for the render primitive set in the render pipeline (" + itos(dl->validation.pipeline_primitive_minimum) + ").");
 
-		ERR_FAIL_COND_MSG((to_draw % draw_list.validation.pipeline_primitive_divisor) != 0,
-				"Index amount (" + itos(to_draw) + ") must be a multiple of the amount of indices required by the render primitive (" + itos(draw_list.validation.pipeline_primitive_divisor) + ").");
+		ERR_FAIL_COND_MSG((to_draw % dl->validation.pipeline_primitive_divisor) != 0,
+				"Index amount (" + itos(to_draw) + ") must be a multiple of the amount of indices required by the render primitive (" + itos(dl->validation.pipeline_primitive_divisor) + ").");
 #endif
 
-		draw_graph.add_draw_list_draw_indexed(to_draw, p_instances, 0);
+		draw_graph->add_draw_list_draw_indexed(to_draw, p_instances, 0, graph_split);
 	} else {
 		uint32_t to_draw;
 
@@ -6290,30 +6378,35 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 			to_draw = p_procedural_vertices;
 		} else {
 #ifdef DEBUG_ENABLED
-			ERR_FAIL_COND_MSG(draw_list.validation.pipeline_vertex_format == INVALID_ID,
+			ERR_FAIL_COND_MSG(dl->validation.pipeline_vertex_format == INVALID_ID,
 					"Draw command lacks indices, but pipeline format does not use vertices.");
 #endif
-			to_draw = draw_list.validation.vertex_array_size;
+			to_draw = dl->validation.vertex_array_size;
 		}
 
 #ifdef DEBUG_ENABLED
-		ERR_FAIL_COND_MSG(to_draw < draw_list.validation.pipeline_primitive_minimum,
-				"Too few vertices (" + itos(to_draw) + ") for the render primitive set in the render pipeline (" + itos(draw_list.validation.pipeline_primitive_minimum) + ").");
+		ERR_FAIL_COND_MSG(to_draw < dl->validation.pipeline_primitive_minimum,
+				"Too few vertices (" + itos(to_draw) + ") for the render primitive set in the render pipeline (" + itos(dl->validation.pipeline_primitive_minimum) + ").");
 
-		ERR_FAIL_COND_MSG((to_draw % draw_list.validation.pipeline_primitive_divisor) != 0,
-				"Vertex amount (" + itos(to_draw) + ") must be a multiple of the amount of vertices required by the render primitive (" + itos(draw_list.validation.pipeline_primitive_divisor) + ").");
+		ERR_FAIL_COND_MSG((to_draw % dl->validation.pipeline_primitive_divisor) != 0,
+				"Vertex amount (" + itos(to_draw) + ") must be a multiple of the amount of vertices required by the render primitive (" + itos(dl->validation.pipeline_primitive_divisor) + ").");
 #endif
 
-		draw_graph.add_draw_list_draw(to_draw, p_instances);
+		draw_graph->add_draw_list_draw(to_draw, p_instances, graph_split);
 	}
 
-	draw_list.state.draw_count++;
+	dl->state.draw_count++;
 }
 
 void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indices, RID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	Buffer *buffer = storage_buffer_owner.get_or_null(p_buffer);
 	ERR_FAIL_NULL(buffer);
@@ -6321,40 +6414,40 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 	ERR_FAIL_COND_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_INDIRECT_BIT), "Buffer provided was not created to do indirect dispatch.");
 
 #ifdef DEBUG_ENABLED
-	ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_active,
+	ERR_FAIL_COND_MSG(!dl->validation.pipeline_active,
 			"No render pipeline was set before attempting to draw.");
-	if (draw_list.validation.pipeline_vertex_format != INVALID_ID) {
+	if (dl->validation.pipeline_vertex_format != INVALID_ID) {
 		// Pipeline uses vertices, validate format.
-		ERR_FAIL_COND_MSG(draw_list.validation.vertex_format == INVALID_ID,
+		ERR_FAIL_COND_MSG(dl->validation.vertex_format == INVALID_ID,
 				"No vertex array was bound, and render pipeline expects vertices.");
 		// Make sure format is right.
-		ERR_FAIL_COND_MSG(draw_list.validation.pipeline_vertex_format != draw_list.validation.vertex_format,
+		ERR_FAIL_COND_MSG(dl->validation.pipeline_vertex_format != dl->validation.vertex_format,
 				"The vertex format used to create the pipeline does not match the vertex format bound.");
 	}
 
-	if (draw_list.validation.pipeline_push_constant_size > 0) {
+	if (dl->validation.pipeline_push_constant_size > 0) {
 		// Using push constants, check that they were supplied.
-		ERR_FAIL_COND_MSG(!draw_list.validation.pipeline_push_constant_supplied,
+		ERR_FAIL_COND_MSG(!dl->validation.pipeline_push_constant_supplied,
 				"The shader in this pipeline requires a push constant to be set before drawing, but it's not present.");
 	}
 #endif
 
 #ifdef DEBUG_ENABLED
-	for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
-		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+	for (uint32_t i = 0; i < dl->state.set_count; i++) {
+		if (dl->state.sets[i].pipeline_expected_format == 0) {
 			// Nothing expected by this pipeline.
 			continue;
 		}
 
-		if (draw_list.state.sets[i].pipeline_expected_format != draw_list.state.sets[i].uniform_set_format) {
-			if (draw_list.state.sets[i].uniform_set_format == 0) {
+		if (dl->state.sets[i].pipeline_expected_format != dl->state.sets[i].uniform_set_format) {
+			if (dl->state.sets[i].uniform_set_format == 0) {
 				ERR_FAIL_MSG(vformat("Uniforms were never supplied for set (%d) at the time of drawing, which are required by the pipeline.", i));
-			} else if (uniform_set_owner.owns(draw_list.state.sets[i].uniform_set)) {
-				UniformSet *us = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
+			} else if (uniform_set_owner.owns(dl->state.sets[i].uniform_set)) {
+				UniformSet *us = uniform_set_owner.get_or_null(dl->state.sets[i].uniform_set);
 				const String us_info = us ? vformat("(%d):\n%s\n", i, _shader_uniform_debug(us->shader_id, us->shader_set)) : vformat("(%d, which was just freed) ", i);
-				ERR_FAIL_MSG(vformat("Uniforms supplied for set %sare not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", us_info, _shader_uniform_debug(draw_list.state.pipeline_shader)));
+				ERR_FAIL_MSG(vformat("Uniforms supplied for set %sare not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", us_info, _shader_uniform_debug(dl->state.pipeline_shader)));
 			} else {
-				ERR_FAIL_MSG(vformat("Uniforms supplied for set (%d, which was just freed) are not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", i, _shader_uniform_debug(draw_list.state.pipeline_shader)));
+				ERR_FAIL_MSG(vformat("Uniforms supplied for set (%d, which was just freed) are not the same format as required by the pipeline shader. Pipeline shader requires the following bindings:\n%s", i, _shader_uniform_debug(dl->state.pipeline_shader)));
 			}
 		}
 	}
@@ -6362,97 +6455,295 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 
 	// Prepare descriptor sets if the API doesn't use pipeline barriers.
 	if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
-		for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
-			if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+		for (uint32_t i = 0; i < dl->state.set_count; i++) {
+			if (dl->state.sets[i].pipeline_expected_format == 0) {
 				// Nothing expected by this pipeline.
 				continue;
 			}
 
-			draw_graph.add_draw_list_uniform_set_prepare_for_use(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_draw_list_uniform_set_prepare_for_use(dl->state.pipeline_shader_driver_id, dl->state.sets[i].uniform_set_driver_id, i, graph_split);
 		}
 	}
 
 	// Bind descriptor sets.
-	for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
-		if (draw_list.state.sets[i].pipeline_expected_format == 0) {
+	for (uint32_t i = 0; i < dl->state.set_count; i++) {
+		if (dl->state.sets[i].pipeline_expected_format == 0) {
 			continue; // Nothing expected by this pipeline.
 		}
-		if (!draw_list.state.sets[i].bound) {
+		if (!dl->state.sets[i].bound) {
 			// All good, see if this requires re-binding.
-			draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_draw_list_bind_uniform_set(dl->state.pipeline_shader_driver_id, dl->state.sets[i].uniform_set_driver_id, i, graph_split);
 
-			UniformSet *uniform_set = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
+			UniformSet *uniform_set = uniform_set_owner.get_or_null(dl->state.sets[i].uniform_set);
 			ERR_FAIL_NULL(uniform_set);
-			_uniform_set_update_shared(uniform_set);
-			_uniform_set_update_clears(uniform_set);
+			_draw_list_uniform_set_bound(split, uniform_set);
 
-			draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph->add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage, graph_split);
 
-			draw_list.state.sets[i].bound = true;
+			dl->state.sets[i].bound = true;
 		}
 	}
 
 	if (p_use_indices) {
 #ifdef DEBUG_ENABLED
-		ERR_FAIL_COND_MSG(!draw_list.validation.index_array_count,
+		ERR_FAIL_COND_MSG(!dl->validation.index_array_count,
 				"Draw command requested indices, but no index buffer was set.");
 
-		ERR_FAIL_COND_MSG(draw_list.validation.pipeline_uses_restart_indices != draw_list.validation.index_buffer_uses_restart_indices,
+		ERR_FAIL_COND_MSG(dl->validation.pipeline_uses_restart_indices != dl->validation.index_buffer_uses_restart_indices,
 				"The usage of restart indices in index buffer does not match the render primitive in the pipeline.");
 #endif
 
 		ERR_FAIL_COND_MSG(p_offset + 20 > buffer->size, "Offset provided (+20) is past the end of buffer.");
 
-		draw_graph.add_draw_list_draw_indexed_indirect(buffer->driver_id, p_offset, p_draw_count, p_stride);
+		draw_graph->add_draw_list_draw_indexed_indirect(buffer->driver_id, p_offset, p_draw_count, p_stride, graph_split);
 	} else {
 		ERR_FAIL_COND_MSG(p_offset + 16 > buffer->size, "Offset provided (+16) is past the end of buffer.");
 
-		draw_graph.add_draw_list_draw_indirect(buffer->driver_id, p_offset, p_draw_count, p_stride);
+		draw_graph->add_draw_list_draw_indirect(buffer->driver_id, p_offset, p_draw_count, p_stride, graph_split);
 	}
 
-	draw_list.state.draw_count++;
+	dl->state.draw_count++;
 
 	if (buffer->draw_tracker != nullptr) {
-		draw_graph.add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+		draw_graph->add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ, graph_split);
 	}
 
-	_check_transfer_worker_buffer(buffer);
+	_draw_list_check_transfer_worker_buffer(split, buffer);
 }
 
 void RenderingDevice::draw_list_set_viewport(DrawListID p_list, const Rect2 &p_rect) {
-	ERR_FAIL_COND(!draw_list.active);
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
+
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	if (p_rect.get_area() == 0) {
 		return;
 	}
 
-	draw_list.viewport = p_rect;
-	draw_graph.add_draw_list_set_viewport(p_rect);
+	dl->viewport = p_rect;
+	draw_graph->add_draw_list_set_viewport(p_rect, graph_split);
 }
 
 void RenderingDevice::draw_list_enable_scissor(DrawListID p_list, const Rect2 &p_rect) {
-	ERR_RENDER_THREAD_GUARD();
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
-	ERR_FAIL_COND(!draw_list.active);
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
 
 	Rect2i rect = p_rect;
-	rect.position += draw_list.viewport.position;
+	rect.position += dl->viewport.position;
 
-	rect = draw_list.viewport.intersection(rect);
+	rect = dl->viewport.intersection(rect);
 
 	if (rect.get_area() == 0) {
 		return;
 	}
 
-	draw_graph.add_draw_list_set_scissor(rect);
+	draw_graph->add_draw_list_set_scissor(rect, graph_split);
 }
 
 void RenderingDevice::draw_list_disable_scissor(DrawListID p_list) {
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
+
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
+
+	draw_graph->add_draw_list_set_scissor(dl->viewport, graph_split);
+}
+
+RenderingDevice::DrawList *RenderingDevice::_get_draw_list(DrawListID p_list, DrawListSplit *&r_split) {
+	if (!_is_split_draw_list(p_list)) {
+		r_split = nullptr;
+		return &draw_list;
+	}
+
+	uint64_t index = uint64_t(p_list) & ((uint64_t(1) << ID_BASE_SHIFT) - 1);
+	ERR_FAIL_COND_V(index >= draw_list_splits_detached && (index < draw_list_split_base || index >= draw_list_split_base + draw_list_split_count), nullptr);
+	r_split = &draw_list_splits[index];
+	return &r_split->draw_list;
+}
+
+void RenderingDevice::_draw_list_uniform_set_bound(DrawListSplit *p_split, UniformSet *p_uniform_set) {
+	if (p_split == nullptr) {
+		_uniform_set_update_shared(p_uniform_set);
+		_uniform_set_update_clears(p_uniform_set);
+	} else if (!p_uniform_set->shared_textures_to_update.is_empty() || !p_uniform_set->pending_clear_textures.is_empty()) {
+		p_split->uniform_sets_to_update.push_back(p_uniform_set);
+	}
+}
+
+void RenderingDevice::_draw_list_check_transfer_worker_buffer(DrawListSplit *p_split, Buffer *p_buffer) {
+	if (p_split == nullptr) {
+		_check_transfer_worker_buffer(p_buffer);
+	} else if (p_buffer->transfer_worker_index >= 0) {
+		p_split->transfer_buffers.push_back(p_buffer);
+	}
+}
+
+void RenderingDevice::_draw_list_check_transfer_worker_vertex_array(DrawListSplit *p_split, VertexArray *p_vertex_array) {
+	if (p_split == nullptr) {
+		_check_transfer_worker_vertex_array(p_vertex_array);
+	} else if (!p_vertex_array->transfer_worker_indices.is_empty()) {
+		p_split->transfer_vertex_arrays.push_back(p_vertex_array);
+	}
+}
+
+void RenderingDevice::_draw_list_check_transfer_worker_index_array(DrawListSplit *p_split, IndexArray *p_index_array) {
+	if (p_split == nullptr) {
+		_check_transfer_worker_index_array(p_index_array);
+	} else if (p_index_array->transfer_worker_index >= 0) {
+		p_split->transfer_index_arrays.push_back(p_index_array);
+	}
+}
+
+void RenderingDevice::draw_list_split_begin(uint32_t p_count, DrawListID *r_split_ids) {
 	ERR_RENDER_THREAD_GUARD();
 
-	ERR_FAIL_COND(!draw_list.active);
+	ERR_FAIL_COND_MSG(!draw_list.active, "A draw list must be active to be split.");
+	ERR_FAIL_COND_MSG(draw_list_split_count > 0, "The draw list is already split.");
+	ERR_FAIL_COND(p_count == 0);
+	ERR_FAIL_COND_MSG(draw_list_subpass_count > 1, "A draw list with subpasses can't be split.");
 
-	draw_graph.add_draw_list_set_scissor(draw_list.viewport);
+	// The graph copies the instructions of earlier splits of this draw list only when it ends: use other ones.
+	draw_list_split_base = draw_list_splits_used;
+	if (draw_list_splits.size() < draw_list_split_base + p_count) {
+		draw_list_splits.resize(draw_list_split_base + p_count);
+	}
+
+	for (uint32_t i = draw_list_split_base; i < draw_list_split_base + p_count; i++) {
+		DrawListSplit &split = draw_list_splits[i];
+		split.draw_list = DrawList();
+		split.draw_list.viewport = draw_list.viewport;
+		split.draw_list.active = true;
+		split.graph.clear();
+		split.uniform_sets_to_update.clear();
+		split.transfer_buffers.clear();
+		split.transfer_vertex_arrays.clear();
+		split.transfer_index_arrays.clear();
+#ifdef DEBUG_ENABLED
+		split.framebuffer_format = draw_list_framebuffer_format;
+#endif
+		r_split_ids[i - draw_list_split_base] = (int64_t(ID_TYPE_SPLIT_DRAW_LIST) << ID_BASE_SHIFT) | int64_t(i);
+	}
+
+	draw_list_split_count = p_count;
+}
+
+void RenderingDevice::_draw_list_split_merge(DrawListSplit &p_split) {
+	draw_graph->add_draw_list_split(p_split.graph);
+
+	for (UniformSet *uniform_set : p_split.uniform_sets_to_update) {
+		_uniform_set_update_shared(uniform_set);
+		_uniform_set_update_clears(uniform_set);
+	}
+
+	for (Buffer *buffer : p_split.transfer_buffers) {
+		_check_transfer_worker_buffer(buffer);
+	}
+
+	for (VertexArray *vertex_array : p_split.transfer_vertex_arrays) {
+		_check_transfer_worker_vertex_array(vertex_array);
+	}
+
+	for (IndexArray *index_array : p_split.transfer_index_arrays) {
+		_check_transfer_worker_index_array(index_array);
+	}
+
+	draw_list.state.draw_count += p_split.draw_list.state.draw_count;
+}
+
+void RenderingDevice::draw_list_split_end() {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND_MSG(draw_list_split_count == 0, "The draw list is not split.");
+
+	for (uint32_t i = draw_list_split_base; i < draw_list_split_base + draw_list_split_count; i++) {
+		_draw_list_split_merge(draw_list_splits[i]);
+	}
+
+	draw_list_splits_used = draw_list_split_base + draw_list_split_count;
+	draw_list_split_count = 0;
+
+	// The splits bound their own state: nothing the draw list had bound before can be assumed anymore.
+	uint32_t draw_count = draw_list.state.draw_count;
+	draw_list.state = DrawList::State();
+	draw_list.state.draw_count = draw_count;
+	draw_list.validation = DrawList::Validation();
+}
+
+void RenderingDevice::draw_list_split_detached_begin(uint32_t p_count, const Rect2i *p_viewports, const FramebufferFormatID *p_formats, DrawListID *r_split_ids) {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND_MSG(draw_list.active, "Splits recorded ahead of their draw lists are reserved while no draw list is open.");
+	ERR_FAIL_COND_MSG(draw_list_splits_detached > 0, "Splits are already reserved ahead of their draw lists.");
+	ERR_FAIL_COND(p_count == 0);
+
+	// No draw list is open, so no split is in use: they take the first ones, and the splits of the draw lists that open
+	// meanwhile come after them (draw_list_splits_used).
+	if (draw_list_splits.size() < p_count) {
+		draw_list_splits.resize(p_count);
+	}
+
+	for (uint32_t i = 0; i < p_count; i++) {
+		DrawListSplit &split = draw_list_splits[i];
+		split.draw_list = DrawList();
+		split.draw_list.viewport = p_viewports[i];
+		split.draw_list.active = true;
+		split.graph.clear();
+		split.uniform_sets_to_update.clear();
+		split.transfer_buffers.clear();
+		split.transfer_vertex_arrays.clear();
+		split.transfer_index_arrays.clear();
+#ifdef DEBUG_ENABLED
+		split.framebuffer_format = p_formats[i];
+#endif
+		r_split_ids[i] = (int64_t(ID_TYPE_SPLIT_DRAW_LIST) << ID_BASE_SHIFT) | int64_t(i);
+	}
+
+	draw_list_splits_detached = p_count;
+	draw_list_splits_used = p_count;
+}
+
+void RenderingDevice::draw_list_split_append(DrawListID p_split) {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND_MSG(!draw_list.active, "A draw list must be active to take a split.");
+	ERR_FAIL_COND_MSG(draw_list_split_count > 0, "The draw list is still split, call draw_list_split_end() first.");
+	ERR_FAIL_COND(!_is_split_draw_list(p_split));
+	const uint64_t index = uint64_t(p_split) & ((uint64_t(1) << ID_BASE_SHIFT) - 1);
+	ERR_FAIL_COND_MSG(index >= draw_list_splits_detached, "Only a split reserved by draw_list_split_detached_begin() can be appended.");
+	ERR_FAIL_COND_MSG(draw_list_subpass_count > 1, "A draw list with subpasses can't take a split.");
+
+	_draw_list_split_merge(draw_list_splits[index]);
+
+	// The split bound its own state, as in draw_list_split_end().
+	uint32_t draw_count = draw_list.state.draw_count;
+	draw_list.state = DrawList::State();
+	draw_list.state.draw_count = draw_count;
+	draw_list.validation = DrawList::Validation();
+}
+
+void RenderingDevice::draw_list_split_detached_end() {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND_MSG(draw_list.active, "The draw lists holding the splits must have ended.");
+	ERR_FAIL_COND_MSG(draw_list_splits_detached == 0, "No split is reserved ahead of its draw list.");
+
+	draw_list_splits_detached = 0;
+	draw_list_splits_used = 0;
 }
 
 uint32_t RenderingDevice::draw_list_get_current_pass() {
@@ -6472,7 +6763,7 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_switch_to_next_pass() {
 	Rect2i viewport;
 	_draw_list_end(&viewport);
 
-	draw_graph.add_draw_list_next_subpass(RDD::COMMAND_BUFFER_TYPE_PRIMARY);
+	draw_graph->add_draw_list_next_subpass(RDD::COMMAND_BUFFER_TYPE_PRIMARY);
 
 	_draw_list_start(viewport);
 
@@ -6502,8 +6793,10 @@ void RenderingDevice::draw_list_end() {
 	ERR_RENDER_THREAD_GUARD();
 
 	ERR_FAIL_COND_MSG(!draw_list.active, "Immediate draw list is already inactive.");
+	ERR_FAIL_COND_MSG(draw_list_split_count > 0, "The draw list is still split, call draw_list_split_end() first.");
 
-	draw_graph.add_draw_list_end();
+	draw_graph->add_draw_list_end();
+	draw_list_splits_used = draw_list_splits_detached;
 
 	_draw_list_end();
 
@@ -6539,7 +6832,7 @@ RenderingDevice::RaytracingListID RenderingDevice::raytracing_list_begin() {
 
 	raytracing_list.active = true;
 
-	draw_graph.add_raytracing_list_begin();
+	draw_graph->add_raytracing_list_begin();
 
 	return ID_TYPE_RAYTRACING_LIST;
 }
@@ -6565,7 +6858,7 @@ void RenderingDevice::raytracing_list_bind_raytracing_pipeline(RaytracingListID 
 	raytracing_list.state.raygen_shader_count = pipeline->raygen_shader_count;
 	raytracing_list.state.miss_shader_count = pipeline->miss_shader_count;
 
-	draw_graph.add_raytracing_list_bind_pipeline(pipeline->driver_id);
+	draw_graph->add_raytracing_list_bind_pipeline(pipeline->driver_id);
 
 	if (raytracing_list.state.layout_defining_shader != pipeline->layout_defining_shader) {
 		// Shader changed, so descriptor sets may become incompatible.
@@ -6670,7 +6963,7 @@ void RenderingDevice::raytracing_list_set_push_constant(RaytracingListID p_list,
 			"This raytracing pipeline requires (" + itos(raytracing_list.validation.pipeline_push_constant_size) + ") bytes of push constant data, supplied: (" + itos(p_data_size) + ")");
 #endif
 
-	draw_graph.add_raytracing_list_set_push_constant(raytracing_list.state.layout_defining_shader_driver_id, p_data, p_data_size);
+	draw_graph->add_raytracing_list_set_push_constant(raytracing_list.state.layout_defining_shader_driver_id, p_data, p_data_size);
 
 	// Store it in the state in case we need to restart the raytracing list.
 	memcpy(raytracing_list.state.push_constant_data, p_data, p_data_size);
@@ -6694,14 +6987,14 @@ void RenderingDevice::raytracing_list_add_buffer_dependency(RaytracingListID p_l
 	// promotion also triggers a global synchronization point so any writes
 	// that happened before the buffer was made mutable are flushed.
 	if (_buffer_make_mutable(buffer, p_buffer)) {
-		draw_graph.add_synchronization();
+		draw_graph->add_synchronization();
 	}
 
 	if (buffer->draw_tracker != nullptr) {
 		RDG::ResourceUsage usage = p_writable
 				? RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ_WRITE
 				: RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ;
-		draw_graph.add_raytracing_list_usage(buffer->draw_tracker, usage);
+		draw_graph->add_raytracing_list_usage(buffer->draw_tracker, usage);
 	}
 
 	_check_transfer_worker_buffer(buffer);
@@ -6758,7 +7051,7 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 				continue;
 			}
 
-			draw_graph.add_raytracing_list_uniform_set_prepare_for_use(raytracing_list.state.layout_defining_shader_driver_id, raytracing_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_raytracing_list_uniform_set_prepare_for_use(raytracing_list.state.layout_defining_shader_driver_id, raytracing_list.state.sets[i].uniform_set_driver_id, i);
 		}
 	}
 
@@ -6769,12 +7062,12 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 		}
 		if (!raytracing_list.state.sets[i].bound) {
 			// All good, see if this requires re-binding.
-			draw_graph.add_raytracing_list_bind_uniform_set(raytracing_list.state.layout_defining_shader_driver_id, raytracing_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_raytracing_list_bind_uniform_set(raytracing_list.state.layout_defining_shader_driver_id, raytracing_list.state.sets[i].uniform_set_driver_id, i);
 
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(raytracing_list.state.sets[i].uniform_set);
 			_uniform_set_update_shared(uniform_set);
 
-			draw_graph.add_raytracing_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph->add_raytracing_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
 
 			raytracing_list.state.sets[i].bound = true;
 		}
@@ -6810,10 +7103,10 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 	ERR_FAIL_COND(err != OK);
 
 	if (hit_sbt->draw_tracker != nullptr) {
-		draw_graph.add_raytracing_list_usage(hit_sbt->draw_tracker, RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
+		draw_graph->add_raytracing_list_usage(hit_sbt->draw_tracker, RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
 	}
 
-	draw_graph.add_raytracing_list_trace_rays(raygen_sbt, miss_sbt, rdd_hit_sbt, p_width, p_height, p_depth);
+	draw_graph->add_raytracing_list_trace_rays(raygen_sbt, miss_sbt, rdd_hit_sbt, p_width, p_height, p_depth);
 	raytracing_list.state.trace_count++;
 }
 
@@ -6822,7 +7115,7 @@ void RenderingDevice::raytracing_list_end() {
 
 	ERR_FAIL_COND(!raytracing_list.active);
 
-	draw_graph.add_raytracing_list_end();
+	draw_graph->add_raytracing_list_end();
 
 	raytracing_list = RaytracingList();
 }
@@ -6839,7 +7132,7 @@ RenderingDevice::ComputeListID RenderingDevice::compute_list_begin() {
 
 	compute_list.active = true;
 
-	draw_graph.add_compute_list_begin();
+	draw_graph->add_compute_list_begin();
 
 	return ID_TYPE_COMPUTE_LIST;
 }
@@ -6859,7 +7152,7 @@ void RenderingDevice::compute_list_bind_compute_pipeline(ComputeListID p_list, R
 
 	compute_list.state.pipeline = p_compute_pipeline;
 
-	draw_graph.add_compute_list_bind_pipeline(pipeline->driver_id);
+	draw_graph->add_compute_list_bind_pipeline(pipeline->driver_id);
 
 	if (compute_list.state.pipeline_shader != pipeline->shader) {
 		// Shader changed, so descriptor sets may become incompatible.
@@ -6972,7 +7265,7 @@ void RenderingDevice::compute_list_set_push_constant(ComputeListID p_list, const
 			"This compute pipeline requires (" + itos(compute_list.validation.pipeline_push_constant_size) + ") bytes of push constant data, supplied: (" + itos(p_data_size) + ")");
 #endif
 
-	draw_graph.add_compute_list_set_push_constant(compute_list.state.pipeline_shader_driver_id, p_data, p_data_size);
+	draw_graph->add_compute_list_set_push_constant(compute_list.state.pipeline_shader_driver_id, p_data, p_data_size);
 
 	// Store it in the state in case we need to restart the compute list.
 	memcpy(compute_list.state.push_constant_data, p_data, p_data_size);
@@ -7040,6 +7333,7 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 	uint32_t first_set_index = 0;
 	uint32_t last_set_index = 0;
 	bool found_first_set = false;
+	bool batch_has_dynamic_buffers = false; // Whether the sets batched so far need the driver's dynamic offsets.
 
 	for (uint32_t i = 0; i < compute_list.state.set_count; i++) {
 		if (compute_list.state.sets[i].pipeline_expected_format == 0) {
@@ -7053,7 +7347,7 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 		}
 		// Prepare descriptor sets if the API doesn't use pipeline barriers.
 		if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
-			draw_graph.add_compute_list_uniform_set_prepare_for_use(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_compute_list_uniform_set_prepare_for_use(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
 		}
 	}
 
@@ -7069,11 +7363,12 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 				// All good, see if this requires re-binding.
 				if (i - last_set_index > 1) {
 					// If the descriptor sets are not contiguous, bind the previous ones and start a new batch.
-					draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+					draw_graph->add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, batch_has_dynamic_buffers);
 
 					first_set_index = i;
 					valid_set_count = 1;
 					valid_descriptor_ids[0] = compute_list.state.sets[i].uniform_set_driver_id;
+					batch_has_dynamic_buffers = false;
 				} else {
 					// Otherwise, keep storing in the current batch.
 					valid_descriptor_ids[valid_set_count] = compute_list.state.sets[i].uniform_set_driver_id;
@@ -7082,22 +7377,23 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 
 				last_set_index = i;
 			} else {
-				draw_graph.add_compute_list_bind_uniform_set(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
+				draw_graph->add_compute_list_bind_uniform_set(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
 			}
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(compute_list.state.sets[i].uniform_set);
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
+			batch_has_dynamic_buffers = batch_has_dynamic_buffers || uniform_set->has_dynamic_buffers;
 
-			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph->add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
 			compute_list.state.sets[i].bound = true;
 		}
 	}
 
 	// Bind the remaining batch.
 	if (valid_set_count > 0) {
-		draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+		draw_graph->add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, batch_has_dynamic_buffers);
 	}
-	draw_graph.add_compute_list_dispatch(p_x_groups, p_y_groups, p_z_groups);
+	draw_graph->add_compute_list_dispatch(p_x_groups, p_y_groups, p_z_groups);
 	compute_list.state.dispatch_count++;
 }
 
@@ -7180,6 +7476,7 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 	uint32_t first_set_index = 0;
 	uint32_t last_set_index = 0;
 	bool found_first_set = false;
+	bool batch_has_dynamic_buffers = false; // Whether the sets batched so far need the driver's dynamic offsets.
 
 	for (uint32_t i = 0; i < compute_list.state.set_count; i++) {
 		if (compute_list.state.sets[i].pipeline_expected_format == 0) {
@@ -7194,7 +7491,7 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 
 		// Prepare descriptor sets if the API doesn't use pipeline barriers.
 		if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
-			draw_graph.add_compute_list_uniform_set_prepare_for_use(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
+			draw_graph->add_compute_list_uniform_set_prepare_for_use(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
 		}
 	}
 
@@ -7208,11 +7505,12 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 			// All good, see if this requires re-binding.
 			if (i - last_set_index > 1) {
 				// If the descriptor sets are not contiguous, bind the previous ones and start a new batch.
-				draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+				draw_graph->add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, batch_has_dynamic_buffers);
 
 				first_set_index = i;
 				valid_set_count = 1;
 				valid_descriptor_ids[0] = compute_list.state.sets[i].uniform_set_driver_id;
+				batch_has_dynamic_buffers = false;
 			} else {
 				// Otherwise, keep storing in the current batch.
 				valid_descriptor_ids[valid_set_count] = compute_list.state.sets[i].uniform_set_driver_id;
@@ -7224,22 +7522,23 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(compute_list.state.sets[i].uniform_set);
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
+			batch_has_dynamic_buffers = batch_has_dynamic_buffers || uniform_set->has_dynamic_buffers;
 
-			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph->add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
 			compute_list.state.sets[i].bound = true;
 		}
 	}
 
 	// Bind the remaining batch.
 	if (valid_set_count > 0) {
-		draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+		draw_graph->add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, batch_has_dynamic_buffers);
 	}
 
-	draw_graph.add_compute_list_dispatch_indirect(buffer->driver_id, p_offset);
+	draw_graph->add_compute_list_dispatch_indirect(buffer->driver_id, p_offset);
 	compute_list.state.dispatch_count++;
 
 	if (buffer->draw_tracker != nullptr) {
-		draw_graph.add_compute_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+		draw_graph->add_compute_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
 	}
 
 	_check_transfer_worker_buffer(buffer);
@@ -7272,7 +7571,7 @@ void RenderingDevice::compute_list_end() {
 
 	ERR_FAIL_COND(!compute_list.active);
 
-	draw_graph.add_compute_list_end();
+	draw_graph->add_compute_list_end();
 
 	compute_list = ComputeList();
 }
@@ -7563,12 +7862,13 @@ void RenderingDevice::_submit_transfer_workers(RDD::CommandBufferID p_draw_comma
 	}
 }
 
-void RenderingDevice::_submit_transfer_barriers(RDD::CommandBufferID p_draw_command_buffer) {
+void RenderingDevice::_take_transfer_barriers(uint32_t p_frame) {
 	MutexLock transfer_worker_lock(transfer_worker_pool_texture_barriers_mutex);
-	if (!transfer_worker_pool_texture_barriers.is_empty()) {
-		driver->command_pipeline_barrier(p_draw_command_buffer, RDD::PIPELINE_STAGE_COPY_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, {}, {}, transfer_worker_pool_texture_barriers, {});
-		transfer_worker_pool_texture_barriers.clear();
+	LocalVector<RDD::TextureBarrier> &barriers = frames[p_frame].transfer_texture_barriers;
+	for (const RDD::TextureBarrier &barrier : transfer_worker_pool_texture_barriers) {
+		barriers.push_back(barrier);
 	}
+	transfer_worker_pool_texture_barriers.clear();
 }
 
 void RenderingDevice::_wait_for_transfer_workers() {
@@ -8001,7 +8301,7 @@ void RenderingDevice::draw_command_begin_label(const Span<char> p_label_name, co
 		return;
 	}
 
-	draw_graph.begin_label(p_label_name, p_color);
+	draw_graph->begin_label(p_label_name, p_color);
 }
 
 #ifndef DISABLE_DEPRECATED
@@ -8013,7 +8313,7 @@ void RenderingDevice::draw_command_insert_label(String p_label_name, const Color
 void RenderingDevice::draw_command_end_label() {
 	ERR_RENDER_THREAD_GUARD();
 
-	draw_graph.end_label();
+	draw_graph->end_label();
 }
 
 String RenderingDevice::get_device_vendor_name() const {
@@ -8026,6 +8326,11 @@ String RenderingDevice::get_device_name() const {
 
 RenderingDeviceEnums::DeviceType RenderingDevice::get_device_type() const {
 	return RenderingDeviceEnums::DeviceType(device.type);
+}
+
+uint64_t RenderingDevice::_get_render_frame_token() {
+	Streamline *streamline = Streamline::get_singleton();
+	return streamline ? streamline->get_render_frame_token() : 0;
 }
 
 String RenderingDevice::get_device_api_name() const {
@@ -8051,23 +8356,85 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
 void RenderingDevice::swap_buffers(bool p_present) {
 	ERR_RENDER_THREAD_GUARD();
 
-	GodotProfileZoneGroupedFirst(_profile_zone, "_end_frame");
-	_end_frame();
+	uint64_t stats_usec = 0;
+	if (frame_stats.enabled) {
+		stats_usec = OS::get_singleton()->get_ticks_usec();
+		if (frame_stats.draw_begin_usec) {
+			frame_stats.recording_usec += stats_usec - frame_stats.draw_begin_usec;
+		}
+	}
 
-	if (submit_after_previous_frame) {
+	GodotProfileZoneGroupedFirst(_profile_zone, "_end_frame");
+	if (replay_thread_enabled) {
+		// The replay is the replay thread's.
+		_end_frame_recording();
+	} else {
+		_end_frame();
+	}
+
+	if (frame_stats.enabled) {
+		const uint64_t now = OS::get_singleton()->get_ticks_usec();
+		frame_stats.end_frame_usec += now - stats_usec;
+		stats_usec = now;
+	}
+
+	if (submit_after_previous_frame && !submit_thread_enabled) {
 		// The CPU has recorded this frame while the GPU rendered the previous one; submit it only once that one
-		// has finished, so the GPU queue drains between frames (see vsync/submit_after_previous_frame).
+		// has finished, so the GPU queue drains between frames (see vsync/submit_after_previous_frame). The
+		// submission thread does this wait itself, and this thread records the next frame meanwhile.
 		_stall_for_frame((frame + frames.size() - 1) % frames.size());
 	}
 
 	GodotProfileZoneGrouped(_profile_zone, "_execute_frame");
-	_execute_frame(p_present);
+	if (replay_thread_enabled) {
+		// The replay thread replays this frame, then the submission thread submits and presents it, while this one
+		// records the next.
+		{
+			MutexLock lock(submit_mutex);
+			const uint64_t job = ++submit_jobs_pushed;
+			replay_jobs.push_back({ uint32_t(frame), draw_graph, p_present, _get_render_frame_token(), job });
+			submit_frame_job[frame] = job;
+			draw_graph_job[draw_graph == &draw_graphs[0] ? 0 : 1] = job;
+		}
+		replay_condition.notify_one();
+	} else if (submit_thread_enabled) {
+		// The submission thread submits and presents this frame while this one begins the next.
+		{
+			MutexLock lock(submit_mutex);
+			submit_jobs.push_back({ uint32_t(frame), p_present, _get_render_frame_token() });
+			submit_frame_job[frame] = ++submit_jobs_pushed;
+		}
+		submit_condition.notify_one();
+	} else {
+		_execute_frame(p_present);
+	}
 
-	// Advance to the next frame and begin recording again.
+	// Advance to the next frame and begin recording again, into the other graph.
 	frame = (frame + 1) % frames.size();
+	draw_graph = draw_graph == &draw_graphs[0] ? &draw_graphs[1] : &draw_graphs[0];
+
+	if (frame_stats.enabled) {
+		const uint64_t now = OS::get_singleton()->get_ticks_usec();
+		frame_stats.hand_off_usec += now - stats_usec;
+		stats_usec = now;
+	}
 
 	GodotProfileZoneGrouped(_profile_zone, "_begin_frame");
 	_begin_frame(true);
+
+	if (frame_stats.enabled) {
+		const uint64_t now = OS::get_singleton()->get_ticks_usec();
+		frame_stats.begin_frame_usec += now - stats_usec;
+		frame_stats.last_swap_end_usec = now;
+		frame_stats.draw_begin_usec = 0;
+		if (++frame_stats.frames == 240) {
+			_frame_stats_print();
+			frame_stats.~FrameStats();
+			memnew_placement(&frame_stats, FrameStats);
+			frame_stats.enabled = true;
+			frame_stats.last_swap_end_usec = now;
+		}
+	}
 }
 
 void RenderingDevice::submit() {
@@ -8173,7 +8540,7 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 	// Framebuffers.
 	while (frames[p_frame].framebuffers_to_dispose_of.front()) {
 		Framebuffer *framebuffer = &frames[p_frame].framebuffers_to_dispose_of.front()->get();
-		draw_graph.framebuffer_cache_free(driver, framebuffer->framebuffer_cache);
+		draw_graph->framebuffer_cache_free(driver, framebuffer->framebuffer_cache);
 		frames[p_frame].framebuffers_to_dispose_of.pop_front();
 	}
 
@@ -8231,12 +8598,19 @@ uint64_t RenderingDevice::get_memory_usage(MemoryType p_type) const {
 void RenderingDevice::_begin_frame(bool p_presented) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "_stall_for_frame");
 	// Before writing to this frame, wait for it to be finished.
+	frame_stats.in_begin_frame = frame_stats.enabled;
 	_stall_for_frame(frame);
+	frame_stats.in_begin_frame = false;
 
 	if (command_pool_reset_enabled) {
 		GodotProfileZoneGrouped(_profile_zone, "driver->command_pool_reset");
 		bool reset = driver->command_pool_reset(frames[frame].command_pool);
 		ERR_FAIL_COND(!reset);
+		// The graph's parallel slices recorded this slot's other command buffers, each from a pool of its own.
+		for (RDD::CommandPoolID parallel_pool : frames[frame].command_buffer_pool.parallel_pools) {
+			reset = driver->command_pool_reset(parallel_pool);
+			ERR_FAIL_COND(!reset);
+		}
 	}
 
 	if (p_presented) {
@@ -8251,9 +8625,13 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	GodotProfileZoneGrouped(_profile_zone, "driver->command_buffer_begin");
 	driver->command_buffer_begin(frames[frame].command_buffer);
 
-	// Reset the graph.
-	GodotProfileZoneGrouped(_profile_zone, "draw_graph.begin");
-	draw_graph.begin();
+	// Reset the graph, once the replay thread is done replaying it (the slot stall above already waited for that with two
+	// frame slots, not with more).
+	if (replay_thread_enabled) {
+		_submit_thread_wait(draw_graph_job[draw_graph == &draw_graphs[0] ? 0 : 1]);
+	}
+	GodotProfileZoneGrouped(_profile_zone, "draw_graph->begin");
+	draw_graph->begin();
 
 	// Erase pending resources.
 	GodotProfileZoneGrouped(_profile_zone, "_free_pending_resources");
@@ -8283,6 +8661,11 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 }
 
 void RenderingDevice::_end_frame() {
+	_end_frame_recording();
+	_replay_frame(frame, draw_graph);
+}
+
+void RenderingDevice::_end_frame_recording() {
 	if (draw_list.active) {
 		ERR_PRINT("Found open draw list at the end of the frame, this should never happen (further drawing will likely not work).");
 	}
@@ -8295,28 +8678,36 @@ void RenderingDevice::_end_frame() {
 		ERR_PRINT("Found open raytracing list at the end of the frame, this should never happen (further raytracing will likely not work).");
 	}
 
-	// The command buffer must be copied into a stack variable as the driver workarounds can change the command buffer in use.
-	RDD::CommandBufferID command_buffer = frames[frame].command_buffer;
 	GodotProfileZoneGroupedFirst(_profile_zone, "_submit_transfer_workers");
-	_submit_transfer_workers(command_buffer);
-	GodotProfileZoneGrouped(_profile_zone, "_submit_transfer_barriers");
-	_submit_transfer_barriers(command_buffer);
+	_submit_transfer_workers(frames[frame].command_buffer);
+	_take_transfer_barriers(frame);
+}
 
-	GodotProfileZoneGrouped(_profile_zone, "draw_graph.end");
-	draw_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, frames[frame].command_buffer_pool);
+void RenderingDevice::_replay_frame(uint32_t p_frame, RenderingDeviceGraph *p_graph) {
+	// The command buffer must be copied into a stack variable as the driver workarounds can change the command buffer in use.
+	RDD::CommandBufferID command_buffer = frames[p_frame].command_buffer;
+	LocalVector<RDD::TextureBarrier> &transfer_barriers = frames[p_frame].transfer_texture_barriers;
+	if (!transfer_barriers.is_empty()) {
+		GodotProfileZoneGrouped(_profile_zone, "transfer barriers");
+		driver->command_pipeline_barrier(command_buffer, RDD::PIPELINE_STAGE_COPY_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, {}, {}, transfer_barriers, {});
+		transfer_barriers.clear();
+	}
+
+	GodotProfileZoneGrouped(_profile_zone, "draw_graph->end");
+	p_graph->end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, frames[p_frame].command_buffer_pool);
 	GodotProfileZoneGrouped(_profile_zone, "driver->command_buffer_end");
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");
 	driver->end_segment();
 }
 
-void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingDeviceDriver::FenceID p_draw_fence,
+void RenderingDevice::execute_chained_cmds(uint32_t p_frame, bool p_present_swap_chain, RenderingDeviceDriver::FenceID p_draw_fence,
 		RenderingDeviceDriver::SemaphoreID p_dst_draw_semaphore_to_signal) {
 	// Execute command buffers and use semaphores to wait on the execution of the previous one.
 	// Normally there's only one command buffer, but driver workarounds can force situations where
 	// there'll be more.
 	uint32_t command_buffer_count = 1;
-	RDG::CommandBufferPool &buffer_pool = frames[frame].command_buffer_pool;
+	RDG::CommandBufferPool &buffer_pool = frames[p_frame].command_buffer_pool;
 	if (buffer_pool.buffers_used > 0) {
 		command_buffer_count += buffer_pool.buffers_used;
 		buffer_pool.buffers_used = 0;
@@ -8329,16 +8720,23 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 	// Adreno workaround on mobile, only if the workaround is active). Thus we must execute all of them
 	// and chain them together via semaphores as dependent executions.
 	thread_local LocalVector<RDD::SemaphoreID> wait_semaphores;
-	wait_semaphores = frames[frame].semaphores_to_wait_on;
+	wait_semaphores = frames[p_frame].semaphores_to_wait_on;
+
+	thread_local LocalVector<RDD::CommandBufferID> command_buffers;
 
 	for (uint32_t i = 0; i < command_buffer_count; i++) {
-		RDD::CommandBufferID command_buffer;
 		RDD::SemaphoreID signal_semaphore;
 		RDD::FenceID signal_fence;
+		command_buffers.clear();
 		if (i > 0) {
-			command_buffer = buffer_pool.buffers[i - 1];
+			command_buffers.push_back(buffer_pool.buffers[i - 1]);
 		} else {
-			command_buffer = frames[frame].command_buffer;
+			// The command buffers recorded in parallel with the main one follow it, in the same submission.
+			command_buffers.push_back(frames[p_frame].command_buffer);
+			for (uint32_t j = 0; j < buffer_pool.parallel_buffers_used; j++) {
+				command_buffers.push_back(buffer_pool.parallel_buffers[j]);
+			}
+			buffer_pool.parallel_buffers_used = 0;
 		}
 
 		if (i == (command_buffer_count - 1)) {
@@ -8348,14 +8746,14 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 
 			if (p_present_swap_chain) {
 				// Just present the swap chains as part of the last command execution.
-				swap_chains = frames[frame].swap_chains_to_present;
+				swap_chains = frames[p_frame].swap_chains_to_present;
 			}
 		} else {
 			signal_semaphore = buffer_pool.semaphores[i];
 			// Semaphores always need to be signaled if it's not the last command buffer.
 		}
 
-		driver->command_queue_execute_and_present(main_queue, wait_semaphores, command_buffer,
+		driver->command_queue_execute_and_present(main_queue, wait_semaphores, command_buffers,
 				signal_semaphore ? signal_semaphore : VectorView<RDD::SemaphoreID>(), signal_fence,
 				swap_chains);
 
@@ -8364,43 +8762,179 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 		wait_semaphores[0] = signal_semaphore;
 	}
 
-	frames[frame].semaphores_to_wait_on.clear();
+	frames[p_frame].semaphores_to_wait_on.clear();
 }
 
 void RenderingDevice::_execute_frame(bool p_present) {
+	_execute_frame_slot(frame, p_present);
+}
+
+void RenderingDevice::_execute_frame_slot(uint32_t p_frame, bool p_present) {
 	// Check whether this frame should present the swap chains and in which queue.
-	const bool frame_can_present = p_present && !frames[frame].swap_chains_to_present.is_empty();
+	const bool frame_can_present = p_present && !frames[p_frame].swap_chains_to_present.is_empty();
 	const bool separate_present_queue = main_queue != present_queue;
 
 	// The semaphore is required if the frame can be presented and a separate present queue is used;
 	// since the separate queue will wait for that semaphore before presenting.
 	const RDD::SemaphoreID semaphore = (frame_can_present && separate_present_queue)
-			? frames[frame].semaphore
+			? frames[p_frame].semaphore
 			: RDD::SemaphoreID(nullptr);
 	const bool present_swap_chain = frame_can_present && !separate_present_queue;
 
-	execute_chained_cmds(present_swap_chain, frames[frame].fence, semaphore);
+	execute_chained_cmds(p_frame, present_swap_chain, frames[p_frame].fence, semaphore);
 	// Indicate the fence has been signaled so the next time the frame's contents need to be
 	// used, the CPU needs to wait on the work to be completed.
-	frames[frame].fence_signaled = true;
+	frames[p_frame].fence_signaled = true;
 
 	if (frame_can_present) {
 		if (separate_present_queue) {
 			// Issue the presentation separately if the presentation queue is different from the main queue.
-			driver->command_queue_execute_and_present(present_queue, frames[frame].semaphore, {}, {}, {}, frames[frame].swap_chains_to_present);
+			driver->command_queue_execute_and_present(present_queue, frames[p_frame].semaphore, {}, {}, {}, frames[p_frame].swap_chains_to_present);
 		}
 
-		frames[frame].swap_chains_to_present.clear();
+		frames[p_frame].swap_chains_to_present.clear();
+	}
+}
+
+void RenderingDevice::_replay_thread_func(void *p_userdata) {
+	Thread::set_name("RenderingDevice replay"); // Turns the recorded frames into command buffers.
+	RenderingDevice *rd = (RenderingDevice *)p_userdata;
+	while (true) {
+		ReplayJob job;
+		uint64_t wait_usec = 0;
+		{
+			MutexLock lock(rd->submit_mutex);
+			while (rd->replay_jobs.is_empty() && !rd->replay_thread_exit) {
+				rd->replay_condition.wait(lock);
+			}
+			if (rd->replay_jobs.is_empty()) {
+				break;
+			}
+			job = rd->replay_jobs[0];
+			rd->replay_jobs.remove_at(0);
+
+			// The previous frame is submitted and presented before this one's driver callbacks run: DLSS-G's tags of
+			// frame N+1 must follow Present(N), as when everything ran on the render thread.
+			if (rd->submit_jobs_done + 1 < job.id) {
+				const uint64_t wait_begin_usec = OS::get_singleton()->get_ticks_usec();
+				while (rd->submit_jobs_done + 1 < job.id) {
+					rd->submit_done_condition.wait(lock);
+				}
+				wait_usec = OS::get_singleton()->get_ticks_usec() - wait_begin_usec;
+			}
+		}
+
+		const uint64_t replay_begin_usec = OS::get_singleton()->get_ticks_usec();
+		rd->_replay_frame(job.frame, job.graph);
+		rd->replay_thread_usec.add(OS::get_singleton()->get_ticks_usec() - replay_begin_usec);
+		rd->replay_thread_wait_usec.add(wait_usec);
+		rd->replay_thread_replays.increment();
+
+		{
+			MutexLock lock(rd->submit_mutex);
+			rd->submit_jobs.push_back({ job.frame, job.present, job.frame_token });
+		}
+		rd->submit_condition.notify_one();
+	}
+}
+
+void RenderingDevice::wait_for_frame_threads() {
+	ERR_RENDER_THREAD_GUARD();
+	_submit_thread_drain();
+}
+
+void RenderingDevice::_submit_thread_func(void *p_userdata) {
+	Thread::set_name("RenderingDevice submission"); // Submits and presents the recorded frames.
+	RenderingDevice *rd = (RenderingDevice *)p_userdata;
+	while (true) {
+		SubmitJob job;
+		{
+			MutexLock lock(rd->submit_mutex);
+			while (rd->submit_jobs.is_empty() && !rd->submit_thread_exit) {
+				rd->submit_condition.wait(lock);
+			}
+			if (rd->submit_jobs.is_empty()) {
+				break;
+			}
+			job = rd->submit_jobs[0];
+			rd->submit_jobs.remove_at(0);
+		}
+
+		const uint32_t previous_frame = (job.frame + rd->frames.size() - 1) % rd->frames.size();
+		if (rd->submit_after_previous_frame && rd->frames[previous_frame].fence_signaled) {
+			// vsync/submit_after_previous_frame: submit this frame once the previous one has finished. The render thread
+			// does not stall on that slot until this wait is done (_stall_for_frame()).
+			rd->driver->fence_wait(rd->frames[previous_frame].fence);
+			{
+				MutexLock lock(rd->submit_mutex);
+				rd->frames[previous_frame].fence_waited = true;
+			}
+			rd->submit_done_condition.notify_all();
+		}
+
+		Streamline::set_present_frame_token(job.frame_token);
+		rd->_execute_frame_slot(job.frame, job.present);
+
+		{
+			MutexLock lock(rd->submit_mutex);
+			rd->submit_jobs_done++;
+		}
+		rd->submit_done_condition.notify_all();
+	}
+}
+
+void RenderingDevice::_submit_thread_wait(uint64_t p_job) {
+	if (!submit_thread_enabled) {
+		return;
+	}
+	MutexLock lock(submit_mutex);
+	while (submit_jobs_done < p_job) {
+		submit_done_condition.wait(lock);
+	}
+}
+
+void RenderingDevice::_submit_thread_drain() {
+	if (!submit_thread_enabled) {
+		return;
+	}
+	MutexLock lock(submit_mutex);
+	while (submit_jobs_done < submit_jobs_pushed) {
+		submit_done_condition.wait(lock);
 	}
 }
 
 void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 	thread_local PackedByteArray packed_byte_array;
 
-	if (frames[p_frame].fence_signaled) {
-		GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait");
-		driver->fence_wait(frames[p_frame].fence);
+	const uint64_t wait_begin_usec = frame_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	if (submit_thread_enabled) {
+		// The slot's fence is only signaled once its submission has run.
+		_submit_thread_wait(submit_frame_job[p_frame]);
+		if (submit_after_previous_frame) {
+			// The next frame's submission waits on this fence and resets it: let it, or one of the two waits would
+			// wait on a reset fence forever.
+			MutexLock lock(submit_mutex);
+			const uint64_t next_job = submit_frame_job[p_frame] + 1;
+			while (submit_jobs_pushed >= next_job && submit_jobs_done < next_job && !frames[p_frame].fence_waited) {
+				submit_done_condition.wait(lock);
+			}
+		}
+	}
+
+	const bool fence_signaled = frames[p_frame].fence_signaled;
+	if (fence_signaled) {
+		if (!frames[p_frame].fence_waited) {
+			GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait");
+			driver->fence_wait(frames[p_frame].fence);
+		}
+		frames[p_frame].fence_waited = false;
 		frames[p_frame].fence_signaled = false;
+	}
+	if (frame_stats.in_begin_frame) {
+		frame_stats.slot_wait_usec += OS::get_singleton()->get_ticks_usec() - wait_begin_usec;
+	}
+
+	if (fence_signaled) {
 
 		// Flush any pending requests for asynchronous buffer downloads.
 		if (!frames[p_frame].download_buffer_get_data_requests.is_empty()) {
@@ -8488,7 +9022,9 @@ void RenderingDevice::_stall_for_previous_frames() {
 	}
 }
 
-void RenderingDevice::_flush_and_stall_for_all_frames(bool p_begin_frame) {
+void RenderingDevice::_flush_and_stall_for_all_frames(bool p_begin_frame, const char *p_caller) {
+	const uint64_t flush_begin_usec = frame_stats.enabled ? OS::get_singleton()->get_ticks_usec() : 0;
+	_submit_thread_drain();
 	_stall_for_previous_frames();
 	_end_frame();
 	_execute_frame(false);
@@ -8497,6 +9033,64 @@ void RenderingDevice::_flush_and_stall_for_all_frames(bool p_begin_frame) {
 		_begin_frame();
 	} else {
 		_stall_for_frame(frame);
+	}
+
+	if (frame_stats.enabled) {
+		_frame_stats_sync("flush and stall", p_caller, OS::get_singleton()->get_ticks_usec() - flush_begin_usec);
+	}
+}
+
+void RenderingDevice::_frame_stats_sync(const char *p_kind, const char *p_caller, uint64_t p_usec) {
+	if (String(p_kind) == "flush and stall") {
+		frame_stats.flushes++;
+		frame_stats.flush_usec += p_usec;
+	} else {
+		frame_stats.staging_stalls++;
+		frame_stats.staging_stall_usec += p_usec;
+	}
+	const String key = String(p_kind) + " <- " + String(p_caller);
+	HashMap<String, uint32_t>::Iterator it = frame_stats.sync_callers.find(key);
+	if (it) {
+		it->value++;
+	} else {
+		frame_stats.sync_callers.insert(key, 1);
+	}
+}
+
+void RenderingDevice::frame_stats_draw_begin() {
+	if (!frame_stats.enabled) {
+		return;
+	}
+	const uint64_t now = OS::get_singleton()->get_ticks_usec();
+	frame_stats.draw_begin_usec = now;
+	if (frame_stats.last_swap_end_usec) {
+		frame_stats.between_frames_usec += now - frame_stats.last_swap_end_usec;
+	}
+}
+
+void RenderingDevice::_frame_stats_print() {
+	const FrameStats &st = frame_stats;
+	const double n = st.frames;
+	const uint64_t total = st.recording_usec + st.end_frame_usec + st.hand_off_usec + st.begin_frame_usec + st.between_frames_usec;
+	print_line(vformat("RenderingDevice frame, render thread per frame: %.0f us = recording %.0f + end() %.0f + hand-off %.0f + begin %.0f (slot wait %.0f) + between frames %.0f; screen acquire waiting for the submission thread %.0f us.",
+			total / n, st.recording_usec / n, st.end_frame_usec / n, st.hand_off_usec / n, st.begin_frame_usec / n, st.slot_wait_usec / n, st.between_frames_usec / n, st.screen_drain_usec / n));
+	String callers;
+	for (const KeyValue<String, uint32_t> &E : st.sync_callers) {
+		callers += vformat(" [%s: %d]", E.key, E.value);
+	}
+	print_line(vformat("RenderingDevice syncs over %d frames: %d flush and stall all (%.0f us), %d staging stalls (%.0f us).%s",
+			st.frames, st.flushes, double(st.flush_usec), st.staging_stalls, double(st.staging_stall_usec), callers));
+	if (replay_thread_enabled) {
+		const uint64_t replays = replay_thread_replays.get();
+		const uint64_t replay_usec = replay_thread_usec.get();
+		const uint64_t wait_usec = replay_thread_wait_usec.get();
+		replay_thread_replays.sub(replays);
+		replay_thread_usec.sub(replay_usec);
+		replay_thread_wait_usec.sub(wait_usec);
+		if (replays) {
+			print_line(vformat("RenderingDevice replay thread, per frame: replay %d us, waiting for the previous frame's submission %d us (%d replays).",
+					replay_usec / replays, wait_usec / replays, replays));
+		}
 	}
 }
 
@@ -8715,8 +9309,10 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	driver->command_buffer_begin(frames[0].command_buffer);
 
 	// Create draw graph and start it initialized as well.
-	draw_graph.initialize(driver, &_render_pass_create_from_graph, frames.size(), main_queue_family, SECONDARY_COMMAND_BUFFERS_PER_FRAME);
-	draw_graph.begin();
+	for (RenderingDeviceGraph &graph : draw_graphs) {
+		graph.initialize(driver, &_render_pass_create_from_graph, frames.size(), main_queue_family, SECONDARY_COMMAND_BUFFERS_PER_FRAME);
+	}
+	draw_graph->begin();
 
 	for (uint32_t i = 0; i < frames.size(); i++) {
 		// Reset all queries in a query pool before doing any operations with them..
@@ -8725,6 +9321,36 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 
 	// Vulkan only: the hiccups it removes were seen with Vulkan presentation; D3D12 did not need it.
 	submit_after_previous_frame = main_surface != 0 && frames.size() > 1 && driver->get_api_name() == "Vulkan" && bool(GLOBAL_GET("rendering/rendering_device/vsync/submit_after_previous_frame"));
+
+	// With a window, frames are submitted and presented by a thread of their own (GODOT_SUBMIT_THREAD=0: by the render
+	// thread, as before). D3D12, and Vulkan on desktop without OpenXR (its runtime submits to the main queue itself).
+	frame_stats.enabled = is_main_instance && (OS::get_singleton()->get_environment("GODOT_RD_STATS") == "1" || OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS_STATS") == "1");
+	bool submit_thread_api = driver->get_api_name() == "D3D12";
+	if (driver->get_api_name() == "Vulkan" && !OS::get_singleton()->has_feature("mobile")) {
+		submit_thread_api = true;
+#ifndef XR_DISABLED
+		const XRServer::XRMode xr_mode = XRServer::get_xr_mode();
+		if (xr_mode == XRServer::XRMODE_ON || (xr_mode == XRServer::XRMODE_DEFAULT && bool(GLOBAL_GET("xr/openxr/enabled")))) {
+			submit_thread_api = false;
+		}
+#endif
+	}
+	submit_thread_enabled = main_surface != 0 && submit_thread_api && OS::get_singleton()->get_environment("GODOT_SUBMIT_THREAD") != "0";
+	if (submit_thread_enabled) {
+		submit_frame_job.resize(frames.size());
+		for (uint64_t &job : submit_frame_job) {
+			job = 0;
+		}
+		submit_thread.start(_submit_thread_func, this);
+		print_verbose("RenderingDevice: frames are submitted and presented by a thread of their own.");
+
+		// And replayed by another (GODOT_RD_REPLAY_THREAD=0: by the render thread, as before).
+		replay_thread_enabled = OS::get_singleton()->get_environment("GODOT_RD_REPLAY_THREAD") != "0";
+		if (replay_thread_enabled) {
+			replay_thread.start(_replay_thread_func, this);
+			print_verbose("RenderingDevice: recorded frames are replayed by a thread of their own.");
+		}
+	}
 
 	// Convert block size from KB.
 	upload_staging_buffers.block_size = GLOBAL_GET("rendering/rendering_device/staging_buffer/block_size_kb");
@@ -8896,7 +9522,7 @@ void RenderingDevice::capture_timestamp(const String &p_name) {
 	ERR_FAIL_COND_MSG(raytracing_list.active && raytracing_list.state.trace_count > 0, "Capturing timestamps during raytracing list creation is not allowed. Offending timestamp was: " + p_name);
 	ERR_FAIL_COND_MSG(frames[frame].timestamp_count >= max_timestamp_query_elements, vformat("Tried capturing more timestamps than the configured maximum (%d). You can increase this limit in the project settings under 'Debug/Settings' called 'Max Timestamp Query Elements'.", max_timestamp_query_elements));
 
-	draw_graph.add_capture_timestamp(frames[frame].timestamp_pool, frames[frame].timestamp_count);
+	draw_graph->add_capture_timestamp(frames[frame].timestamp_pool, frames[frame].timestamp_count);
 
 	frames[frame].timestamp_names[frames[frame].timestamp_count] = p_name;
 	frames[frame].timestamp_cpu_values[frames[frame].timestamp_count] = OS::get_singleton()->get_ticks_usec();
@@ -9057,7 +9683,27 @@ void RenderingDevice::finalize() {
 
 	if (!frames.is_empty()) {
 		// Wait for all frames to have finished rendering.
-		_flush_and_stall_for_all_frames(false);
+		_flush_and_stall_for_all_frames(false, __func__);
+	}
+
+	if (replay_thread_enabled) {
+		{
+			MutexLock lock(submit_mutex);
+			replay_thread_exit = true;
+		}
+		replay_condition.notify_one();
+		replay_thread.wait_to_finish();
+		replay_thread_enabled = false;
+	}
+
+	if (submit_thread_enabled) {
+		{
+			MutexLock lock(submit_mutex);
+			submit_thread_exit = true;
+		}
+		submit_condition.notify_one();
+		submit_thread.wait_to_finish();
+		submit_thread_enabled = false;
 	}
 
 	// Wait for transfer workers to finish.
@@ -9065,7 +9711,9 @@ void RenderingDevice::finalize() {
 	_wait_for_transfer_workers();
 
 	// Delete everything the graph has created.
-	draw_graph.finalize();
+	for (RenderingDeviceGraph &graph : draw_graphs) {
+		graph.finalize();
+	}
 
 	// Free all resources.
 	_free_rids(render_pipeline_owner, "Pipeline");
@@ -9134,6 +9782,10 @@ void RenderingDevice::finalize() {
 		RDG::CommandBufferPool &buffer_pool = frames[i].command_buffer_pool;
 		for (uint32_t j = 0; j < buffer_pool.buffers.size(); j++) {
 			driver->semaphore_free(buffer_pool.semaphores[j]);
+		}
+
+		for (uint32_t j = 0; j < buffer_pool.parallel_pools.size(); j++) {
+			driver->command_pool_free(buffer_pool.parallel_pools[j]);
 		}
 
 		for (uint32_t j = 0; j < frames[i].transfer_worker_semaphores.size(); j++) {

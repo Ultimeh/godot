@@ -32,6 +32,7 @@
 
 #include "core/object/worker_thread_pool.h"
 #include "core/os/condition_variable.h"
+#include "core/os/thread.h"
 #include "core/os/thread_safe.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rb_map.h"
@@ -91,6 +92,88 @@ private:
 	// rendering/rendering_device/vsync/submit_after_previous_frame, on Vulkan, with a swap chain and more than one frame in flight.
 	bool submit_after_previous_frame = false;
 
+	// Submission thread (D3D12 and desktop Vulkan, main instance with a window; GODOT_SUBMIT_THREAD=0 disables it):
+	// swap_buffers() hands the recorded frame over and begins the next one while this thread submits and presents it.
+	// Anything else that uses the main queue or a swap chain first waits for it to be idle (_submit_thread_drain()), and
+	// a frame slot is reused only once its submission is done (_stall_for_frame()).
+	struct SubmitJob {
+		uint32_t frame = 0;
+		bool present = false;
+		uint64_t frame_token = 0; // Streamline token of the frame, for its present markers.
+	};
+	bool submit_thread_enabled = false;
+	Thread submit_thread;
+	BinaryMutex submit_mutex;
+	ConditionVariable submit_condition; // A job was pushed, or the thread must exit.
+	ConditionVariable submit_done_condition; // A job is done.
+	LocalVector<SubmitJob> submit_jobs; // FIFO.
+	uint64_t submit_jobs_pushed = 0;
+	uint64_t submit_jobs_done = 0;
+	bool submit_thread_exit = false;
+	LocalVector<uint64_t> submit_frame_job; // Per frame slot: the number of the job that submits it.
+
+	static void _submit_thread_func(void *p_userdata);
+	void _submit_thread_wait(uint64_t p_job);
+	static uint64_t _get_render_frame_token(); // Streamline's frame token of the frame being recorded, 0 without it.
+	void _submit_thread_drain();
+
+	// Replay thread (with the submission thread; GODOT_RD_REPLAY_THREAD=0 disables it): swap_buffers()
+	// hands the recorded frame over and the render thread begins recording the next one into the other graph, while
+	// this thread replays the recorded graph into the slot's command buffers (RenderingDeviceGraph::end()) and passes
+	// the frame on to the submission thread. Its jobs are numbered with the submission jobs (submit_jobs_pushed): job n
+	// is done once its frame is submitted and presented, so _submit_thread_wait()/_submit_thread_drain() cover both
+	// threads. Each replay waits for the previous frame's submission: DLSS-G wants frame N+1's tags after Present(N).
+	struct ReplayJob {
+		uint32_t frame = 0;
+		RenderingDeviceGraph *graph = nullptr;
+		bool present = false;
+		uint64_t frame_token = 0;
+		uint64_t id = 0;
+	};
+	bool replay_thread_enabled = false;
+	Thread replay_thread;
+	ConditionVariable replay_condition; // A job was pushed, or the thread must exit (under submit_mutex).
+	LocalVector<ReplayJob> replay_jobs; // FIFO, under submit_mutex.
+	bool replay_thread_exit = false;
+	uint64_t draw_graph_job[2] = {}; // The last job that replays each of draw_graphs.
+	// Stats (GODOT_RD_STATS), written by the replay thread.
+	SafeNumeric<uint64_t> replay_thread_usec;
+	SafeNumeric<uint64_t> replay_thread_wait_usec; // Waiting for the previous frame's submission.
+	SafeNumeric<uint64_t> replay_thread_replays;
+
+	static void _replay_thread_func(void *p_userdata);
+
+	// Where the render thread's time goes around the graph, and every synchronization with the GPU (RD-REPLAY-THREAD-STUDY.md,
+	// step 0). Main instance only; GODOT_RD_STATS=1 (or GODOT_PARALLEL_DRAW_LISTS_STATS=1) prints it every 240 frames.
+	// A frame runs from one RenderingServer draw (frame_stats_draw_begin()) to the end of its swap_buffers().
+	struct FrameStats {
+		bool enabled = false;
+		uint32_t frames = 0;
+		uint64_t draw_begin_usec = 0; // Of the frame being recorded.
+		uint64_t last_swap_end_usec = 0;
+		uint64_t recording_usec = 0; // Draw begin to swap_buffers(): culling, list building, recording.
+		uint64_t end_frame_usec = 0; // _end_frame(): transfer workers, graph replay, command buffer end.
+		uint64_t hand_off_usec = 0; // Submit job pushed, or _execute_frame() without the submission thread.
+		uint64_t begin_frame_usec = 0; // _begin_frame(), the slot stall included.
+		uint64_t slot_wait_usec = 0; // Waiting in _begin_frame()'s _stall_for_frame() for the slot's submission and fence.
+		bool in_begin_frame = false;
+		uint64_t between_frames_usec = 0; // swap_buffers() end to the next draw: other commands, or idle.
+		uint64_t screen_drain_usec = 0; // screen_prepare_for_drawing() waiting for the submission thread.
+		uint32_t flushes = 0; // _flush_and_stall_for_all_frames().
+		uint64_t flush_usec = 0;
+		uint32_t staging_stalls = 0; // Staging rings full: STALL_PREVIOUS.
+		uint64_t staging_stall_usec = 0;
+		HashMap<String, uint32_t> sync_callers; // "kind <- caller": count, over the 240 frames.
+	} frame_stats;
+	void _frame_stats_sync(const char *p_kind, const char *p_caller, uint64_t p_usec);
+	void _frame_stats_print();
+
+public:
+	// Marks the start of a RenderingServer draw for the frame stats (cheap no-op when they are off).
+	void frame_stats_draw_begin();
+
+private:
+
 protected:
 	static void _bind_methods();
 
@@ -115,6 +198,7 @@ public:
 		ID_TYPE_DRAW_LIST,
 		ID_TYPE_COMPUTE_LIST = 4,
 		ID_TYPE_RAYTRACING_LIST = 5,
+		ID_TYPE_SPLIT_DRAW_LIST = 6,
 		ID_TYPE_MAX,
 		ID_BASE_SHIFT = 58, // 5 bits for ID types.
 		ID_MASK = (ID_BASE_SHIFT - 1),
@@ -177,7 +261,7 @@ private:
 	};
 
 	Error _staging_buffer_allocate(StagingBuffers &p_staging_buffers, uint32_t p_amount, uint32_t p_required_align, uint32_t &r_alloc_offset, uint32_t &r_alloc_size, StagingRequiredAction &r_required_action, bool p_can_segment = true);
-	void _staging_buffer_execute_required_action(StagingBuffers &p_staging_buffers, StagingRequiredAction p_required_action);
+	void _staging_buffer_execute_required_action(StagingBuffers &p_staging_buffers, StagingRequiredAction p_required_action, const char *p_caller = "");
 	Error _insert_staging_block(StagingBuffers &p_staging_buffers);
 
 	StagingBuffers upload_staging_buffers;
@@ -711,8 +795,10 @@ public:
 	FramebufferFormatID framebuffer_format_create_empty(TextureSamples p_samples = TEXTURE_SAMPLES_1);
 	TextureSamples framebuffer_format_get_texture_samples(FramebufferFormatID p_format, uint32_t p_pass = 0);
 
-	RID framebuffer_create(const Vector<RID> &p_texture_attachments, FramebufferFormatID p_format_check = INVALID_ID, uint32_t p_view_count = 1);
-	RID framebuffer_create_multipass(const Vector<RID> &p_texture_attachments, const Vector<FramebufferPass> &p_passes, FramebufferFormatID p_format_check = INVALID_ID, uint32_t p_view_count = 1);
+	// p_layers > 1 (needs SUPPORTS_SHADER_OUTPUT_LAYER, one view): a layered framebuffer, every attachment that many
+	// layers, the vertex shader choosing one with gl_Layer.
+	RID framebuffer_create(const Vector<RID> &p_texture_attachments, FramebufferFormatID p_format_check = INVALID_ID, uint32_t p_view_count = 1, uint32_t p_layers = 1);
+	RID framebuffer_create_multipass(const Vector<RID> &p_texture_attachments, const Vector<FramebufferPass> &p_passes, FramebufferFormatID p_format_check = INVALID_ID, uint32_t p_view_count = 1, uint32_t p_layers = 1);
 	RID framebuffer_create_empty(const Size2i &p_size, TextureSamples p_samples = TEXTURE_SAMPLES_1, FramebufferFormatID p_format_check = INVALID_ID);
 	bool framebuffer_is_valid(RID p_framebuffer) const;
 	void framebuffer_set_invalidation_callback(RID p_framebuffer, InvalidationCallback p_callback, void *p_userdata);
@@ -827,6 +913,7 @@ private:
 		Vector<RDD::BufferID> buffers; // Not owned, just referenced.
 		Vector<RDG::ResourceTracker *> draw_trackers; // Not owned, just referenced.
 		Vector<uint64_t> offsets;
+		bool has_dynamic_buffers = false; // Any created with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT.
 		Vector<int32_t> transfer_worker_indices;
 		Vector<uint64_t> transfer_worker_operations;
 		HashSet<RID> untracked_buffers;
@@ -1166,6 +1253,7 @@ private:
 		};
 
 		LocalVector<AttachableTexture> attachable_textures; // Used for validation.
+		bool has_dynamic_buffers = false; // Any UNIFORM_TYPE_*_BUFFER_DYNAMIC uniform.
 		Vector<RDG::ResourceTracker *> draw_trackers;
 		Vector<RDG::ResourceUsage> draw_trackers_usage;
 		HashMap<RID, RDG::ResourceUsage> untracked_usage;
@@ -1541,6 +1629,35 @@ private:
 
 	LocalVector<RID> draw_list_bound_textures;
 
+	// A part of the active draw list recorded on another thread (draw_list_split_begin()). What the recording would
+	// change outside the split's own state is kept aside and done in order by draw_list_split_end().
+	struct DrawListSplit {
+		DrawList draw_list;
+		RDG::DrawListSplit graph;
+		LocalVector<UniformSet *> uniform_sets_to_update;
+		LocalVector<Buffer *> transfer_buffers;
+		LocalVector<VertexArray *> transfer_vertex_arrays;
+		LocalVector<IndexArray *> transfer_index_arrays;
+#ifdef DEBUG_ENABLED
+		FramebufferFormatID framebuffer_format = INVALID_ID; // The format its pipelines are validated against.
+#endif
+	};
+
+	LocalVector<DrawListSplit> draw_list_splits;
+	uint32_t draw_list_split_count = 0;
+	uint32_t draw_list_split_base = 0; // The splits in use: [base, base + count).
+	uint32_t draw_list_splits_used = 0; // Splits whose instructions the open draw list still references, until it ends.
+	uint32_t draw_list_splits_detached = 0; // Splits recorded ahead of their draw lists: [0, detached), see draw_list_split_detached_begin().
+
+	void _draw_list_split_merge(DrawListSplit &p_split);
+
+	DrawList *_get_draw_list(DrawListID p_list, DrawListSplit *&r_split);
+	_FORCE_INLINE_ bool _is_split_draw_list(DrawListID p_list) const { return (p_list >> ID_BASE_SHIFT) == ID_TYPE_SPLIT_DRAW_LIST; }
+	void _draw_list_uniform_set_bound(DrawListSplit *p_split, UniformSet *p_uniform_set);
+	void _draw_list_check_transfer_worker_buffer(DrawListSplit *p_split, Buffer *p_buffer);
+	void _draw_list_check_transfer_worker_vertex_array(DrawListSplit *p_split, VertexArray *p_vertex_array);
+	void _draw_list_check_transfer_worker_index_array(DrawListSplit *p_split, IndexArray *p_index_array);
+
 	void _draw_list_start(const Rect2i &p_viewport);
 	void _draw_list_end(Rect2i *r_last_viewport = nullptr);
 
@@ -1605,6 +1722,20 @@ public:
 	DrawListID draw_list_switch_to_next_pass();
 
 	void draw_list_end();
+
+	// Splits the active draw list in p_count parts that other threads may record at the same time, each with the
+	// DrawListID it gets in r_split_ids and the usual draw_list_*() functions. Each part starts with nothing bound.
+	// draw_list_split_end(), on the render thread once every part is recorded, appends them to the draw list in order.
+	void draw_list_split_begin(uint32_t p_count, DrawListID *r_split_ids);
+	void draw_list_split_end();
+
+	// p_count splits recorded before the draw lists that will hold them exist, by other threads as above: split i for a
+	// draw list on a framebuffer of format p_formats[i] whose viewport is p_viewports[i]. Each draw list, once begun on
+	// the render thread, takes its split with draw_list_split_append(). draw_list_split_detached_end() releases them
+	// all, when no draw list is open any more.
+	void draw_list_split_detached_begin(uint32_t p_count, const Rect2i *p_viewports, const FramebufferFormatID *p_formats, DrawListID *r_split_ids);
+	void draw_list_split_append(DrawListID p_split);
+	void draw_list_split_detached_end();
 
 private:
 	/**************************/
@@ -1769,7 +1900,10 @@ private:
 	void _check_transfer_worker_vertex_array(VertexArray *p_vertex_array);
 	void _check_transfer_worker_index_array(IndexArray *p_index_array);
 	void _submit_transfer_workers(RDD::CommandBufferID p_draw_command_buffer = RDD::CommandBufferID());
-	void _submit_transfer_barriers(RDD::CommandBufferID p_draw_command_buffer);
+	void _take_transfer_barriers(uint32_t p_frame);
+	// The replay of a recorded frame: the transfer barriers, the graph, the end of its command buffer. Reads nothing
+	// but that frame's slot and graph (RD-REPLAY-THREAD-STUDY.md, step 1b).
+	void _replay_frame(uint32_t p_frame, RenderingDeviceGraph *p_graph);
 	void _wait_for_transfer_workers();
 	void _free_transfer_workers();
 
@@ -1787,7 +1921,10 @@ private:
 	bool _dependencies_make_mutable_recursive(RID p_id, RDG::ResourceTracker *p_resource_tracker);
 	bool _dependencies_make_mutable(RID p_id, RDG::ResourceTracker *p_resource_tracker);
 
-	RenderingDeviceGraph draw_graph;
+	// Two graphs: the next frame is recorded into one while the other is replayed (RD-REPLAY-THREAD-STUDY.md, step 1d).
+	// draw_graph is the one being recorded, swapped by swap_buffers().
+	RenderingDeviceGraph draw_graphs[2];
+	RenderingDeviceGraph *draw_graph = &draw_graphs[0];
 
 	/**************************/
 	/**** QUEUE MANAGEMENT ****/
@@ -1819,6 +1956,10 @@ private:
 	// when the frame is cycled.
 
 	struct Frame {
+		// The transfer workers' texture barriers this frame's commands start with, taken when its recording ends and
+		// recorded by its replay (_replay_frame()), which may run on another thread.
+		LocalVector<RDD::TextureBarrier> transfer_texture_barriers;
+
 		// List in usage order, from last to free to first to free.
 		List<Buffer> buffers_to_dispose_of;
 		List<Texture> textures_to_dispose_of;
@@ -1854,6 +1995,9 @@ private:
 		// Signaled by the command buffer submission. Must wait on this fence before beginning command recording for the frame.
 		RDD::FenceID fence;
 		bool fence_signaled = false;
+		// vsync/submit_after_previous_frame with the submission thread: that thread already waited on the fence (and
+		// reset it) before submitting the next frame.
+		bool fence_waited = false;
 
 		// Semaphores the frame must wait on before executing the command buffer.
 		LocalVector<RDD::SemaphoreID> semaphores_to_wait_on;
@@ -1909,7 +2053,7 @@ private:
 	SafeNumeric<uint64_t> buffer_memory;
 
 protected:
-	void execute_chained_cmds(bool p_present_swap_chain,
+	void execute_chained_cmds(uint32_t p_frame, bool p_present_swap_chain,
 			RenderingDeviceDriver::FenceID p_draw_fence,
 			RenderingDeviceDriver::SemaphoreID p_dst_draw_semaphore_to_signal);
 
@@ -1917,10 +2061,16 @@ public:
 	void _free_internal(RID p_id);
 	void _begin_frame(bool p_presented = false);
 	void _end_frame();
+	void _end_frame_recording();
+	// Waits until every frame swap_buffers() handed over is replayed, submitted and presented (replay and submission
+	// threads); nothing is replayed or submitted by it. For code that must order itself after those frames' driver
+	// callbacks, like the DLSS context destruction turning DLSS-G off.
+	void wait_for_frame_threads();
 	void _execute_frame(bool p_present);
+	void _execute_frame_slot(uint32_t p_frame, bool p_present);
 	void _stall_for_frame(uint32_t p_frame);
 	void _stall_for_previous_frames();
-	void _flush_and_stall_for_all_frames(bool p_begin_frame = true);
+	void _flush_and_stall_for_all_frames(bool p_begin_frame = true, const char *p_caller = "");
 
 	template <typename T>
 	void _free_rids(T &p_owner, const char *p_type);
