@@ -16,6 +16,13 @@
 //   materials[], CustomMaterialUniforms, scene_data_block
 
 MaterialData rt_mat = materials[rt_geometry_idx];
+// The raygen passes the distance of the opaque surface behind a front layer hit in the payload (rt_depth_buffer_value()).
+if (is_front_layer_ray(payload.packed_bounces_flags) && payload.hit_t > 0.0 && payload.hit_t < 10000.0) {
+	vec3 rt_behind_world = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * payload.hit_t;
+	vec3 rt_behind_view = (transpose(mat4(scene_data_block.data.view_matrix[0], scene_data_block.data.view_matrix[1], scene_data_block.data.view_matrix[2], vec4(0.0, 0.0, 0.0, 1.0))) * vec4(rt_behind_world, 1.0)).xyz;
+	vec4 rt_behind_clip = scene_data_block.data.projection_matrix * vec4(rt_behind_view, 1.0);
+	rt_behind_depth = rt_behind_clip.z / rt_behind_clip.w;
+}
 material = CustomMaterialUniforms(rt_mat.uniform_address);
 rt_instance_uniforms_ofs = rt_mat.instance_uniforms_ofs;
 

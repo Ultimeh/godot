@@ -105,6 +105,14 @@ vec3 rt_hit_bary_ddx = vec3(0.0);
 vec3 rt_hit_bary_ddy = vec3(0.0);
 bool rt_derivatives_ready = false;
 
+// DEPTH_TEXTURE as raster reads it at this pixel. For a front layer ray (a transparent surface's reflection) it is the
+// opaque surface behind, which the raygen traced: material code that measures the water's depth, foam or shore from it
+// works as in raster. Elsewhere there is nothing behind: the far plane (0, reverse Z).
+float rt_behind_depth = 0.0;
+float rt_depth_buffer_value() {
+	return rt_behind_depth;
+}
+
 // Screen/depth textures are unavailable in RT -- alias to bindless slot 0
 // so shaders that reference them still compile (reads return dummy values).
 #define depth_buffer bindless_textures[0]

@@ -491,6 +491,48 @@ static String _apply_varying_code(const String &p_template, const Vector<ShaderC
 	return p_template.replace("/* RT_CUSTOM_VARYING_STORAGE */", storage).replace("/* RT_CUSTOM_VARYING_SAVE */", save).replace("/* RT_CUSTOM_VARYING_BLEND */", blend).replace("/* RT_CUSTOM_VARYING_PUSH */", push).replace("/* RT_CUSTOM_VARYING_POP */", pop);
 }
 
+// The hit shaders have no depth texture: every read of DEPTH_TEXTURE (any texture function on depth_buffer) becomes
+// rt_depth_buffer_value(), the depth raster would read at this pixel (raytracing_custom_globals_inc.glsl).
+static String _depth_buffer_reads(const String &p_code) {
+	static const char *functions[] = { "textureGrad(", "textureLod(", "texelFetch(", "texture(" };
+	String result = p_code;
+	int from = 0;
+	while (true) {
+		const int sampler = result.find("sampler2D(depth_buffer", from);
+		if (sampler < 0) {
+			break;
+		}
+		int start = -1;
+		for (const char *function : functions) {
+			const int length = String(function).length();
+			if (sampler >= length && result.substr(sampler - length, length) == function) {
+				start = sampler - length;
+				break;
+			}
+		}
+		if (start < 0) {
+			from = sampler + 1;
+			continue;
+		}
+		// The end of the call.
+		int depth = 0;
+		int i = result.find("(", start);
+		for (; i < result.length(); i++) {
+			if (result[i] == '(') {
+				depth++;
+			} else if (result[i] == ')' && --depth == 0) {
+				break;
+			}
+		}
+		if (i >= result.length()) {
+			break;
+		}
+		result = result.substr(0, start) + "vec4(rt_depth_buffer_value())" + result.substr(i + 1);
+		from = start;
+	}
+	return result;
+}
+
 // Ray tracing stages read mip 0 with texture(): its calls in fragment code become textureGrad() with the screen
 // derivatives of the coordinates (dFdx() is defined by the hit shaders). Shadow and other samplers are left as they are.
 static String _texture_calls_with_gradients(const String &p_code) {
@@ -763,9 +805,9 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 		}
 	}
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
-	r_entry.fragment_code = _texture_calls_with_gradients(gen_code.code.has("fragment") ? gen_code.code["fragment"] : String());
+	r_entry.fragment_code = _texture_calls_with_gradients(_depth_buffer_reads(gen_code.code.has("fragment") ? gen_code.code["fragment"] : String()));
 	// The functions vertex() calls too: their derivatives are 0 there, raster's vertex() reads mip 0 as well.
-	r_entry.fragment_globals = _texture_calls_with_gradients(gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
+	r_entry.fragment_globals = _texture_calls_with_gradients(_depth_buffer_reads(gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]));
 	if (p_is_procedural) {
 		r_entry.intersection_code = gen_code.code.has("intersection") ? gen_code.code["intersection"] : String();
 		r_entry.intersection_globals = gen_code.stage_globals[ShaderCompiler::STAGE_INTERSECTION];

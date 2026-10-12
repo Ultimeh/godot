@@ -499,11 +499,15 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		front_mat.emissive = vec3(0.0);
 		front_mat.transmissivness = 0.0;
 		front_mat.opacity = 1.0;
+		// The material's normal as raster reflects on it: clamping it toward the faceted geometry at grazing angles
+		// would reflect the triangles of a displaced surface (waves) instead of its smooth normal.
 		vec3 front_dir;
 		vec3 front_weight;
-		if (!evalIndirectCombinedBRDF(rand2(ps.rng_state), N, h.geometry_normal, V, front_mat, SPECULAR_TYPE, front_dir, front_weight, vec4(0.0)) || dot(front_dir, h.geometry_normal) <= 0.0) {
-			front_dir = reflect(-V, h.geometry_normal);
+		if (!evalIndirectCombinedBRDF(rand2(ps.rng_state), m.normal, m.normal, V, front_mat, SPECULAR_TYPE, front_dir, front_weight, vec4(0.0))) {
+			front_dir = reflect(-V, m.normal);
 		}
+		// Below the surface, the ray would cross it: mirror it back above.
+		front_dir -= 2.0 * min(dot(front_dir, h.geometry_normal), 0.0) * h.geometry_normal;
 		ps.hit_t = gl_HitTEXT;
 		ps.offset_normal = h.geometry_normal;
 		ps.next_ray_dir = front_dir;

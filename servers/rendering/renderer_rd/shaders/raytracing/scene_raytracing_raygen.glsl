@@ -115,7 +115,7 @@ void main() {
 		fs.throughput = vec3(1.0);
 		fs.packed_bounces_flags = set_front_layer_ray(0u);
 		fs.rng_state = init_rng(pixel, frame_index, samples_per_pixel);
-		fs.hit_t = 0.0;
+		fs.hit_t = opaque_t; // Read by the hit shaders as DEPTH_TEXTURE (rt_depth_buffer_value()).
 		fs.offset_normal = vec3(0.0, 0.0, 1.0);
 		fs.next_ray_dir = vec3(0.0, 0.0, 1.0);
 		path_pack(payload, fs);
@@ -128,11 +128,11 @@ void main() {
 			PathState rs;
 			rs.radiance = vec3(0.0);
 			rs.throughput = vec3(1.0);
-			rs.packed_bounces_flags = pack_bounces(1u, 0u);
+			rs.packed_bounces_flags = pack_bounces(0u, 0u); // As deep as a camera path; not sample zero: no primary writes.
 			rs.rng_state = fs.rng_state;
 			vec3 ray_origin = offset_ray_origin(origin.xyz + direction.xyz * fs.hit_t, fs.offset_normal);
 			vec3 ray_dir = fs.next_ray_dir;
-			[[dont_unroll]] for (uint bounce = 1u; bounce <= max_bounces; bounce++) {
+			[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
 				path_pack(payload, rs);
 				traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 				rs = path_unpack(payload);
@@ -456,12 +456,17 @@ void main() {
 		m.normal = h.geometry_normal; // Material code can leave NaN normals (screen derivatives are zero here).
 	}
 
-	// Apply normal map if it was written.
+	// NORMAL_MAP as raster applies it: in the fragment's own TANGENT, BINORMAL and NORMAL, which a material can compute
+	// itself (Terrain3D derives them from its heightmap; the mesh's tangent frame would turn its relief inside out).
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
 		vec3 ts_normal;
 		ts_normal.xy = normal_map.xy * 2.0 - 1.0;
 		ts_normal.z = sqrt(max(0.0, 1.0 - dot(ts_normal.xy, ts_normal.xy)));
-		m.normal = apply_normal_map(h, ts_normal, normal_map_depth);
+		vec3 mapped = normalize(mix(normal, tangent * ts_normal.x + binormal * ts_normal.y + normal * ts_normal.z, normal_map_depth));
+		m.normal = normalize(mat3(inv_view_matrix) * mapped);
+		if (any(isnan(m.normal))) {
+			m.normal = h.geometry_normal;
+		}
 	}
 
 #ifdef RT_DEBUG_ENABLED
