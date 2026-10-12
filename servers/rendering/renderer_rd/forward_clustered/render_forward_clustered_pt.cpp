@@ -372,6 +372,20 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		raytracing->copy_output_texture(p_render_data);
 	}
 
+	// The sky where the camera rays missed (their depth is the far plane), drawn as raster draws it: the miss shader only
+	// reads the radiance octmap, far too coarse for a background (a sky shader's stars become a grid of blotches).
+	if (draw_sky || draw_sky_fog_only) {
+		RENDER_TIMESTAMP("Render Sky");
+
+		RD::get_singleton()->draw_command_begin_label("Draw Sky");
+		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(color_only_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0u, p_render_data->render_region);
+
+		sky.draw_sky(draw_list, rb, p_render_data->environment, color_only_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier);
+
+		RD::get_singleton()->draw_list_end();
+		RD::get_singleton()->draw_command_end_label();
+	}
+
 	{
 		// RT output is already in internal_texture, so the color MSAA resolve is
 		// skipped; only depth is resolved for compositor effects that need it.
