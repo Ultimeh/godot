@@ -40,10 +40,17 @@ global_time = scene_data_block.data.time;
 
 mat4 rt_world_to_object_decomp = rt_aabb_xform * mat4(gl_WorldToObjectEXT);
 
+#ifdef VERTEX_WORLD_COORDS_USED
+vertex = rt_hit_pos;
+normal = rt_normal;
+tangent = rt_tangent;
+binormal = rt_bitangent;
+#else
 vertex = (rt_world_to_object_decomp * vec4(rt_hit_pos, 1.0)).xyz;
 normal = mat3(rt_world_to_object_decomp) * rt_normal;
 tangent = mat3(rt_world_to_object_decomp) * rt_tangent;
 binormal = mat3(rt_world_to_object_decomp) * rt_bitangent;
+#endif
 uv_interp = rt_uv;
 uv2_interp = rt_uv;
 color_interp = rt_color;
@@ -52,15 +59,29 @@ rt_front_facing = rt_front_face;
 rt_screen_uv = vec2(gl_LaunchIDEXT.xy) / vec2(gl_LaunchSizeEXT.xy);
 rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 
+rt_modelview_matrix = rt_view_matrix * read_model_matrix;
+rt_modelview_normal_matrix = mat3(rt_modelview_matrix);
+
 // Run vertex shader (computes varyings, may modify built-ins).
 /* RT_CUSTOM_VERTEX_CALL */
+if (any(isnan(vertex))) {
+	RT_CUSTOM_REMOVED_POINT
+}
 
-// Post-vertex transform: object-space -> view-space (mirrors rasterizer post-vertex).
-mat4 rt_modelview = rt_view_matrix * read_model_matrix;
-vertex = (rt_modelview * vec4(vertex, 1.0)).xyz;
-normal = normalize(mat3(rt_modelview) * normal);
-tangent = normalize(mat3(rt_modelview) * tangent);
-binormal = normalize(mat3(rt_modelview) * binormal);
+// Post-vertex transform to view space, as the rasterizer does.
+#if defined(SKIP_TRANSFORM_USED)
+// vertex() already wrote view-space values.
+#elif defined(VERTEX_WORLD_COORDS_USED)
+vertex = (rt_view_matrix * vec4(vertex, 1.0)).xyz;
+normal = normalize(mat3(rt_view_matrix) * normal);
+tangent = normalize(mat3(rt_view_matrix) * tangent);
+binormal = normalize(mat3(rt_view_matrix) * binormal);
+#else
+vertex = (rt_modelview_matrix * vec4(vertex, 1.0)).xyz;
+normal = normalize(rt_modelview_normal_matrix * normal);
+tangent = normalize(mat3(rt_modelview_matrix) * tangent);
+binormal = normalize(mat3(rt_modelview_matrix) * binormal);
+#endif
 
 // Fragment outputs with sensible defaults.
 vec3 albedo = vec3(1.0);

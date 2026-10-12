@@ -46,6 +46,10 @@ namespace RendererRD {
 
 class MaterialStorage : public RendererMaterialStorage {
 public:
+	// Writes one regular material uniform as material uniform buffers lay it out (std140, arrays padded to 16 bytes per
+	// element): p_value if given, else the shader's default, else zero (identity for matrices, opaque black for colors).
+	static void fill_std140_uniform(const ShaderLanguage::ShaderNode::Uniform &p_uniform, const Variant *p_value, uint8_t *r_data, bool p_use_linear_color);
+
 	enum ShaderType {
 		SHADER_TYPE_2D,
 		SHADER_TYPE_3D,

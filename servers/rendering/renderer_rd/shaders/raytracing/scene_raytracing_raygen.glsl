@@ -286,6 +286,7 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 layout(location = 0) rayPayloadInEXT PathPayload payload;
 
 layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+layout(set = 2, binding = 0) uniform texture2DArray bindless_texture_arrays[];
 
 #include "raytracing_samplers_inc.glsl"
 
@@ -357,6 +358,10 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 // ============================================================================
 void main() {
 	HitData h = compute_hit_data();
+	// Every variant indexes the texture array table dynamically, so the descriptor stays unbounded in each layout.
+	if (h.geometry_idx == 0xFFFFFFFFu) {
+		h.hit_pos.x += textureLod(sampler2DArray(bindless_texture_arrays[nonuniformEXT(h.geometry_idx)], SAMPLER_LINEAR_REPEAT), vec3(0.0), 0.0).r;
+	}
 	write_primary_hit_depth(h.hit_pos);
 	write_primary_hit_velocity(h.hit_pos);
 
@@ -370,6 +375,16 @@ void main() {
 	vec3 rt_bitangent = h.bitangent;
 	bool rt_front_face = h.is_front_face;
 
+	// A point vertex() removed (NaN position) lets the ray pass through, as raster draws nothing there.
+#define RT_CUSTOM_REMOVED_POINT                             \
+	{                                                       \
+		PathState removed_ps = path_unpack(payload);        \
+		removed_ps.hit_t = gl_HitTEXT;                      \
+		removed_ps.offset_normal = gl_WorldRayDirectionEXT; \
+		removed_ps.next_ray_dir = gl_WorldRayDirectionEXT;  \
+		path_pack(payload, removed_ps);                     \
+		return;                                             \
+	}
 #include "raytracing_custom_fragment_inc.glsl"
 
 	// Build MaterialResult from fragment outputs.
@@ -381,6 +396,9 @@ void main() {
 	m.specular = specular;
 	m.emissive = emission * scene_data_block.data.emissive_exposure_normalization;
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
+	if (any(isnan(m.normal))) {
+		m.normal = h.geometry_normal; // Material code can leave NaN normals (screen derivatives are zero here).
+	}
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -502,6 +520,7 @@ layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
 // clang-format on
 
 layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+layout(set = 2, binding = 0) uniform texture2DArray bindless_texture_arrays[];
 
 #include "raytracing_samplers_inc.glsl"
 
@@ -521,6 +540,9 @@ layout(set = 0, binding = 32, std430) readonly buffer MotionTransforms {
 void main() {
 	uint geometry_idx = gl_InstanceCustomIndexEXT;
 	GeometryData geom = geometries[geometry_idx];
+	if (geometry_idx == 0xFFFFFFFFu && textureLod(sampler2DArray(bindless_texture_arrays[nonuniformEXT(geometry_idx)], SAMPLER_LINEAR_REPEAT), vec3(0.0), 0.0).r > 0.0) {
+		ignoreIntersectionEXT;
+	}
 
 	uint i0, i1, i2;
 	get_triangle_indices(geom, i0, i1, i2);
@@ -550,6 +572,7 @@ void main() {
 	vec3 rt_hit_pos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 	vec4 rt_color = fetch_color(geom, i0, i1, i2, bary);
 
+#define RT_CUSTOM_REMOVED_POINT ignoreIntersectionEXT;
 #include "raytracing_custom_fragment_inc.glsl"
 
 	if (alpha_scissor_threshold > 0.0 && alpha < alpha_scissor_threshold) {
@@ -621,6 +644,7 @@ layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
 // clang-format on
 
 layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+layout(set = 2, binding = 0) uniform texture2DArray bindless_texture_arrays[];
 
 #include "raytracing_samplers_inc.glsl"
 
@@ -651,6 +675,9 @@ uint64_t _rt_material_address;
 #endif
 
 void main() {
+	if (gl_InstanceCustomIndexEXT == -1 && textureLod(sampler2DArray(bindless_texture_arrays[nonuniformEXT(0)], SAMPLER_LINEAR_REPEAT), vec3(0.0), 0.0).r > 0.0) {
+		return;
+	}
 #ifdef RT_CUSTOM_HIT_GROUP
 	// Writable outputs.
 	vec2 m_HIT_UV = vec2(0.0);

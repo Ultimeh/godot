@@ -415,8 +415,50 @@ struct SceneShaderRaytracing::PipelineBuildTask {
 	WorkerThreadPool::TaskID worker_id = WorkerThreadPool::INVALID_TASK_ID;
 };
 
+// The identifier ShaderCompiler gives a uniform ("__" is reserved in GLSL).
+static String _uniform_identifier(const String &p_name) {
+	return ("m_" + p_name.replace("__", "_dus_")).replace("__", "_dus_");
+}
+
+// Clamps every index of the material uniform array p_member in p_code. Raster reads material uniforms from a uniform
+// buffer, where an out-of-bounds index is harmless (Terrain3D reads its region map that way); here they are read by
+// device address, where it faults.
+static String _clamp_uniform_array_indices(const String &p_code, const String &p_member, int p_size) {
+	const String access = "material." + p_member + "[";
+	String result;
+	int from = 0;
+	while (true) {
+		const int start = p_code.find(access, from);
+		if (start < 0) {
+			result += p_code.substr(from);
+			break;
+		}
+		const int index_begin = start + access.length();
+		int depth = 1;
+		int index_end = index_begin;
+		while (index_end < p_code.length() && depth > 0) {
+			const char32_t c = p_code[index_end];
+			if (c == '[') {
+				depth++;
+			} else if (c == ']') {
+				depth--;
+			}
+			index_end++;
+		}
+		if (depth != 0) {
+			result += p_code.substr(from);
+			break;
+		}
+		const String index = p_code.substr(index_begin, index_end - 1 - index_begin);
+		result += p_code.substr(from, index_begin - from);
+		result += "clamp(int(" + _clamp_uniform_array_indices(index, p_member, p_size) + "), 0, " + itos(p_size - 1) + ")]";
+		from = index_end;
+	}
+	return result;
+}
+
 void SceneShaderRaytracing::_strip_texture_globals(String &r_globals, const String &p_tex_name) {
-	const String decl_marker = " m_" + p_tex_name + ";";
+	const String decl_marker = " " + _uniform_identifier(p_tex_name) + ";";
 	int pos = r_globals.find(decl_marker);
 	if (pos < 0) {
 		return;
@@ -432,7 +474,7 @@ void SceneShaderRaytracing::_strip_texture_globals(String &r_globals, const Stri
 	r_globals = r_globals.substr(0, line_start) + r_globals.substr(line_end);
 }
 
-void SceneShaderRaytracing::_finalize_uniforms_with_textures(
+bool SceneShaderRaytracing::_finalize_uniforms_with_textures(
 		CustomShaderEntry &r_entry,
 		const ShaderCompiler::GeneratedCode &p_gen_code,
 		const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms,
@@ -446,7 +488,18 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 		if (ShaderLanguage::is_sampler_type(uu.type) || uu.order < 0 || uu.order >= (int)p_gen_code.uniform_offsets.size()) {
 			continue;
 		}
-		uint32_t end = p_gen_code.uniform_offsets[uu.order] + ShaderLanguage::get_datatype_size(uu.type);
+		// Sizes as ShaderCompiler lays them out: a global is an index, an array is padded to 16 bytes per element.
+		uint32_t size = ShaderLanguage::get_datatype_size(uu.type);
+		if (uu.scope == ShaderLanguage::ShaderNode::Uniform::SCOPE_GLOBAL) {
+			size = ShaderLanguage::get_datatype_size(ShaderLanguage::TYPE_UINT);
+		} else if (uu.array_size > 0) {
+			const uint32_t padded = 16 * uu.array_size;
+			size *= uu.array_size;
+			if (size % padded != 0) {
+				size += padded - (size % padded);
+			}
+		}
+		uint32_t end = p_gen_code.uniform_offsets[uu.order] + size;
 		if (end > raw_uniform_end) {
 			raw_uniform_end = end;
 		}
@@ -456,6 +509,11 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 		const ShaderCompiler::GeneratedCode::Texture &tex = p_gen_code.texture_uniforms[ti];
 		if (tex.name.is_empty()) {
 			continue;
+		}
+		// The bindless tables hold float 2D textures and 2D texture arrays.
+		if ((tex.type != ShaderLanguage::TYPE_SAMPLER2D && tex.type != ShaderLanguage::TYPE_SAMPLER2DARRAY) || tex.array_size > 0) {
+			WARN_PRINT(vformat("RT: texture uniform '%s' has a type path tracing cannot bind; the material falls back to the default.", tex.name));
+			return false;
 		}
 
 		_strip_texture_globals(r_entry.fragment_globals, tex.name);
@@ -474,6 +532,7 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 		tui.hint = tex.hint;
 		tui.use_color = tex.use_color;
 		tui.is_global = tex.global;
+		tui.is_array = tex.type == ShaderLanguage::TYPE_SAMPLER2DARRAY;
 		tui.buffer_offset = offset;
 		r_entry.texture_uniforms.push_back(tui);
 
@@ -485,7 +544,7 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 			}
 		}
 
-		r_entry.uniform_members += "uint m_" + tex.name + ";\n";
+		r_entry.uniform_members += "uint " + _uniform_identifier(tex.name) + ";\n";
 		raw_uniform_end = offset + 4;
 	}
 
@@ -493,6 +552,7 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 	if (r_entry.uniform_total_size % 16 != 0) {
 		r_entry.uniform_total_size += 16 - (r_entry.uniform_total_size % 16);
 	}
+	return true;
 }
 
 // Slot table: append-only by 128-bit source hash (stable across reloads).
@@ -592,6 +652,11 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 
 	r_entry.is_procedural = p_is_procedural;
 	r_entry.uses_alpha_clip = detected_alpha_clip;
+	for (const String &define : gen_code.defines) {
+		if (define.contains("SKIP_TRANSFORM_USED") || define.contains("VERTEX_WORLD_COORDS_USED")) {
+			r_entry.defines += define;
+		}
+	}
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
 	r_entry.fragment_globals = gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT];
@@ -599,12 +664,22 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 		r_entry.intersection_code = gen_code.code.has("intersection") ? gen_code.code["intersection"] : String();
 		r_entry.intersection_globals = gen_code.stage_globals[ShaderCompiler::STAGE_INTERSECTION];
 	}
+	for (const KeyValue<StringName, ShaderLanguage::ShaderNode::Uniform> &kv : uniform_sink) {
+		if (kv.value.array_size <= 0 || ShaderLanguage::is_sampler_type(kv.value.type) || kv.value.scope != ShaderLanguage::ShaderNode::Uniform::SCOPE_LOCAL) {
+			continue;
+		}
+		const String member = _uniform_identifier(kv.key);
+		r_entry.vertex_code = _clamp_uniform_array_indices(r_entry.vertex_code, member, kv.value.array_size);
+		r_entry.fragment_code = _clamp_uniform_array_indices(r_entry.fragment_code, member, kv.value.array_size);
+		r_entry.fragment_globals = _clamp_uniform_array_indices(r_entry.fragment_globals, member, kv.value.array_size);
+		r_entry.intersection_code = _clamp_uniform_array_indices(r_entry.intersection_code, member, kv.value.array_size);
+		r_entry.intersection_globals = _clamp_uniform_array_indices(r_entry.intersection_globals, member, kv.value.array_size);
+	}
 	r_entry.uniform_members = gen_code.uniforms;
 	r_entry.uniform_total_size = gen_code.uniform_total_size;
 	r_entry.uniform_offsets = gen_code.uniform_offsets;
 	r_entry.uniforms = uniform_sink;
-	_finalize_uniforms_with_textures(r_entry, gen_code, uniform_sink, /*strip_intersection_globals=*/p_is_procedural);
-	return true;
+	return _finalize_uniforms_with_textures(r_entry, gen_code, uniform_sink, /*strip_intersection_globals=*/p_is_procedural);
 }
 
 void SceneShaderRaytracing::finalize_custom_shaders() {
@@ -974,7 +1049,8 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		String tex_defines;
 		for (int ti = 0; ti < entry.texture_uniforms.size(); ti++) {
 			const TextureUniformInfo &tui = entry.texture_uniforms[ti];
-			tex_defines += "#define m_" + tui.name + " bindless_textures[nonuniformEXT(material.m_" + tui.name + ")]\n";
+			const String id = _uniform_identifier(tui.name);
+			tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
 		}
 		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
 
@@ -1008,6 +1084,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 
 		{
 			String s = ctx.ch_template;
+			s = s.replace("/* RT_CUSTOM_DEFINES */", entry.defines);
 			s = s.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry.fragment_globals);
 			s = s.replace("/* RT_CUSTOM_FRAGMENT_CODE */", fragment_code);
 			s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
@@ -1018,6 +1095,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		}
 		if (entry.uses_alpha_clip) {
 			String s = ctx.ah_template;
+			s = s.replace("/* RT_CUSTOM_DEFINES */", entry.defines);
 			s = s.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry.fragment_globals);
 			s = s.replace("/* RT_CUSTOM_FRAGMENT_CODE */", fragment_code);
 			s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
@@ -1477,8 +1555,8 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.renames["INV_VIEW_MATRIX"] = "inv_view_matrix";
 		actions.renames["PROJECTION_MATRIX"] = "projection_matrix";
 		actions.renames["INV_PROJECTION_MATRIX"] = "inv_projection_matrix";
-		actions.renames["MODELVIEW_MATRIX"] = "(read_view_matrix * read_model_matrix)";
-		actions.renames["MODELVIEW_NORMAL_MATRIX"] = "mat3(read_view_matrix * read_model_matrix)";
+		actions.renames["MODELVIEW_MATRIX"] = "rt_modelview_matrix";
+		actions.renames["MODELVIEW_NORMAL_MATRIX"] = "rt_modelview_normal_matrix";
 		actions.renames["MAIN_CAM_INV_VIEW_MATRIX"] = "inv_view_matrix";
 
 		actions.renames["VERTEX"] = "vertex";

@@ -30,15 +30,14 @@
 
 #include "bindless_block.h"
 
-#include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
-
-void BindlessBlock::initialize(RenderingDevice *p_rd) {
+void BindlessBlock::initialize(RenderingDevice *p_rd, RID p_default_texture) {
 	ERR_FAIL_NULL(p_rd);
+	ERR_FAIL_COND(!p_default_texture.is_valid());
 
 	rd = p_rd;
 
-	default_texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(
-			RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+	default_texture = p_default_texture;
+	texture_type = rd->texture_get_format(default_texture).texture_type;
 	textures.push_back(default_texture);
 	texture_to_index[default_texture] = 0;
 }
@@ -80,8 +79,8 @@ void BindlessBlock::begin_frame() {
 uint32_t BindlessBlock::add_texture(RID p_texture) {
 	ERR_FAIL_COND_V_MSG(!is_initialized(), 0, "BindlessBlock not initialized. Call initialize() first.");
 
-	// Substitute null/stale RIDs with the default white texture.
-	if (!p_texture.is_valid() || !rd->texture_is_valid(p_texture)) {
+	// Substitute null/stale RIDs, and textures of another type, with the default texture.
+	if (!p_texture.is_valid() || !rd->texture_is_valid(p_texture) || rd->texture_get_format(p_texture).texture_type != texture_type) {
 		p_texture = default_texture;
 	}
 

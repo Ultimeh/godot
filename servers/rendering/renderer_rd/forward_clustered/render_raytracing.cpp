@@ -49,6 +49,7 @@ using namespace RendererSceneRenderImplementation;
 void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
 	bindless_block = memnew(BindlessBlock);
+	bindless_array_block = memnew(BindlessBlock);
 
 	// Initialize merged MultiMesh BLAS compute shader.
 	Vector<String> merge_modes;
@@ -78,6 +79,10 @@ RenderRaytracing::~RenderRaytracing() {
 	if (bindless_block) {
 		memdelete(bindless_block);
 		bindless_block = nullptr;
+	}
+	if (bindless_array_block) {
+		memdelete(bindless_array_block);
+		bindless_array_block = nullptr;
 	}
 	if (shader) {
 		memdelete(shader);
@@ -402,6 +407,7 @@ void RenderRaytracing::cleanup_caches() {
 				RTMaterialCacheEntry *entry = &material_chunks[i][j];
 				if (entry->ptr) {
 					if (entry->ptr->uniform_buffer.is_valid()) {
+						mat_ubo_dedicated_buffers.erase(entry->ptr->uniform_buffer);
 						RD::get_singleton()->free_rid(entry->ptr->uniform_buffer);
 					}
 					if (entry->ptr->uniform_pool_slot != UINT32_MAX) {
@@ -599,10 +605,15 @@ void RenderRaytracing::prepare_frame() {
 	cache_hits = 0;
 	cache_misses = 0;
 
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	if (!bindless_block->is_initialized()) {
-		bindless_block->initialize(RD::get_singleton());
+		bindless_block->initialize(RD::get_singleton(), texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE));
+	}
+	if (!bindless_array_block->is_initialized()) {
+		bindless_array_block->initialize(RD::get_singleton(), texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE));
 	}
 	bindless_block->begin_frame();
+	bindless_array_block->begin_frame();
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1566,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 				uint32_t offset = cse->uniform_offsets[u.order];
 				uint32_t size = ShaderLanguage::get_datatype_size(u.type);
+				if (u.array_size > 0) {
+					const uint32_t padded = 16 * u.array_size;
+					size *= u.array_size;
+					if (size % padded != 0) {
+						size += padded - (size % padded);
+					}
+				}
 				if (offset + size > cse->uniform_total_size) {
 					continue;
 				}
@@ -1565,6 +1583,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					int32_t idx = material_storage->global_shader_uniform_get_buffer_index(kv.key);
 					uint32_t uidx = (idx >= 0) ? (uint32_t)idx : 0;
 					memcpy(dst, &uidx, sizeof(uint32_t));
+				} else if (u.array_size > 0) {
+					Variant val = material_storage->material_get_param(p_material_rid, kv.key);
+					RendererRD::MaterialStorage::fill_std140_uniform(u, val.get_type() == Variant::NIL ? nullptr : &val, dst, true);
 				} else {
 					Variant val = material_storage->material_get_param(p_material_rid, kv.key);
 					pack_uniform(u, val, dst);
@@ -1574,6 +1595,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			RendererRD::TextureStorage *ts = RendererRD::TextureStorage::get_singleton();
 			for (int ti = 0; ti < cse->texture_uniforms.size(); ti++) {
 				const SceneShaderRaytracing::TextureUniformInfo &tui = cse->texture_uniforms[ti];
+				BindlessBlock *table = tui.is_array ? bindless_array_block : bindless_block;
 				uint32_t bindless_idx = 0;
 
 				if (tui.is_global) {
@@ -1581,7 +1603,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					if (tex_rid.is_valid()) {
 						RID rd_tex = ts->texture_get_rd_texture(tex_rid, tui.use_color);
 						if (rd_tex.is_valid()) {
-							bindless_idx = bindless_block->add_texture(rd_tex);
+							bindless_idx = table->add_texture(rd_tex);
 						}
 					}
 				} else {
@@ -1591,7 +1613,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 						if (tex_rid.is_valid()) {
 							RID rd_tex = ts->texture_get_rd_texture(tex_rid, tui.use_color);
 							if (rd_tex.is_valid()) {
-								bindless_idx = bindless_block->add_texture(rd_tex);
+								bindless_idx = table->add_texture(rd_tex);
 							}
 						}
 					}
@@ -1599,26 +1621,28 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 				if (bindless_idx == 0 && tui.hint != ShaderLanguage::ShaderNode::Uniform::HINT_NONE) {
 					using Hint = ShaderLanguage::ShaderNode::Uniform::Hint;
-					RID default_tex;
+					using DefaultTexture = RendererRD::TextureStorage::DefaultRDTexture;
+					DefaultTexture default_type;
 					switch (tui.hint) {
 						case Hint::HINT_DEFAULT_BLACK:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : DefaultTexture::DEFAULT_RD_TEXTURE_BLACK;
 							break;
 						case Hint::HINT_DEFAULT_TRANSPARENT:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_TRANSPARENT);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_TRANSPARENT : DefaultTexture::DEFAULT_RD_TEXTURE_TRANSPARENT;
 							break;
 						case Hint::HINT_NORMAL:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_NORMAL);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_NORMAL : DefaultTexture::DEFAULT_RD_TEXTURE_NORMAL;
 							break;
 						case Hint::HINT_ANISOTROPY:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_ANISO);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : DefaultTexture::DEFAULT_RD_TEXTURE_ANISO;
 							break;
 						default:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : DefaultTexture::DEFAULT_RD_TEXTURE_WHITE;
 							break;
 					}
+					RID default_tex = ts->texture_rd_get_default(default_type);
 					if (default_tex.is_valid()) {
-						bindless_idx = bindless_block->add_texture(default_tex);
+						bindless_idx = table->add_texture(default_tex);
 					}
 				}
 
@@ -1647,6 +1671,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				if (mat_data->uniform_pool_slot != UINT32_MAX) {
 					// Transitioning from a dedicated buffer back into the pool.
 					if (mat_data->uniform_buffer.is_valid()) {
+						mat_ubo_dedicated_buffers.erase(mat_data->uniform_buffer);
 						RD::get_singleton()->free_rid(mat_data->uniform_buffer);
 						mat_data->uniform_buffer = RID();
 					}
@@ -1667,7 +1692,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 						: "pool exhausted";
 				WARN_PRINT_ONCE(vformat(
 						"RT Material UBO falling back to dedicated buffer (%s): "
-						"sbt_offset=%u, uniform_total_size=%u, slot_size=%u.",
+						"sbt_offset=%d, uniform_total_size=%d, slot_size=%d.",
 						String(reason), mat_data->rt_sbt_offset,
 						cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
 
@@ -1676,9 +1701,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					mat_data->uniform_pool_slot = UINT32_MAX;
 				}
 				if (mat_data->uniform_buffer.is_valid()) {
+					mat_ubo_dedicated_buffers.erase(mat_data->uniform_buffer);
 					RD::get_singleton()->free_rid(mat_data->uniform_buffer);
 				}
 				mat_data->uniform_buffer = RD::get_singleton()->storage_buffer_create(cse->uniform_total_size, ubo_data, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+				mat_ubo_dedicated_buffers.insert(mat_data->uniform_buffer);
 				RD::get_singleton()->set_resource_name(mat_data->uniform_buffer, String("RT Material UBO [sbt=") + itos(mat_data->rt_sbt_offset) + "]");
 				mat.uniform_address = RD::get_singleton()->buffer_get_device_address(mat_data->uniform_buffer);
 			}
@@ -3276,6 +3303,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			bindless_block->finalize(shader_rd, 1);
 			bindless_uniform_set = bindless_block->get_uniform_set();
 		}
+		if (bindless_array_block && bindless_array_block->is_initialized()) {
+			bindless_array_block->finalize(shader_rd, 2);
+			bindless_array_uniform_set = bindless_array_block->get_uniform_set();
+		}
 	}
 
 	return result;
@@ -3298,6 +3329,11 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 	// Mat UBO pool buffer dependency.
 	if (mat_ubo_pool_buffer.is_valid()) {
 		rd->raytracing_list_add_buffer_dependency(p_list, mat_ubo_pool_buffer, /*p_writable=*/false);
+	}
+	// Materials too large for a pool slot: their buffers can be created this frame, the upload of their data
+	// must come before the trace.
+	for (const RID &buffer : mat_ubo_dedicated_buffers) {
+		rd->raytracing_list_add_buffer_dependency(p_list, buffer, /*p_writable=*/false);
 	}
 
 	// Deformed surface buffer dependencies.

@@ -347,11 +347,13 @@ public:
 		ShaderLanguage::ShaderNode::Uniform::Hint hint = ShaderLanguage::ShaderNode::Uniform::HINT_NONE;
 		bool use_color = false;
 		bool is_global = false;
+		bool is_array = false; // sampler2DArray: index into the texture array table.
 		uint32_t buffer_offset = 0; // Stored as bindless index in UBO
 	};
 
 	// Preprocessed custom HG GLSL (templates filled per compile). One entry per slot, all variants.
 	struct CustomShaderEntry {
+		String defines; // The compiler's defines the RT templates honor (vertex space).
 		String vertex_code;
 		String fragment_code;
 		String fragment_globals;
@@ -451,7 +453,7 @@ private:
 	uint32_t _register_slot(uint32_t p_shader_id, RID p_material, bool p_is_procedural);
 	bool _preprocess_shader(RID p_material, bool p_is_procedural, CustomShaderEntry &r_entry);
 	void _strip_texture_globals(String &r_globals, const String &p_tex_name);
-	void _finalize_uniforms_with_textures(CustomShaderEntry &r_entry, const ShaderCompiler::GeneratedCode &p_gen_code, const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, bool p_strip_intersection_globals);
+	bool _finalize_uniforms_with_textures(CustomShaderEntry &r_entry, const ShaderCompiler::GeneratedCode &p_gen_code, const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, bool p_strip_intersection_globals);
 
 	// Bundle build / rebuild.
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);

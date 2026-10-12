@@ -346,6 +346,10 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		if (bindless_set.is_valid()) {
 			RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, bindless_set, 1);
 		}
+		RID bindless_array_set = raytracing->get_bindless_array_uniform_set();
+		if (bindless_array_set.is_valid()) {
+			RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, bindless_array_set, 2);
+		}
 
 		// Make sure BDA referenced buffers are registered as dependencies -- these cannot be inferred by the draw graph.
 		raytracing->register_raytracing_buffer_dependencies(raytracing_list);

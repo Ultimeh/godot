@@ -2,6 +2,20 @@
 // Include under #ifdef RT_CUSTOM_HIT_GROUP, outside main().
 // Requires: bindless_textures[], materials[] bindings already declared.
 
+/* RT_CUSTOM_DEFINES */
+
+// Ray tracing stages have no screen derivatives: material code reads mip 0.
+#define dFdx(m_value) ((m_value) * 0.0)
+#define dFdy(m_value) ((m_value) * 0.0)
+#define dFdxCoarse(m_value) ((m_value) * 0.0)
+#define dFdyCoarse(m_value) ((m_value) * 0.0)
+#define dFdxFine(m_value) ((m_value) * 0.0)
+#define dFdyFine(m_value) ((m_value) * 0.0)
+#define fwidth(m_value) ((m_value) * 0.0)
+#define fwidthCoarse(m_value) ((m_value) * 0.0)
+#define fwidthFine(m_value) ((m_value) * 0.0)
+#define SHADER_IS_SRGB false
+
 layout(buffer_reference, std140) readonly buffer CustomMaterialUniforms{
 	/* RT_CUSTOM_UNIFORM_MEMBERS */
 };
@@ -20,6 +34,8 @@ vec4 color_interp = vec4(1.0);
 vec3 view = vec3(0.0, 0.0, -1.0);
 mat4 read_model_matrix = mat4(1.0);
 mat4 read_view_matrix = mat4(1.0);
+mat4 rt_modelview_matrix = mat4(1.0);
+mat3 rt_modelview_normal_matrix = mat3(1.0);
 mat4 inv_view_matrix = mat4(1.0);
 mat4 projection_matrix = mat4(1.0);
 mat4 inv_projection_matrix = mat4(1.0);

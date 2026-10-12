@@ -33,6 +33,7 @@
 #include "core/math/transform_3d.h"
 #include "core/string/string_name.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/vector.h"
@@ -328,8 +329,10 @@ class RenderRaytracing {
 	RenderForwardClustered *owner = nullptr;
 	SceneShaderRaytracing *shader = nullptr;
 	BindlessBlock *bindless_block = nullptr;
+	BindlessBlock *bindless_array_block = nullptr; // 2D texture arrays, set 2.
 
 	RID bindless_uniform_set;
+	RID bindless_array_uniform_set;
 
 	// Caching (chunked sparse caches indexed by RID low bits / 256).
 	Vector<RTCacheEntry *> surface_chunks;
@@ -397,6 +400,7 @@ class RenderRaytracing {
 	// Material UBO sub-allocation pool. One large device-address buffer divided
 	// into fixed-size slots for performance reasons, and easier to debug.
 	RID mat_ubo_pool_buffer;
+	HashSet<RID> mat_ubo_dedicated_buffers; // Read by the trace through device addresses: declared as dependencies.
 	uint64_t mat_ubo_pool_bda = 0;
 	LocalVector<uint32_t> mat_ubo_pool_free_slots;
 	uint32_t mat_ubo_pool_free_count = 0;
@@ -487,6 +491,7 @@ public:
 	SceneShaderRaytracing *get_shader() const { return shader; }
 
 	RID get_bindless_uniform_set() const { return bindless_uniform_set; }
+	RID get_bindless_array_uniform_set() const { return bindless_array_uniform_set; }
 	RID get_mat_ubo_pool_buffer() const { return mat_ubo_pool_buffer; }
 
 	~RenderRaytracing();

@@ -40,7 +40,9 @@ public:
 
 	uint32_t add_texture(RID p_texture);
 
-	void initialize(RenderingDevice *p_rd);
+	// p_default_texture fills unused slots and sets the type of the table: a texture of another type is replaced by it,
+	// as one wrong descriptor would invalidate the whole set.
+	void initialize(RenderingDevice *p_rd, RID p_default_texture);
 
 	void begin_frame();
 
@@ -61,6 +63,7 @@ private:
 	LocalVector<uint32_t> free_indices;
 	uint32_t free_indices_count = 0; // logical top to avoid resize of free_indices array
 	RID default_texture;
+	RD::TextureType texture_type = RD::TEXTURE_TYPE_2D;
 	RID uniform_set;
 	bool needs_refinalize = false;
 };
