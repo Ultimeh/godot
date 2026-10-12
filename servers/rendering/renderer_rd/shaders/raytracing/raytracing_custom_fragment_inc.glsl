@@ -65,27 +65,20 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 rt_modelview_matrix = rt_view_matrix * read_model_matrix;
 rt_modelview_normal_matrix = mat3(rt_modelview_matrix);
 
-if ((rt_geom.flags & FLAG_DISPLACED) != 0u) {
-	// The BLAS holds vertex()'s output already. As raster does, run it at the triangle's vertices on their rest data
-	// and interpolate what it writes: run once at the hit, a texelFetch() in vertex() would snap to one texel.
+if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
+	// As raster does, run vertex() at the triangle's vertices (on their rest data for displaced geometry, whose BLAS
+	// holds vertex()'s output already) and interpolate what it writes: run once at the hit, a texelFetch() in vertex()
+	// would snap to one texel. The vertex values also give the screen derivatives.
 	uint rt_corner_index[3] = uint[3](rt_i0, rt_i1, rt_i2);
-	vec3 rt_corner_vertex[3];
-	vec3 rt_corner_normal[3];
-	vec3 rt_corner_tangent[3];
-	vec3 rt_corner_binormal[3];
-	vec2 rt_corner_uv[3];
-	vec2 rt_corner_uv2[3];
-	vec4 rt_corner_color[3];
-	/* RT_CUSTOM_VARYING_STORAGE */
 	for (int rt_corner = 0; rt_corner < 3; rt_corner++) {
 		uint rt_index = rt_corner_index[rt_corner];
-		vec3 rt_rest = fetch_rest_vertex(rt_geom, rt_index);
+		vec3 rt_rest = (rt_geom.flags & FLAG_DISPLACED) != 0u ? fetch_rest_vertex(rt_geom, rt_index) : fetch_mesh_position(rt_geom, rt_index);
 		TBNResult rt_tbn;
 		rt_tbn.normal = vec3(0.0, 1.0, 0.0);
 		rt_tbn.tangent = vec3(1.0, 0.0, 0.0);
 		rt_tbn.binormal = vec3(0.0, 0.0, 1.0);
 		if (rt_geom.normal_byte_offset != OFFSET_NONE) {
-			rt_tbn = fetch_tbn_uncompressed_vertex(rt_geom, rt_index);
+			rt_tbn = (rt_geom.flags & FLAG_COMPRESSED) != 0u ? fetch_tbn_compressed_vertex(rt_geom, rt_index) : fetch_tbn_uncompressed_vertex(rt_geom, rt_index);
 		}
 #ifdef VERTEX_WORLD_COORDS_USED
 		vertex = (read_model_matrix * vec4(rt_rest, 1.0)).xyz;
@@ -114,36 +107,33 @@ if ((rt_geom.flags & FLAG_DISPLACED) != 0u) {
 		rt_corner_color[rt_corner] = color_interp;
 		/* RT_CUSTOM_VARYING_SAVE */
 	}
-	vertex = rt_corner_vertex[0] * rt_bary.x + rt_corner_vertex[1] * rt_bary.y + rt_corner_vertex[2] * rt_bary.z;
-	normal = rt_corner_normal[0] * rt_bary.x + rt_corner_normal[1] * rt_bary.y + rt_corner_normal[2] * rt_bary.z;
-	tangent = rt_corner_tangent[0] * rt_bary.x + rt_corner_tangent[1] * rt_bary.y + rt_corner_tangent[2] * rt_bary.z;
-	binormal = rt_corner_binormal[0] * rt_bary.x + rt_corner_binormal[1] * rt_bary.y + rt_corner_binormal[2] * rt_bary.z;
-	uv_interp = rt_corner_uv[0] * rt_bary.x + rt_corner_uv[1] * rt_bary.y + rt_corner_uv[2] * rt_bary.z;
-	uv2_interp = rt_corner_uv2[0] * rt_bary.x + rt_corner_uv2[1] * rt_bary.y + rt_corner_uv2[2] * rt_bary.z;
-	color_interp = rt_corner_color[0] * rt_bary.x + rt_corner_color[1] * rt_bary.y + rt_corner_color[2] * rt_bary.z;
-	/* RT_CUSTOM_VARYING_BLEND */
+	if (any(isnan(rt_corner_vertex[0])) || any(isnan(rt_corner_vertex[1])) || any(isnan(rt_corner_vertex[2]))) {
+		RT_CUSTOM_REMOVED_POINT
+	}
+	rt_hit_bary = rt_bary;
+	rt_set_fragment_inputs(rt_bary);
+	hit_barycentric_derivatives(rt_geom, rt_i0, rt_i1, rt_i2, rt_bary, rt_hit_bary_ddx, rt_hit_bary_ddy);
+	rt_derivatives_ready = true;
 } else {
-	// Run vertex shader (computes varyings, may modify built-ins).
+	// Procedural geometry has no vertices: vertex() runs once at the hit, without screen derivatives.
 	/* RT_CUSTOM_VERTEX_CALL */
 	if (any(isnan(vertex))) {
 		RT_CUSTOM_REMOVED_POINT
 	}
-}
-
-// Post-vertex transform to view space, as the rasterizer does.
 #if defined(SKIP_TRANSFORM_USED)
-// vertex() already wrote view-space values.
+	// vertex() already wrote view-space values.
 #elif defined(VERTEX_WORLD_COORDS_USED)
-vertex = (rt_view_matrix * vec4(vertex, 1.0)).xyz;
-normal = normalize(mat3(rt_view_matrix) * normal);
-tangent = normalize(mat3(rt_view_matrix) * tangent);
-binormal = normalize(mat3(rt_view_matrix) * binormal);
+	vertex = (rt_view_matrix * vec4(vertex, 1.0)).xyz;
+	normal = normalize(mat3(rt_view_matrix) * normal);
+	tangent = normalize(mat3(rt_view_matrix) * tangent);
+	binormal = normalize(mat3(rt_view_matrix) * binormal);
 #else
-vertex = (rt_modelview_matrix * vec4(vertex, 1.0)).xyz;
-normal = normalize(rt_modelview_normal_matrix * normal);
-tangent = normalize(mat3(rt_modelview_matrix) * tangent);
-binormal = normalize(mat3(rt_modelview_matrix) * binormal);
+	vertex = (rt_modelview_matrix * vec4(vertex, 1.0)).xyz;
+	normal = normalize(rt_modelview_normal_matrix * normal);
+	tangent = normalize(mat3(rt_modelview_matrix) * tangent);
+	binormal = normalize(mat3(rt_modelview_matrix) * binormal);
 #endif
+}
 
 // Fragment outputs with sensible defaults.
 vec3 albedo = vec3(1.0);

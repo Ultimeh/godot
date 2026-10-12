@@ -124,11 +124,19 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 	return sample_bindless_texture(tex_idx, uv);
 }
 
+/// With the screen derivatives of the coordinates, for the mip level raster picks.
+vec4 sample_material_texture_grad(uint tex_idx, vec2 uv, vec2 uv_ddx, vec2 uv_ddy, uint mat_flags) {
+	if ((mat_flags & 4u) != 0u) {
+		return sample_bindless_texture_point(tex_idx, uv);
+	}
+	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, uv_ddx, uv_ddy);
+}
+
 /// BaseMaterial3D's triplanar_texture().
-vec4 sample_material_triplanar(uint tex_idx, vec3 weights, vec3 triplanar_pos, uint mat_flags) {
-	vec4 samp = sample_material_texture(tex_idx, triplanar_pos.xy, mat_flags) * weights.z;
-	samp += sample_material_texture(tex_idx, triplanar_pos.xz, mat_flags) * weights.y;
-	samp += sample_material_texture(tex_idx, triplanar_pos.zy * vec2(-1.0, 1.0), mat_flags) * weights.x;
+vec4 sample_material_triplanar(uint tex_idx, vec3 weights, vec3 triplanar_pos, vec3 pos_ddx, vec3 pos_ddy, uint mat_flags) {
+	vec4 samp = sample_material_texture_grad(tex_idx, triplanar_pos.xy, pos_ddx.xy, pos_ddy.xy, mat_flags) * weights.z;
+	samp += sample_material_texture_grad(tex_idx, triplanar_pos.xz, pos_ddx.xz, pos_ddy.xz, mat_flags) * weights.y;
+	samp += sample_material_texture_grad(tex_idx, triplanar_pos.zy * vec2(-1.0, 1.0), pos_ddx.zy * vec2(-1.0, 1.0), pos_ddy.zy * vec2(-1.0, 1.0), mat_flags) * weights.x;
 	return samp;
 }
 

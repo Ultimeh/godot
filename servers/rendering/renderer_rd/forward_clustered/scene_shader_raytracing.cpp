@@ -465,23 +465,96 @@ static String _clamp_uniform_array_indices(const String &p_code, const String &p
 	return result;
 }
 
-// On displaced geometry the hit shaders run vertex() at the triangle's three vertices: storage for each varying, the
-// copy after each run, and the barycentric blend (flat and integer varyings take the first vertex, as raster does).
-static void _varying_interpolation_code(const Vector<ShaderCompiler::GeneratedCode::Varying> &p_varyings, String &r_storage, String &r_save, String &r_blend) {
+// The hit shaders run vertex() at the triangle's three vertices and interpolate the varyings as raster does (flat and
+// integer varyings take the first vertex); dFdx() and dFdy() evaluate their argument again with the neighboring pixel's
+// values. The code each material's varyings need for that, and its replacement in a hit group or displacement template.
+static String _apply_varying_code(const String &p_template, const Vector<ShaderCompiler::GeneratedCode::Varying> &p_varyings) {
+	String storage, save, blend, push, pop;
 	for (const ShaderCompiler::GeneratedCode::Varying &varying : p_varyings) {
 		const String corners = "rt_corner_" + varying.name;
+		const String saved = "rt_saved_" + varying.name;
 		const String array = varying.array_size > 0 ? "[" + itos(varying.array_size) + "]" : String();
-		r_storage += varying.type + " " + corners + "[3]" + array + ";\n";
-		r_save += corners + "[rt_corner] = " + varying.name + ";\n";
+		storage += varying.type + " " + corners + "[3]" + array + ";\n";
+		storage += varying.type + " " + saved + array + ";\n";
+		save += corners + "[rt_corner] = " + varying.name + ";\n";
+		push += saved + " = " + varying.name + ";\n";
+		pop += varying.name + " = " + saved + ";\n";
 		if (!varying.interpolated) {
-			r_blend += varying.name + " = " + corners + "[0];\n";
+			blend += varying.name + " = " + corners + "[0];\n";
 		} else if (varying.array_size > 0) {
-			r_blend += "for (int rt_element = 0; rt_element < " + itos(varying.array_size) + "; rt_element++) {\n";
-			r_blend += varying.name + "[rt_element] = " + corners + "[0][rt_element] * rt_bary.x + " + corners + "[1][rt_element] * rt_bary.y + " + corners + "[2][rt_element] * rt_bary.z;\n}\n";
+			blend += "for (int rt_element = 0; rt_element < " + itos(varying.array_size) + "; rt_element++) {\n";
+			blend += varying.name + "[rt_element] = " + corners + "[0][rt_element] * p_bary.x + " + corners + "[1][rt_element] * p_bary.y + " + corners + "[2][rt_element] * p_bary.z;\n}\n";
 		} else {
-			r_blend += varying.name + " = " + corners + "[0] * rt_bary.x + " + corners + "[1] * rt_bary.y + " + corners + "[2] * rt_bary.z;\n";
+			blend += varying.name + " = " + corners + "[0] * p_bary.x + " + corners + "[1] * p_bary.y + " + corners + "[2] * p_bary.z;\n";
 		}
 	}
+	return p_template.replace("/* RT_CUSTOM_VARYING_STORAGE */", storage).replace("/* RT_CUSTOM_VARYING_SAVE */", save).replace("/* RT_CUSTOM_VARYING_BLEND */", blend).replace("/* RT_CUSTOM_VARYING_PUSH */", push).replace("/* RT_CUSTOM_VARYING_POP */", pop);
+}
+
+// Ray tracing stages read mip 0 with texture(): its calls in fragment code become textureGrad() with the screen
+// derivatives of the coordinates (dFdx() is defined by the hit shaders). Shadow and other samplers are left as they are.
+static String _texture_calls_with_gradients(const String &p_code) {
+	String result;
+	int from = 0;
+	while (true) {
+		int start = p_code.find("texture(", from);
+		if (start < 0) {
+			result += p_code.substr(from);
+			break;
+		}
+		const char32_t before = start > 0 ? p_code[start - 1] : U' ';
+		if (is_ascii_identifier_char(before)) {
+			result += p_code.substr(from, start + 8 - from);
+			from = start + 8;
+			continue;
+		}
+		// Split the arguments at the top level.
+		Vector<String> args;
+		int depth = 0;
+		int arg_begin = start + 8;
+		int i = arg_begin;
+		for (; i < p_code.length(); i++) {
+			const char32_t c = p_code[i];
+			if (c == '(' || c == '[') {
+				depth++;
+			} else if (c == ')' || c == ']') {
+				if (depth == 0) {
+					break;
+				}
+				depth--;
+			} else if (c == ',' && depth == 0) {
+				args.push_back(p_code.substr(arg_begin, i - arg_begin).strip_edges());
+				arg_begin = i + 1;
+			}
+		}
+		if (i >= p_code.length()) {
+			result += p_code.substr(from);
+			break;
+		}
+		args.push_back(p_code.substr(arg_begin, i - arg_begin).strip_edges());
+
+		String grad_swizzle;
+		bool supported = args.size() == 2 || args.size() == 3;
+		if (args[0].begins_with("sampler2DArray(") || args[0].begins_with("usampler2DArray(") || args[0].begins_with("isampler2DArray(")) {
+			grad_swizzle = ".xy";
+		} else if (args[0].begins_with("sampler2D(") || args[0].begins_with("usampler2D(") || args[0].begins_with("isampler2D(") ||
+				args[0].begins_with("sampler3D(") || args[0].begins_with("samplerCube(")) {
+			grad_swizzle = "";
+		} else {
+			supported = false;
+		}
+		result += p_code.substr(from, start - from);
+		if (!supported) {
+			result += p_code.substr(start, i + 1 - start);
+		} else {
+			const String coord = _texture_calls_with_gradients(args[1]);
+			// A bias scales the footprint the way it offsets the LOD.
+			const String scale = args.size() == 3 ? " * exp2(" + _texture_calls_with_gradients(args[2]) + ")" : String();
+			result += "textureGrad(" + _texture_calls_with_gradients(args[0]) + ", " + coord + ", dFdx(" + coord + ")" + grad_swizzle + scale + ", dFdy(" + coord + ")" + grad_swizzle + scale + ")";
+		}
+		from = i + 1;
+	}
+	return result;
 }
 
 void SceneShaderRaytracing::_strip_texture_globals(String &r_globals, const String &p_tex_name) {
@@ -690,8 +763,9 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 		}
 	}
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
-	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
-	r_entry.fragment_globals = gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT];
+	r_entry.fragment_code = _texture_calls_with_gradients(gen_code.code.has("fragment") ? gen_code.code["fragment"] : String());
+	// The functions vertex() calls too: their derivatives are 0 there, raster's vertex() reads mip 0 as well.
+	r_entry.fragment_globals = _texture_calls_with_gradients(gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]);
 	if (p_is_procedural) {
 		r_entry.intersection_code = gen_code.code.has("intersection") ? gen_code.code["intersection"] : String();
 		r_entry.intersection_globals = gen_code.stage_globals[ShaderCompiler::STAGE_INTERSECTION];
@@ -769,6 +843,7 @@ RID SceneShaderRaytracing::get_displace_pipeline(uint32_t p_slot_index, RID &r_s
 	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
 	source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + entry->vertex_code + "\n}\n");
 	source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
+	source = _apply_varying_code(source, entry->varyings);
 
 	Vector<String> sources;
 	sources.resize(RD::SHADER_STAGE_MAX);
@@ -1152,8 +1227,6 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			vertex_function = "void rt_run_vertex_shader() {\n" + entry.vertex_code + "\n}\n";
 			vertex_call = "rt_run_vertex_shader();";
 		}
-		String varying_storage, varying_save, varying_blend;
-		_varying_interpolation_code(entry.varyings, varying_storage, varying_save, varying_blend);
 
 		// Procedural with no fragment stage: default material shading.
 		String fragment_code = entry.fragment_code;
@@ -1185,10 +1258,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
 			s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
 			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
-			s = s.replace("/* RT_CUSTOM_VARYING_STORAGE */", varying_storage);
-			s = s.replace("/* RT_CUSTOM_VARYING_SAVE */", varying_save);
-			s = s.replace("/* RT_CUSTOM_VARYING_BLEND */", varying_blend);
-			si.ch_src = s;
+			si.ch_src = _apply_varying_code(s, entry.varyings);
 		}
 		if (entry.uses_alpha_clip) {
 			String s = ctx.ah_template;
@@ -1199,10 +1269,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
 			s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
 			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
-			s = s.replace("/* RT_CUSTOM_VARYING_STORAGE */", varying_storage);
-			s = s.replace("/* RT_CUSTOM_VARYING_SAVE */", varying_save);
-			s = s.replace("/* RT_CUSTOM_VARYING_BLEND */", varying_blend);
-			si.ah_src = s;
+			si.ah_src = _apply_varying_code(s, entry.varyings);
 		}
 		if (entry.is_procedural && !ctx.is_template.is_empty()) {
 			String s = ctx.is_template;

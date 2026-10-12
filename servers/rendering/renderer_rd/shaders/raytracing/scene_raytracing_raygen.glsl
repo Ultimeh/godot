@@ -430,10 +430,25 @@ void main() {
 	MaterialData mat = materials[h.geometry_idx];
 	vec2 uv = h.uv * mat.uv1_scale + mat.uv1_offset;
 
+	// Screen derivatives of the UVs, for the mip level raster picks.
+	GeometryData geom = geometries[h.geometry_idx];
+	uint i0, i1, i2;
+	get_triangle_indices(geom, i0, i1, i2);
+	vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+	vec3 bary_ddx, bary_ddy;
+	hit_barycentric_derivatives(geom, i0, i1, i2, bary, bary_ddx, bary_ddy);
+	vec2 uv0 = fetch_uv(geom, i0, i0, i0, vec3(1.0, 0.0, 0.0));
+	vec2 uv1 = fetch_uv(geom, i1, i1, i1, vec3(1.0, 0.0, 0.0));
+	vec2 uv2 = fetch_uv(geom, i2, i2, i2, vec3(1.0, 0.0, 0.0));
+	vec2 uv_ddx = (uv0 * bary_ddx.x + uv1 * bary_ddx.y + uv2 * bary_ddx.z) * mat.uv1_scale;
+	vec2 uv_ddy = (uv0 * bary_ddy.x + uv1 * bary_ddy.y + uv2 * bary_ddy.z) * mat.uv1_scale;
+
 	// Triplanar mapping, set up as BaseMaterial3D's vertex() does: object space unless world triplanar.
 	bool triplanar = (mat.flags & MAT_FLAG_UV1_TRIPLANAR) != 0u;
 	vec3 triplanar_weights = vec3(0.0);
 	vec3 triplanar_pos = vec3(0.0);
+	vec3 triplanar_ddx = vec3(0.0);
+	vec3 triplanar_ddy = vec3(0.0);
 	HitData nh = h;
 	if (triplanar) {
 		bool world = (mat.flags & MAT_FLAG_UV1_WORLD_TRIPLANAR) != 0u;
@@ -443,6 +458,23 @@ void main() {
 		triplanar_weights /= dot(triplanar_weights, vec3(1.0));
 		triplanar_pos = pos * vec3(mat.uv1_scale, mat.uv1_scale_z) + vec3(mat.uv1_offset, mat.uv1_offset_z);
 		triplanar_pos *= vec3(1.0, -1.0, 1.0);
+		vec3 p0 = fetch_mesh_position(geom, i0);
+		vec3 p1 = fetch_mesh_position(geom, i1);
+		vec3 p2 = fetch_mesh_position(geom, i2);
+		if (world) {
+			mat4 mesh_to_world = mat4(gl_ObjectToWorldEXT);
+			if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+				mat4 aabb_xform, inv_aabb_xform;
+				get_aabb_compression_xforms(geom, aabb_xform, inv_aabb_xform);
+				mesh_to_world = mesh_to_world * inv_aabb_xform;
+			}
+			p0 = (mesh_to_world * vec4(p0, 1.0)).xyz;
+			p1 = (mesh_to_world * vec4(p1, 1.0)).xyz;
+			p2 = (mesh_to_world * vec4(p2, 1.0)).xyz;
+		}
+		vec3 scale = vec3(mat.uv1_scale, mat.uv1_scale_z) * vec3(1.0, -1.0, 1.0);
+		triplanar_ddx = (p0 * bary_ddx.x + p1 * bary_ddx.y + p2 * bary_ddx.z) * scale;
+		triplanar_ddy = (p0 * bary_ddy.x + p1 * bary_ddy.y + p2 * bary_ddy.z) * scale;
 
 		vec3 an = abs(n);
 		vec3 tangent = normalize(vec3(0.0, 0.0, -1.0) * an.x + vec3(1.0, 0.0, 0.0) * (an.y + an.z));
@@ -462,16 +494,16 @@ void main() {
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
-		vec3 normal_sample = triplanar ? sample_material_triplanar(mat.normal_texture_idx, triplanar_weights, triplanar_pos, 0u).rgb : sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
+		vec3 normal_sample = triplanar ? sample_material_triplanar(mat.normal_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, 0u).rgb : sample_material_texture_grad(mat.normal_texture_idx, uv, uv_ddx, uv_ddy, 0u).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
 		final_normal = apply_normal_map(nh, tangent_space_normal, mat.normal_map_depth);
 	}
 
 	// Texture sampling.
-	vec4 albedo_tex = triplanar ? sample_material_triplanar(mat.albedo_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
+	vec4 albedo_tex = triplanar ? sample_material_triplanar(mat.albedo_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.albedo_texture_idx, uv, uv_ddx, uv_ddy, mat.flags);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = (triplanar ? sample_material_triplanar(mat.orm_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.orm_texture_idx, uv, mat.flags)).rgb;
+	vec3 orm = (triplanar ? sample_material_triplanar(mat.orm_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.orm_texture_idx, uv, uv_ddx, uv_ddy, mat.flags)).rgb;
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
@@ -480,7 +512,7 @@ void main() {
 	if ((mat.flags & MAT_FLAG_EMISSION) != 0u) {
 		vec3 emission_tex = vec3(0.0);
 		if ((mat.flags & 2u) != 0u) {
-			emission_tex = (triplanar ? sample_material_triplanar(mat.emission_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.emission_texture_idx, uv, mat.flags)).rgb;
+			emission_tex = (triplanar ? sample_material_triplanar(mat.emission_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.emission_texture_idx, uv, uv_ddx, uv_ddy, mat.flags)).rgb;
 		}
 		emissive = ((mat.flags & MAT_FLAG_EMISSION_ADD) != 0u ? mat.emission_color + emission_tex : mat.emission_color * emission_tex) * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
@@ -623,7 +655,15 @@ void main() {
 	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	MaterialData mat = materials[geometry_idx];
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	// The mip level the closest hit and raster read, so the cut-out does not change from one pixel's ray to the next.
+	vec3 bary_ddx, bary_ddy;
+	hit_barycentric_derivatives(geom, i0, i1, i2, bary, bary_ddx, bary_ddy);
+	vec2 uv0 = fetch_uv(geom, i0, i0, i0, vec3(1.0, 0.0, 0.0));
+	vec2 uv1 = fetch_uv(geom, i1, i1, i1, vec3(1.0, 0.0, 0.0));
+	vec2 uv2 = fetch_uv(geom, i2, i2, i2, vec3(1.0, 0.0, 0.0));
+	vec2 uv_ddx = (uv0 * bary_ddx.x + uv1 * bary_ddx.y + uv2 * bary_ddx.z) * mat.uv1_scale;
+	vec2 uv_ddy = (uv0 * bary_ddy.x + uv1 * bary_ddy.y + uv2 * bary_ddy.z) * mat.uv1_scale;
+	float alpha = textureGrad(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, uv_ddx, uv_ddy).a;
 	alpha *= mat.albedo_color.a;
 
 	if (alpha < 0.5) {

@@ -73,6 +73,96 @@ vec3 fetch_rest_vertex(in GeometryData geom, uint index) {
 	return vec3(rest.v[index * 3u], rest.v[index * 3u + 1u], rest.v[index * 3u + 2u]);
 }
 
+/// A vertex position as the BLAS has it: normalized to the surface AABB for a compressed mesh, whose instance
+/// transform also scales by that AABB.
+vec3 fetch_blas_position(in GeometryData geom, uint index) {
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		Uint32Buffer vb = Uint32Buffer(geom.vertex_address);
+		uint w0 = vb.v[index * 2u];
+		uint w1 = vb.v[index * 2u + 1u];
+		return vec3(float(w0 & 0xFFFFu), float(w0 >> 16), float(w1 & 0xFFFFu)) / 65535.0;
+	}
+	FloatBuffer vb = FloatBuffer(geom.vertex_address);
+	uint stride = geom.position_stride >> 2;
+	return vec3(vb.v[index * stride], vb.v[index * stride + 1u], stride > 2u ? vb.v[index * stride + 2u] : 0.0);
+}
+
+/// A vertex position in mesh space, as vertex() receives it.
+vec3 fetch_mesh_position(in GeometryData geom, uint index) {
+	vec3 p = fetch_blas_position(geom, index);
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		p = p * vec3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z) + vec3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z);
+	}
+	return p;
+}
+
+#ifndef RT_DISPLACE_PASS
+/// The barycentrics of the point where the ray p_origin + t * p_direction meets the triangle's plane.
+vec3 ray_plane_barycentrics(vec3 p_origin, vec3 p_direction, vec3 p0, vec3 e1, vec3 e2, vec3 n) {
+	float denom = dot(p_direction, n);
+	if (abs(denom) < 1e-12) {
+		return vec3(-1.0);
+	}
+	vec3 p = p_origin + p_direction * (dot(p0 - p_origin, n) / denom);
+	vec3 d = p - p0;
+	float d00 = dot(e1, e1);
+	float d01 = dot(e1, e2);
+	float d11 = dot(e2, e2);
+	float d20 = dot(d, e1);
+	float d21 = dot(d, e2);
+	float inv = 1.0 / (d00 * d11 - d01 * d01);
+	float v = (d11 * d20 - d01 * d21) * inv;
+	float w = (d00 * d21 - d01 * d20) * inv;
+	return vec3(1.0 - v - w, v, w);
+}
+
+/// The world direction of the camera ray through a pixel (as the raygen shader builds it, without jitter).
+vec3 camera_ray_direction(vec2 p_pixel) {
+	vec2 d = (p_pixel + 0.5) / vec2(gl_LaunchSizeEXT.xy) * 2.0 - 1.0;
+	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(d, 1.0, 1.0);
+	mat3 inv_view = transpose(mat3(scene_data_block.data.inv_view_matrix[0].xyz, scene_data_block.data.inv_view_matrix[1].xyz, scene_data_block.data.inv_view_matrix[2].xyz));
+	return normalize(inv_view * normalize(target.xyz));
+}
+
+/// Screen derivatives of the hit's barycentrics, what raster's dFdx()/dFdy() see on interpolated values. A camera ray
+/// is differentiated against its neighboring pixels' rays; any other ray as a cone of one pixel's angle from its origin.
+void hit_barycentric_derivatives(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary, out vec3 r_ddx, out vec3 r_ddy) {
+	r_ddx = vec3(0.0);
+	r_ddy = vec3(0.0);
+	vec3 p0 = gl_ObjectToWorldEXT * vec4(fetch_blas_position(geom, i0), 1.0);
+	vec3 e1 = gl_ObjectToWorldEXT * vec4(fetch_blas_position(geom, i1), 1.0) - p0;
+	vec3 e2 = gl_ObjectToWorldEXT * vec4(fetch_blas_position(geom, i2), 1.0) - p0;
+	vec3 n = cross(e1, e2);
+	if (dot(n, n) < 1e-24) {
+		return;
+	}
+	vec3 origin = gl_WorldRayOriginEXT;
+	vec3 direction = gl_WorldRayDirectionEXT;
+	vec3 camera_position = vec3(scene_data_block.data.inv_view_matrix[0].w, scene_data_block.data.inv_view_matrix[1].w, scene_data_block.data.inv_view_matrix[2].w);
+	vec3 dir_x, dir_y;
+	if (distance(origin, camera_position) < 1e-3) {
+		vec2 pixel = vec2(gl_LaunchIDEXT.xy);
+		vec3 center = camera_ray_direction(pixel);
+		dir_x = direction + camera_ray_direction(pixel + vec2(1.0, 0.0)) - center;
+		dir_y = direction + camera_ray_direction(pixel + vec2(0.0, 1.0)) - center;
+	} else {
+		float pixel_angle = 2.0 / (float(gl_LaunchSizeEXT.y) * abs(scene_data_block.data.projection_matrix[1][1]));
+		vec3 u = normalize(cross(direction, abs(direction.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+		vec3 v = cross(direction, u);
+		dir_x = direction + u * pixel_angle;
+		dir_y = direction + v * pixel_angle;
+	}
+	vec3 bx = ray_plane_barycentrics(origin, dir_x, p0, e1, e2, n);
+	vec3 by = ray_plane_barycentrics(origin, dir_y, p0, e1, e2, n);
+	if (bx.x > -0.5 || bx.y > -0.5) {
+		r_ddx = bx - bary;
+	}
+	if (by.x > -0.5 || by.y > -0.5) {
+		r_ddy = by - bary;
+	}
+}
+#endif
+
 // ============================================================================
 // UV FETCHING
 // ============================================================================
