@@ -22,6 +22,8 @@
 #include "raytracing_common_inc.glsl"
 
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+// The reflection of the first transparent surface in front of the opaque ones, and that surface's view depth (0: none).
+layout(set = 0, binding = 29, rgba16f) uniform image2D front_layer_image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
@@ -47,6 +49,7 @@ void main() {
 
 	// Accumulate multiple samples per pixel
 	vec3 total_radiance = vec3(0.0);
+	float opaque_t = 10000.0;
 
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
@@ -68,7 +71,7 @@ void main() {
 
 #ifdef USE_SER
 			hitObjectEXT hitObject;
-			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 
 			// Reorder with a coherence hint that has 8 bits
 			uint hint = 0;
@@ -84,6 +87,9 @@ void main() {
 #endif
 
 			ps = path_unpack(payload);
+			if (sample_idx == 0u && bounce == 0u && !is_path_terminated(ps.packed_bounces_flags)) {
+				opaque_t = ps.hit_t;
+			}
 			if (is_path_terminated(ps.packed_bounces_flags)) {
 				break;
 			}
@@ -99,6 +105,48 @@ void main() {
 	vec3 final_radiance = total_radiance / float(samples_per_pixel);
 
 	imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));
+
+	// Front layer: the first transparent surface before the opaque hit, and one path along its reflection, for the raster
+	// transparent pass (RenderForwardClustered::front_layer_reflection). Not a primary ray: no depth, motion or RR guides.
+	vec4 front_layer = vec4(0.0);
+	if (get_rt_param(RT_PARAM_FRONT_LAYER_COUNT) > 0.0) {
+		PathState fs;
+		fs.radiance = vec3(0.0);
+		fs.throughput = vec3(1.0);
+		fs.packed_bounces_flags = set_front_layer_ray(0u);
+		fs.rng_state = init_rng(pixel, frame_index, samples_per_pixel);
+		fs.hit_t = 0.0;
+		fs.offset_normal = vec3(0.0, 0.0, 1.0);
+		fs.next_ray_dir = vec3(0.0, 0.0, 1.0);
+		path_pack(payload, fs);
+		traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_FRONT_LAYER, 0, 0, 0, origin.xyz, 0.001, direction.xyz, opaque_t, 0);
+		fs = path_unpack(payload);
+
+		if (!is_path_terminated(fs.packed_bounces_flags)) {
+			float view_depth = fs.hit_t * dot(direction.xyz, -normalize(inv_view[2].xyz));
+
+			PathState rs;
+			rs.radiance = vec3(0.0);
+			rs.throughput = vec3(1.0);
+			rs.packed_bounces_flags = pack_bounces(1u, 0u);
+			rs.rng_state = fs.rng_state;
+			vec3 ray_origin = offset_ray_origin(origin.xyz + direction.xyz * fs.hit_t, fs.offset_normal);
+			vec3 ray_dir = fs.next_ray_dir;
+			[[dont_unroll]] for (uint bounce = 1u; bounce <= max_bounces; bounce++) {
+				path_pack(payload, rs);
+				traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+				rs = path_unpack(payload);
+				if (is_path_terminated(rs.packed_bounces_flags)) {
+					break;
+				}
+				vec3 hit_pos = ray_origin + ray_dir * rs.hit_t;
+				ray_origin = offset_ray_origin(hit_pos, rs.offset_normal);
+				ray_dir = rs.next_ray_dir;
+			}
+			front_layer = vec4(rs.radiance, view_depth);
+		}
+	}
+	imageStore(front_layer_image, ivec2(pixel), front_layer);
 }
 
 #[miss]

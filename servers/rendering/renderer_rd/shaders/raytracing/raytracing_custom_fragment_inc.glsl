@@ -17,6 +17,7 @@
 
 MaterialData rt_mat = materials[rt_geometry_idx];
 material = CustomMaterialUniforms(rt_mat.uniform_address);
+rt_instance_uniforms_ofs = rt_mat.instance_uniforms_ofs;
 
 // Matrices.
 mat4 rt_view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0],

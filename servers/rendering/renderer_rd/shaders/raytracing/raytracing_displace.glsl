@@ -35,7 +35,7 @@ layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 scene_data_block;
 
 layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
-	vec4 data[256];
+	vec4 data[];
 }
 global_shader_uniforms;
 
@@ -49,7 +49,7 @@ struct DisplaceJob {
 	GeometryData geom; // The mesh surface as stored (possibly compressed).
 	uint64_t material_address;
 	uint tbn_words; // 0, 1 (normal) or 2 (normal and tangent) per vertex.
-	uint pad;
+	uint instance_uniforms_ofs;
 };
 
 layout(set = 0, binding = 30, std430) readonly buffer DisplaceJobs {
@@ -182,6 +182,7 @@ void main() {
 	}
 
 	material = CustomMaterialUniforms(job.material_address);
+	rt_instance_uniforms_ofs = job.instance_uniforms_ofs;
 
 	// As raster computes motion vectors: vertex() again with the previous frame's time, camera and transform (the
 	// uniforms stay current), for the motion of the previous position.

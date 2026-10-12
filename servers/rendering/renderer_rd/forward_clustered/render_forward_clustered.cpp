@@ -1129,6 +1129,9 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 				}
 			}
 		}
+		if (front_layer_reflection.is_valid()) {
+			ss_flags |= 1 << 4;
+		}
 		scene_state.ubo.ss_effects_flags = ss_flags;
 	} else {
 		scene_state.ubo.ss_effects_flags = 0;
@@ -5718,6 +5721,9 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 			}
 		}
 
+		if (p_render_list == RENDER_LIST_ALPHA && front_layer_reflection.is_valid()) {
+			ssr = front_layer_reflection;
+		}
 		RID texture = ssr.is_valid() ? ssr : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
 		uniforms.push_back(u);

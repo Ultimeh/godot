@@ -113,7 +113,7 @@ struct MaterialData {
 	float uv1_scale_z; // Triplanar only.
 	float uv1_offset_z;
 	float uv1_blend_sharpness;
-	uint pad;
+	uint instance_uniforms_ofs; // The instance's `instance uniform` values in the global shader uniform buffer.
 };
 
 #define MAT_FLAG_UV1_TRIPLANAR 8u

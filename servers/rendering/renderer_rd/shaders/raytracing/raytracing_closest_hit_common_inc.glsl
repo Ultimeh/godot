@@ -488,6 +488,29 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec3 N = clampShadingNormal(m.normal, h.geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 	float NdotV = max(dot(N, V), 0.0001);
 
+	// A front layer ray (raygen): a direction in this transparent surface's specular lobe, for its reflection. The raster
+	// transparent pass shades the surface.
+	if (is_front_layer_ray(ps.packed_bounces_flags)) {
+		MaterialProperties front_mat;
+		front_mat.baseColor = m.albedo;
+		front_mat.metalness = m.metalness;
+		front_mat.roughness = m.roughness;
+		front_mat.dielectricF0 = specular_to_f0(m.specular);
+		front_mat.emissive = vec3(0.0);
+		front_mat.transmissivness = 0.0;
+		front_mat.opacity = 1.0;
+		vec3 front_dir;
+		vec3 front_weight;
+		if (!evalIndirectCombinedBRDF(rand2(ps.rng_state), N, h.geometry_normal, V, front_mat, SPECULAR_TYPE, front_dir, front_weight, vec4(0.0)) || dot(front_dir, h.geometry_normal) <= 0.0) {
+			front_dir = reflect(-V, h.geometry_normal);
+		}
+		ps.hit_t = gl_HitTEXT;
+		ps.offset_normal = h.geometry_normal;
+		ps.next_ray_dir = front_dir;
+		path_pack(payload, ps);
+		return;
+	}
+
 	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
 	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
 

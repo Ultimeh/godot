@@ -40,10 +40,12 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
+#define RB_TEX_RT_FRONT_LAYER SNAME("rt_front_layer")
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")
 #define RB_TEX_DLSS_RR_DIFFUSE_ALBEDO SNAME("diffuse_albedo")
@@ -123,7 +125,7 @@ struct alignas(16) RT_MaterialData {
 	float uv1_scale_z; // Triplanar only.
 	float uv1_offset_z;
 	float uv1_blend_sharpness;
-	uint32_t pad;
+	uint32_t instance_uniforms_ofs; // The instance's `instance uniform` values in the global shader uniform buffer.
 };
 static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
 
@@ -170,6 +172,7 @@ enum {
 enum : uint8_t {
 	RT_INSTANCE_MASK_CAMERA = 1u,
 	RT_INSTANCE_MASK_SHADOW = 2u,
+	RT_INSTANCE_MASK_FRONT_LAYER = 4u, // Transparent surfaces, for their reflections only (RenderForwardClustered::front_layer_reflection).
 	RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW = 0x80u, // Build-time only: the shadow rays need both faces, see build_tlas().
 };
 
@@ -214,7 +217,7 @@ struct alignas(16) RT_DisplaceJob {
 	RT_GeometryData geometry; // The mesh surface as stored.
 	uint64_t material_address;
 	uint32_t tbn_words;
-	uint32_t pad;
+	uint32_t instance_uniforms_ofs;
 };
 static_assert(sizeof(RT_DisplaceJob) == 400, "RT_DisplaceJob must be 400 bytes for std430");
 
@@ -415,6 +418,22 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
 
+	// The volumetric fog applied over the traced color.
+	struct VolumetricFogShader {
+		struct PushConstant {
+			float inv_projection[16];
+			int32_t size[2];
+			float inv_length;
+			float detail_spread;
+			uint32_t legacy_blending;
+			uint32_t pad[3];
+		};
+		RaytracingVolumetricFogShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} volumetric_fog_shader;
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.
@@ -461,6 +480,7 @@ class RenderRaytracing {
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // RT_INSTANCE_MASK_* bits.
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+	uint32_t front_layer_instance_count = 0;
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 
@@ -539,6 +559,7 @@ public:
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
+	void apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
 
 	// Raytracing output textures (stored on the render buffers via named scopes).
@@ -547,6 +568,9 @@ public:
 	RID rt_get_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	bool rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	RID rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	RID rt_get_front_layer_texture(RenderSceneBuffersRD *p_render_buffers) const;
+	// Transparent surfaces in the TLAS this frame: the raygen traces their reflections.
+	uint32_t get_front_layer_instance_count() const { return front_layer_instance_count; }
 
 	// DLSS Ray Reconstruction guide buffers (stored on the render buffers).
 	void dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers);

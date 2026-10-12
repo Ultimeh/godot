@@ -84,6 +84,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 	ERR_FAIL_NULL(current_cluster_builder);
 
+	// As raster: the volumetric fog and the transparent pass read the VoxelGI textures (white defaults without any).
+	gi.setup_voxel_gi_instances(p_render_data, p_render_data->render_buffers, p_render_data->scene_data->cam_transform, *p_render_data->voxel_gi_instances, p_render_data->voxel_gi_count);
+
 	p_render_data->cluster_buffer = current_cluster_builder->get_cluster_buffer();
 	p_render_data->cluster_size = current_cluster_builder->get_cluster_size();
 	p_render_data->cluster_max_elements = current_cluster_builder->get_max_cluster_elements();
@@ -314,10 +317,17 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// The path tracer produces the opaque color, but transparents are still
 	// rasterized on top, which needs the reflection-probe / light / decal buffers
 	// and the cluster grid to be valid for the current frame.
-	{
+	if (rb_data.is_valid() && is_environment(p_render_data->environment) && environment_get_volumetric_fog_enabled(p_render_data->environment)) {
+		// The volumetric fog lights its volume through the shadow maps, as in raster: render them, then update it.
+		_pre_opaque_render(p_render_data, false, false, false, false, nullptr, RID());
+	} else {
 		uint32_t pt_directional_light_count = 0;
 		uint32_t pt_positional_light_count = 0;
 		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
+		if (rb_data.is_valid()) {
+			// Frees the volume of a fog just turned off.
+			_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, false, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes);
+		}
 	}
 
 	// Execute raytracing (replaces the opaque + motion vector pass).
@@ -369,6 +379,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			RD::get_singleton()->draw_command_end_label();
 		}
 
+		raytracing->apply_volumetric_fog(p_render_data, fog_use_legacy_blending_get());
 		raytracing->copy_output_texture(p_render_data);
 	}
 
@@ -459,6 +470,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
+		// The path traced reflections of the transparent surfaces, in place of their probes and sky where they match.
+		front_layer_reflection = (raytracing && raytracing->get_front_layer_instance_count() > 0) ? raytracing->rt_get_front_layer_texture(rb.ptr()) : RID();
+
 		uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, false, screen_size, screen_size, p_default_bg_color, false);
 
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
@@ -472,6 +486,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 		}
+		front_layer_reflection = RID();
 
 		RD::get_singleton()->draw_command_end_label();
 	}

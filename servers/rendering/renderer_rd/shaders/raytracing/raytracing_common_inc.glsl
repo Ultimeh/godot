@@ -24,6 +24,7 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // TLAS instance masks (RT_INSTANCE_MASK_* in render_raytracing.h).
 #define RT_MASK_CAMERA 0x01
 #define RT_MASK_SHADOW 0x02
+#define RT_MASK_FRONT_LAYER 0x04
 
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;
@@ -32,7 +33,7 @@ layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 scene_data_block;
 
 layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
-	vec4 data[256];
+	vec4 data[];
 }
 global_shader_uniforms;
 

@@ -2225,6 +2225,17 @@ void fragment_shader(in SceneData scene_data) {
 			// Alpha is premultiplied.
 			indirect_specular_light = indirect_specular_light * (1.0 - ssr.a) + ssr.rgb;
 		}
+
+#ifndef USE_MULTIVIEW
+		// The path tracer's reflection of the first transparent surface in front of the opaque ones, in place of the
+		// probes and sky where this fragment is that surface (alpha: its view depth).
+		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_FRONT_LAYER_REFLECTION)) {
+			vec4 front_layer = texelFetch(sampler2D(ssr_buffer, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0);
+			if (front_layer.a > 0.0 && abs(front_layer.a + vertex.z) < 0.05 + front_layer.a * 0.01) {
+				indirect_specular_light = front_layer.rgb;
+			}
+		}
+#endif
 	}
 #endif // AMBIENT_LIGHT_DISABLED
 

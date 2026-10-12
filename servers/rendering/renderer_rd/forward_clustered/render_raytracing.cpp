@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
@@ -62,6 +63,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.version_shader[i] = mm_merge_shader.shader.version_get_shader(mm_merge_shader.version, i);
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
+
+	Vector<String> fog_modes;
+	fog_modes.push_back("\n");
+	volumetric_fog_shader.shader.initialize(fog_modes);
+	volumetric_fog_shader.version = volumetric_fog_shader.shader.version_create();
+	volumetric_fog_shader.version_shader = volumetric_fog_shader.shader.version_get_shader(volumetric_fog_shader.version, 0);
+	volumetric_fog_shader.pipeline = RD::get_singleton()->compute_pipeline_create(volumetric_fog_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -91,6 +99,7 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
+	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +187,9 @@ void RenderRaytracing::rt_ensure_textures(RenderSceneBuffersRD *p_render_buffers
 	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH)) {
 		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
+	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER)) {
+		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	}
 }
 
 bool RenderRaytracing::rt_has_texture(RenderSceneBuffersRD *p_render_buffers) const {
@@ -196,6 +208,14 @@ bool RenderRaytracing::rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffe
 RID RenderRaytracing::rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
 	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH);
+}
+
+RID RenderRaytracing::rt_get_front_layer_texture(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER)) {
+		return RID();
+	}
+	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER);
 }
 
 void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -543,6 +563,7 @@ void RenderRaytracing::prepare_frame() {
 	blas_transforms.clear();
 	instance_flags.clear();
 	instance_masks.clear();
+	front_layer_instance_count = 0;
 	sbt_offsets.clear();
 	geometry_data.clear();
 	material_data.clear();
@@ -1145,7 +1166,9 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 		}
 
 		for (const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches; surf; surf = surf->next) {
-			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
+			// Transparent surfaces too, as build_tlas() traces them for their reflections; not the unshaded ones.
+			const bool front_layer = surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA;
+			if ((front_layer && (!surf->shader || surf->shader->unshaded)) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
 				continue;
 			}
 			const RID material_rid = surface_material(surf);
@@ -1220,6 +1243,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			RendererRD::MaterialStorage::store_transform(prev_transform.affine_inverse(), data.prev_inv_model_matrix);
 			data.material_address = mat_data->data.uniform_address;
 			data.tbn_words = tbn_words;
+			data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 			job_data.push_back(data);
 
 			mat_ubo_pool_ensure_initialized();
@@ -2724,6 +2748,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
 				RTMaterialData *proc_mat_data = process_material(proc_material_rid, proc_mat_counter);
 				material_data.push_back(proc_mat_data->data);
+				material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 
 				// Procedural instances disable triangle culling and are opaque.
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
@@ -2842,8 +2867,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
-			// Skip surfaces routed to the raster alpha overlay
-			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+			// Surfaces of the raster transparent pass are only seen by the front layer rays, for their reflections; an
+			// unshaded one has none.
+			const bool front_layer = surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA;
+			if (front_layer && (!surf->shader || surf->shader->unshaded)) {
 				surf = surf->next;
 				continue;
 			}
@@ -2992,6 +3019,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			sbt_offsets.push_back(mat_data->rt_sbt_offset);
 			material_data.push_back(mat_data->data);
+			material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 
 			// Determine per-instance TLAS flags from material properties.
 			uint32_t inst_flags = 0;
@@ -3012,7 +3040,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 			}
 
-			if (mat_data->rt_sbt_offset > 0) {
+			if (front_layer) {
+				// A blended surface is the front layer wherever it is drawn; only an alpha scissor cuts it.
+				if (!surf->shader->uses_alpha_clip) {
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				}
+			} else if (mat_data->rt_sbt_offset > 0) {
 				// Custom shader: enable any-hit if it uses alpha clip or has a hint_albedo texture.
 				const SceneShaderRaytracing::CustomShaderEntry *cse =
 						rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -3027,7 +3060,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(instance_mask(inst));
+			if (front_layer) {
+				instance_masks.push_back(RT_INSTANCE_MASK_FRONT_LAYER);
+				front_layer_instance_count++;
+			} else {
+				instance_masks.push_back(instance_mask(inst));
+			}
 
 			surf = surf->next;
 		}
@@ -3056,6 +3094,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
+			material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
 			instance_masks.push_back(instance_mask(pending.mm_surf->owner));
@@ -3115,6 +3154,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 				material_data.push_back(pending.mat_data->data);
+				material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
 
 				if (pending.transform_moved) {
 					Transform3D prev_final = pending.prev_instance_transform * mm_xform;
@@ -3510,6 +3550,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
 		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRONT_LAYER_COUNT] = float(front_layer_instance_count);
 
 		// Unjittered VP for motion vectors (matches raster convention).
 		{
@@ -3672,6 +3713,16 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	// Bindings 16-27: Material samplers (12 filter/repeat combinations for custom shaders).
 	RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default().append_uniforms(uniforms, 16);
 
+	// Binding 29: Front layer reflection output (RGBA16F: reflected radiance, view depth of the transparent surface).
+	{
+		rt_ensure_textures(rb);
+		RD::Uniform u;
+		u.binding = 29;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rt_get_front_layer_texture(rb));
+		uniforms.push_back(u);
+	}
+
 	// Binding 28: Velocity output (RG16F). Past the 16-27 sampler range.
 	{
 		rb->ensure_velocity();
@@ -3783,6 +3834,38 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 // ---------------------------------------------------------------------------
 // Output copy
 // ---------------------------------------------------------------------------
+
+void RenderRaytracing::apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+	if (!rb->has_custom_data(RB_SCOPE_FOG) || !rt_has_texture(rb.ptr()) || !rt_has_depth_texture(rb.ptr())) {
+		return;
+	}
+	Ref<RendererRD::Fog::VolumetricFog> fog = rb->get_custom_data(RB_SCOPE_FOG);
+
+	// The same parameters as the scene shader's (RenderForwardClustered::_setup_environment()).
+	VolumetricFogShader::PushConstant push_constant = {};
+	RendererRD::MaterialStorage::store_camera(p_render_data->scene_data->get_cam_projection().inverse(), push_constant.inv_projection);
+	const Size2i size = rb->get_internal_size();
+	push_constant.size[0] = size.width;
+	push_constant.size[1] = size.height;
+	push_constant.inv_length = fog->length > 0.0 ? 1.0 / fog->length : 1.0;
+	push_constant.detail_spread = fog->spread > 0.0 ? 1.0 / fog->spread : 1.0;
+	push_constant.legacy_blending = p_legacy_blending;
+
+	RD::Uniform color(RD::UNIFORM_TYPE_IMAGE, 0, rt_get_texture(rb.ptr()));
+	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
+	RD::Uniform fog_map(RD::UNIFORM_TYPE_TEXTURE, 2, fog->fog_map);
+	RD::Uniform sampler(RD::UNIFORM_TYPE_SAMPLER, 3, RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED));
+
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, volumetric_fog_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(volumetric_fog_shader.version_shader, 0, color, depth, fog_map, sampler), 0);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(VolumetricFogShader::PushConstant));
+	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+	rd->compute_list_end();
+}
 
 void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data) {
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
