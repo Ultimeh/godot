@@ -51,12 +51,8 @@
 
 #include <atomic>
 
-// Everything below follows AMD's FidelityFX SDK 2.3.0 sample (Samples/Upscalers/FidelityFX_FSR,
-// fsrapirendermodule.cpp) and its documentation (frame-interpolation-api.md,
-// frame-interpolation-swap-chain.md), with the swap chain's frame pacing left at AMD's defaults.
-// Two choices differ from the sample, both measured (FSR-FG-STUDY.md): interpolation on the game's
-// queue by default (uses_async_workloads()), and HUD-less UI composition (AMD's third mode, for
-// engines that draw their UI into the frame).
+// Follows AMD's FidelityFX SDK sample and documentation, frame pacing included, except for interpolation on the
+// game's queue by default (see uses_async_workloads()) and HUD-less UI composition, as Godot draws its UI into the frame.
 
 namespace {
 
@@ -158,8 +154,7 @@ void log_frame_generation_versions(State &s) {
 }
 
 // Frame generation off on the proxy swap chain: it presents the frames it is given, and drops its
-// references to the HUD-less color and the last prepare's resources. AMD's sample sets
-// frameGenerationEnabled on every configure; this is the configure of a frame that does not generate.
+// references to the HUD-less color and the last prepare's resources.
 void configure_disabled(State &s) {
 	ffxConfigureDescFrameGeneration cfg = {};
 	cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -173,9 +168,8 @@ void destroy_fg_context(State &s) {
 	if (!s.fg_context) {
 		return;
 	}
-	// AMD's shutdown order: disable frame generation on the proxy swap chain first. That configure
-	// waits for in-flight interpolation and UI composition that still reference the context's
-	// resources (D3D12 error #921 otherwise), then destroy the context.
+	// AMD's shutdown order: disabling frame generation first waits for in-flight interpolation and UI
+	// composition that still reference the context's resources, then the context is destroyed.
 	if (s.swap_chain) {
 		configure_disabled(s);
 	}
@@ -248,11 +242,8 @@ bool FSRFrameGenerationD3D12::is_available() {
 }
 
 bool FSRFrameGenerationD3D12::uses_async_workloads() {
-	// Optical flow and interpolation on an async compute queue, overlapping the next frame's
-	// rendering, as in AMD's sample (GODOT_FSR_FG_ASYNC=1). Off by default: AMD advises to profile
-	// (frame-interpolation-api.md), and measured in MySupCom at 4K, DLSS Quality, RTX 5070, still camera:
-	// async, interpolation 4.3-5.8 ms and Godot's viewport 5.4-6.2 ms (they contend), 114 fps rendered;
-	// game queue, interpolation 2.5-2.7 ms and viewport 4.7-5.2 ms, 120 fps (the display's cap).
+	// Interpolation on an async compute queue, overlapping the next frame, as in AMD's sample. Off by default:
+	// AMD advises to profile it, and it contends with Godot's own rendering.
 	static const bool enabled = env_bool("GODOT_FSR_FG_ASYNC", false);
 	return enabled;
 }
@@ -302,10 +293,8 @@ bool FSRFrameGenerationD3D12::create_swap_chain(void *p_hwnd, void *p_desc1, voi
 	IDXGISwapChain4 *proxy = nullptr;
 	desc.swapchain = &proxy;
 	desc.hwnd = (HWND)p_hwnd;
-	// The proxy only creates its frame latency waitable object (wait_before_present()) when the desc
-	// asks for it at creation, as the sample does. It forces the flag on the real swap chain either
-	// way and re-adds it in its ResizeBuffers, so Godot's own creation_flags and ResizeBuffers calls
-	// stay unchanged.
+	// The proxy only creates its frame latency waitable object when asked at creation. It re-adds the flag in its
+	// own ResizeBuffers, so Godot's creation_flags stay unchanged.
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = *(DXGI_SWAP_CHAIN_DESC1 *)p_desc1;
 	sc_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	desc.desc = &sc_desc;
@@ -367,12 +356,8 @@ void FSRFrameGenerationD3D12::before_present(void *p_swap_chain) {
 	if (s.swap_chain != (IDXGISwapChain4 *)p_swap_chain) {
 		return;
 	}
-	// The proxy's Present generates from the last configuration it was given: the HUD-less color,
-	// and the depth and motion vectors of the last prepare. Without a prepare since the previous
-	// Present, those may be resources Godot has freed since: after a window resize the 3D is not
-	// drawn for a few frames while the render buffers are recreated, and the third Present read a
-	// released ID3D12Resource (access violation in amd_fidelityfx_framegeneration_dx12). Such a frame
-	// does not generate; the next prepare() configures generation on again.
+	// The proxy's Present generates from the resources of the last prepare. Without a prepare since the
+	// previous Present (e.g. while render buffers are recreated), they may have been freed since.
 	if (s.fg_context && s.fg_enabled && s.prepares_since_present == 0) {
 		configure_disabled(s);
 	}
@@ -402,10 +387,8 @@ void FSRFrameGenerationD3D12::wait_before_present(void *p_swap_chain) {
 		}
 		frame_latency = s.frame_latency;
 	}
-	// AMD (frame-interpolation-swap-chain.md, "Waitable Object"): the game uses the proxy's frame
-	// latency waitable object to keep the CPU from running ahead of the GPU, one wait per frame.
-	// This is the thread that creates and destroys the swap chain, so the handle stays valid. The
-	// documentation waits without a timeout; one second only keeps a lost release from hanging.
+	// One wait per frame keeps the CPU from running ahead of the GPU. This thread creates and destroys the swap
+	// chain, so the handle stays valid; the timeout only keeps a lost release from hanging.
 	WaitForSingleObject(frame_latency, 1000);
 }
 
@@ -490,12 +473,8 @@ void FSRFrameGenerationD3D12::prepare(const PrepareParams &p_params) {
 	cfg.frameGenerationCallbackUserContext = &s.fg_context;
 	cfg.frameGenerationEnabled = true;
 	cfg.allowAsyncWorkloads = uses_async_workloads();
-	// AMD's third UI mode: a HUD-less copy of the back buffer, from which frame generation tells
-	// the UI apart. With allowAsyncWorkloads, interpolation reads it on an async compute queue while
-	// the next frame renders: the compositor double-buffers it then (frame-interpolation-api.md,
-	// "When HUDLess composition mode is used"). Its state at Present is COMPUTE_READ (= NON_PIXEL_SHADER_RESOURCE),
-	// as in AMD's sample. Format: the back buffer's own, typed, so no separate hudless format
-	// (ffxCreateContextDescFrameGenerationHudless) is needed.
+	// HUD-less UI composition: frame generation tells the UI apart using a copy of the frame before its UI, in the
+	// back buffer's format. With async workloads it is read while the next frame renders, so the compositor double-buffers it.
 	cfg.HUDLessColor = FfxApiResource({});
 	if (p_params.hudless_resource) {
 		ID3D12Resource *hudless = (ID3D12Resource *)p_params.hudless_resource;

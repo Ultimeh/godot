@@ -32,21 +32,16 @@
 
 #include <cstdint>
 
-// PROTOTYPE: AMD FSR frame generation (FidelityFX SDK 2.3.0, ffx-api, D3D12 only), enabled with the
-// environment variable GODOT_FSR_FG=1 in a game (never in the editor). See FSR-FG-STUDY.md.
-//
-// The interface below carries no D3D12 types so the renderer (effects/dlss.cpp) can call it.
-// Everything runs on the thread that owns the swap chain and records the frame: the render thread
-// in the Separate model, the main thread in Safe. The AMD contexts are not thread safe; a mutex
-// still guards every call, as AMD's guide asks.
+// AMD FSR frame generation (FidelityFX ffx-api, D3D12 only), enabled with GODOT_FSR_FG=1 in a game, never in the editor.
+// The interface carries no D3D12 types so the renderer can call it. Everything runs on the thread that owns the swap
+// chain; the AMD contexts are not thread safe, and a mutex guards every call as AMD's guide asks.
 class FSRFrameGenerationD3D12 {
 public:
 	struct PrepareParams {
 		void *native_command_list = nullptr; // ID3D12GraphicsCommandList*.
 		uint64_t depth_resource = 0; // ID3D12Resource*, in NON_PIXEL_SHADER_RESOURCE state.
 		uint64_t motion_vectors_resource = 0; // ID3D12Resource*, decoded (no (-1,-1) sentinel).
-		// ID3D12Resource*, or 0: the frame before its canvas, back-buffer-sized, in the back
-		// buffer's color space. Written later in the frame; sampled (NON_PIXEL_SHADER_RESOURCE)
+		// ID3D12Resource*, or 0: the frame before its canvas (HUD-less), in the back buffer's color space and sampled
 		// by the time of Present. Used only if its size and format family match the back buffer.
 		uint64_t hudless_resource = 0;
 		uint32_t render_width = 0;
@@ -72,12 +67,9 @@ public:
 	// amd_fidelityfx_loader_dx12.dll loads (next to the executable). Probed once, quietly.
 	static bool is_available();
 
-	// D3D12 driver: creates the proxy swap chain for this window instead of
-	// IDXGIFactory::CreateSwapChainForHwnd. Returns false (and leaves r_swap_chain untouched) when
-	// FSR frame generation is not requested or failed, so the caller creates a plain swap chain.
-	// p_desc1 is a DXGI_SWAP_CHAIN_DESC1*, p_factory an IDXGIFactory*, p_queue an
-	// ID3D12CommandQueue*, p_device an ID3D12Device*, r_swap_chain receives an IDXGISwapChain4*
-	// with one reference owned by the caller.
+	// Creates AMD's proxy swap chain instead of CreateSwapChainForHwnd(), or returns false (r_swap_chain untouched) so
+	// the caller creates a plain one. The pointers are a DXGI_SWAP_CHAIN_DESC1, IDXGIFactory, ID3D12CommandQueue and
+	// ID3D12Device; r_swap_chain receives an IDXGISwapChain4 with one reference owned by the caller.
 	static bool create_swap_chain(void *p_hwnd, void *p_desc1, void *p_factory, void *p_queue, void *p_device, void **r_swap_chain);
 
 	// D3D12 driver: before the caller releases its last reference to p_swap_chain. Tears down the
@@ -88,29 +80,26 @@ public:
 	// frame is presented. Configures frame generation and records its prepare pass.
 	static void prepare(const PrepareParams &p_params);
 
-	// D3D12 driver, right before Present on p_swap_chain (the render thread in the Separate model):
-	// one wait per frame on the proxy's frame latency waitable object, as AMD's documentation asks,
-	// so the CPU does not run ahead of the GPU. No-op for any other swap chain.
+	// Right before Present: one wait per frame on the proxy's frame latency waitable object, as AMD's documentation
+	// asks. No-op for any other swap chain.
 	static void wait_before_present(void *p_swap_chain);
 
-	// D3D12 driver, right before Present on p_swap_chain: turns frame generation off for this Present
-	// when no frame was prepared since the previous one, so the proxy never generates from resources
-	// freed since. The next prepare() turns it on again. No-op for any other swap chain.
+	// Right before Present: turns generation off when no frame was prepared since the previous Present, so the proxy
+	// never generates from freed resources. No-op for any other swap chain.
 	static void before_present(void *p_swap_chain);
 
 	// D3D12 driver, right before ResizeBuffers on p_swap_chain: destroys the frame generation
 	// context, sized for the old back buffers. The next prepare() creates it again.
 	static void before_resize(void *p_swap_chain);
 
-	// The proxy swap chain exists (GODOT_FSR_FG=1, main window created through it).
+	// The main window's swap chain is AMD's proxy.
 	static bool is_active();
 
 	// Frames are being generated: a context exists and its last configure turned generation on.
 	static bool is_generating();
 
-	// Renderer, for the viewport shown on the main window when its Viewport.frame_generation is off:
-	// releases the frame generation context (AMD's shutdown order). The proxy keeps presenting the
-	// frames it is given; the next prepare() creates the context again.
+	// Releases the frame generation context when the main window's viewport turns frame generation off. The proxy
+	// keeps presenting; the next prepare() creates the context again.
 	static void stop_generating();
 
 	// Whether interpolation runs on an async compute queue (GODOT_FSR_FG_ASYNC=1, default off): the

@@ -58,14 +58,13 @@ private:
 	Mutex compiled_queue_mutex;
 	RBSet<uint32_t> compilation_set;
 	HashMap<uint32_t, WorkerThreadPool::TaskID> compilation_tasks;
-	// A compilation is started once, by its background task or by a thread that needs the pipeline before the task ran
-	// (it compiles it itself); the task then does nothing. Threads needing a pipeline being compiled wait for the
-	// compilation itself, never for a queued task: with parallel draw lists several pool threads can need the same
-	// pipeline, and blocking them all on a task still queued would leave no thread to run it.
+	// A compilation runs once, in its task or in the first thread that needs the pipeline before the task starts.
+	// Threads wait for the running compilation, never for a queued task: blocking several pool threads on a task still
+	// queued could leave no thread to run it.
 	RBSet<uint32_t> started_compilations;
 	RBSet<uint32_t> running_compilations;
-	// Compiled by the thread that needed them: their task is still to run (and do nothing), so it stays in
-	// compilation_tasks for clear_pipelines() to wait for before the map can go.
+	// Compiled by the thread that needed them: their task still has to run (and do nothing), so clear_pipelines()
+	// waits for it.
 	RBSet<uint32_t> inline_compilations;
 	ConditionVariable running_compilations_condition; // With local_mutex.
 	BinaryMutex local_mutex;
@@ -92,9 +91,8 @@ private:
 		running_compilations_condition.notify_all();
 	}
 
-	// Waits for a submitted pipeline: compiles it here if its task hasn't started yet, else waits for the compilation
-	// running on another thread. Without a key, a task not started yet is waited for (the original behavior, for
-	// callers on the render thread).
+	// Compiles a submitted pipeline here if its task hasn't started yet, else waits for the running compilation.
+	// Without a key, a task not started yet is waited for instead.
 	void _wait_for_compilation(uint32_t p_key_hash, const Key *p_key) {
 		WorkerThreadPool::TaskID task_id_to_wait = WorkerThreadPool::INVALID_TASK_ID;
 		{

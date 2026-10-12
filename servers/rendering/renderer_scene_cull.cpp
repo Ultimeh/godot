@@ -3059,8 +3059,8 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 							cull_data.cull->lock.unlock();
 
 							if (cull_data.threaded) {
-								// Queued by _render_scene() once the cull is done, in one command: every cull thread
-								// queuing its own made them all contend on the command queue's lock.
+								// Queued by _render_scene() in one command once the cull is done, so the cull threads
+								// do not contend on the command queue's lock.
 								cull_result.view_axis_particles.push_back(idata.base_rid);
 							} else {
 								RS::get_singleton()->call_on_render_thread(callable_mp_static(&RendererSceneCull::_scene_particles_set_view_axis).bind(idata.base_rid, -cull_data.cam_transform.basis.get_column(2).normalized(), cull_data.cam_transform.basis.get_column(1).normalized()));
@@ -3573,7 +3573,8 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			}
 
 			if (scene_cull_result.view_axis_particles.size()) {
-				// Queued, not called: the cull threads' calls were queued too, and run after this draw.
+				// Queued, not called, so it runs after this draw like the serial cull's calls: applying it now
+				// would change the image.
 				Array view_axis_particles;
 				view_axis_particles.resize(scene_cull_result.view_axis_particles.size());
 				for (uint32_t i = 0; i < scene_cull_result.view_axis_particles.size(); i++) {

@@ -310,10 +310,8 @@ void RenderingServerDefault::finish() {
 		}
 		server_thread = Thread::MAIN_ID;
 #ifdef RD_ENABLED
-		// The render thread took ownership of the RD in `_assign_mt_ids`; hand it back, since
-		// the display server destroys it from the main thread. Without this, `finalize()`
-		// fails its thread guard at exit, the driver is never torn down, and Streamline is
-		// never shut down: DLSS-G then cleans itself up in DllMain at process exit and aborts.
+		// The render thread took ownership of the RD in `_assign_mt_ids()`; hand it back, since the display server
+		// finalizes it from the main thread. Otherwise the driver and Streamline are never shut down.
 		RenderingDevice *rd = RenderingDevice::get_singleton();
 		if (rd) {
 			rd->make_current();
@@ -435,8 +433,7 @@ void RenderingServerDefault::_thread_exit() {
 }
 
 void RenderingServerDefault::_thread_loop() {
-	// A pool thread taken for good: named as other engines name theirs (Unreal's "RenderThread 0"), not "WorkerThread N",
-	// so profilers and debuggers tell it apart.
+	// A pool thread taken for good, named so profilers and debuggers tell it apart from the workers.
 	Thread::set_name("RenderThread");
 
 	DisplayServer::get_singleton()->gl_window_make_current(DisplayServerEnums::MAIN_WINDOW_ID); // Move GL to this thread.
@@ -472,13 +469,8 @@ void RenderingServerDefault::draw(bool p_present, double frame_step) {
 	RS::get_singleton()->emit_signal(SNAME("frame_pre_draw"));
 	changes = 0;
 
-	// The Streamline frame token is renewed by the main thread at the end of every iteration,
-	// while the DLSS pass runs on the render thread and used to read it at execution time. A
-	// render that lagged past that renewal took the next token, and a quick one right after
-	// took the same token again: slSetConstants refused it as duplicated constants and that
-	// frame was never upscaled — one refusal per window minimization in the game's DevVideo
-	// probe. The token now rides the draw command with its frame, in queue order with
-	// everything else the render thread does for it.
+	// The main thread renews the Streamline frame token after every iteration, so the token travels with the draw
+	// command rather than being read when the render thread runs it.
 	uint64_t frame_token = 0;
 #ifdef STREAMLINE_ENABLED
 	frame_token = (uint64_t)StreamlineContext::get().get_frame_token_for_draw();

@@ -117,12 +117,9 @@ private:
 	static uint64_t _get_render_frame_token(); // Streamline's frame token of the frame being recorded, 0 without it.
 	void _submit_thread_drain();
 
-	// Replay thread (with the submission thread; GODOT_RD_REPLAY_THREAD=0 disables it): swap_buffers()
-	// hands the recorded frame over and the render thread begins recording the next one into the other graph, while
-	// this thread replays the recorded graph into the slot's command buffers (RenderingDeviceGraph::end()) and passes
-	// the frame on to the submission thread. Its jobs are numbered with the submission jobs (submit_jobs_pushed): job n
-	// is done once its frame is submitted and presented, so _submit_thread_wait()/_submit_thread_drain() cover both
-	// threads. Each replay waits for the previous frame's submission: DLSS-G wants frame N+1's tags after Present(N).
+	// Replay thread (with the submission thread; GODOT_RD_REPLAY_THREAD=0 disables it): replays the recorded graph while
+	// the render thread records the next frame into the other one. Its jobs share the submission jobs' numbering, so
+	// waiting for a job covers both threads. A replay waits for the previous frame's submission (DLSS-G tags follow Present).
 	struct ReplayJob {
 		uint32_t frame = 0;
 		RenderingDeviceGraph *graph = nullptr;
@@ -143,9 +140,8 @@ private:
 
 	static void _replay_thread_func(void *p_userdata);
 
-	// Where the render thread's time goes around the graph, and every synchronization with the GPU (RD-REPLAY-THREAD-STUDY.md,
-	// step 0). Main instance only; GODOT_RD_STATS=1 (or GODOT_PARALLEL_DRAW_LISTS_STATS=1) prints it every 240 frames.
-	// A frame runs from one RenderingServer draw (frame_stats_draw_begin()) to the end of its swap_buffers().
+	// Render thread time around the graph and synchronizations with the GPU, main instance only. Printed periodically
+	// with GODOT_RD_STATS=1 (or GODOT_PARALLEL_DRAW_LISTS_STATS=1).
 	struct FrameStats {
 		bool enabled = false;
 		uint32_t frames = 0;
@@ -1729,10 +1725,9 @@ public:
 	void draw_list_split_begin(uint32_t p_count, DrawListID *r_split_ids);
 	void draw_list_split_end();
 
-	// p_count splits recorded before the draw lists that will hold them exist, by other threads as above: split i for a
-	// draw list on a framebuffer of format p_formats[i] whose viewport is p_viewports[i]. Each draw list, once begun on
-	// the render thread, takes its split with draw_list_split_append(). draw_list_split_detached_end() releases them
-	// all, when no draw list is open any more.
+	// Splits recorded before their draw lists exist: split i is for a framebuffer of format p_formats[i] and viewport
+	// p_viewports[i]. Each draw list takes its split with draw_list_split_append(); draw_list_split_detached_end()
+	// releases them once no draw list is open.
 	void draw_list_split_detached_begin(uint32_t p_count, const Rect2i *p_viewports, const FramebufferFormatID *p_formats, DrawListID *r_split_ids);
 	void draw_list_split_append(DrawListID p_split);
 	void draw_list_split_detached_end();
@@ -1901,8 +1896,7 @@ private:
 	void _check_transfer_worker_index_array(IndexArray *p_index_array);
 	void _submit_transfer_workers(RDD::CommandBufferID p_draw_command_buffer = RDD::CommandBufferID());
 	void _take_transfer_barriers(uint32_t p_frame);
-	// The replay of a recorded frame: the transfer barriers, the graph, the end of its command buffer. Reads nothing
-	// but that frame's slot and graph (RD-REPLAY-THREAD-STUDY.md, step 1b).
+	// Replays a recorded frame: transfer barriers, graph, end of its command buffer. Reads only that frame's slot and graph.
 	void _replay_frame(uint32_t p_frame, RenderingDeviceGraph *p_graph);
 	void _wait_for_transfer_workers();
 	void _free_transfer_workers();
@@ -1921,8 +1915,7 @@ private:
 	bool _dependencies_make_mutable_recursive(RID p_id, RDG::ResourceTracker *p_resource_tracker);
 	bool _dependencies_make_mutable(RID p_id, RDG::ResourceTracker *p_resource_tracker);
 
-	// Two graphs: the next frame is recorded into one while the other is replayed (RD-REPLAY-THREAD-STUDY.md, step 1d).
-	// draw_graph is the one being recorded, swapped by swap_buffers().
+	// The next frame is recorded into one graph while the other is replayed. draw_graph is the one being recorded.
 	RenderingDeviceGraph draw_graphs[2];
 	RenderingDeviceGraph *draw_graph = &draw_graphs[0];
 

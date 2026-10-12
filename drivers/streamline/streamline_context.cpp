@@ -190,9 +190,8 @@ void StreamlineContext::apply_frame_generation_features(bool p_fsr) {
 	if (want_dlssg == dlssg_loaded && want_reflex == reflex_loaded) {
 		return;
 	}
-	// Streamline: the pipeline is flushed (RenderingDevice stalls before resizing a swap chain) and
-	// no other DXGI/D3D call runs meanwhile (render thread). Unloaded features are unhooked and their
-	// functions unusable: the pointers are fetched again below for the loaded ones.
+	// slSetFeatureLoaded() requires an idle pipeline and no concurrent DXGI/D3D calls. Unloaded
+	// features are unhooked, so the function pointers are fetched again below.
 	if (want_dlssg != dlssg_loaded) {
 		if (!want_dlssg && (uint32_t)dlssg_viewport != UINT_MAX) {
 			dlssg_disable();
@@ -290,16 +289,8 @@ void StreamlineContext::reflex_get_state(sl::ReflexState &reflexState) {
 }
 
 sl::FrameToken *StreamlineContext::get_new_frame_token() {
-	// The frame index is ours, monotonic per request. Left to Streamline (nullptr), the index
-	// only advances on present: a frame rendered without one — the window being minimized,
-	// which is what alt-tab does to an exclusive fullscreen window — yields two tokens
-	// carrying the same index, and the next slSetConstants is refused with
-	// eErrorDuplicatedConstants, so that frame is never upscaled. Reproduced with the game's
-	// DevVideo probe: one refusal per minimization, every run. One token per main-loop
-	// iteration is what the engine requests anyway; giving it a number of its own just stops
-	// the count from depending on whether the swapchain presented the previous frame. The
-	// other half of the same refusal is which token the render thread reads: see
-	// RenderingServerDefault::draw.
+	// Streamline's own index only advances on present, so a frame drawn without one (e.g. a minimized
+	// window) would reuse an index and slSetConstants would refuse it as duplicated.
 	++frame_index;
 	last_token_drawn = false;
 	sl::Result result = this->slGetNewFrameToken ? this->slGetNewFrameToken(last_token, &frame_index) : sl::Result::eOk;
@@ -308,13 +299,8 @@ sl::FrameToken *StreamlineContext::get_new_frame_token() {
 }
 
 sl::FrameToken *StreamlineContext::get_frame_token_for_draw() {
-	// Streamline wants one token per frame. The main loop asks for it at the start of each
-	// iteration, before simulation, as Reflex requires; but RenderingServer::draw() is also called
-	// outside the main loop: RenderingServer.force_draw(), the editor's forced redraws of a game
-	// paused from the debugger (repeated for as long as the scene keeps changing, e.g. any
-	// material animated by TIME), resource previews. Each of those reused a token a previous draw
-	// had already sent, and slSetConstants refused the second set of constants on it
-	// (eErrorDuplicatedConstants), so that frame was not upscaled.
+	// One token per draw. draw() can also run outside the main loop (force_draw(), redraws of a game
+	// paused in the debugger), which would otherwise reuse a token slSetConstants already received.
 	if (last_token_drawn && slGetNewFrameToken) {
 		get_new_frame_token();
 	}
@@ -430,11 +416,8 @@ void StreamlineContext::initialize(bool d3d12) {
 
 	StreamlineContext::get().is_d3d12 = d3d12;
 	if (StreamlineContext::get().is_game) {
-		// Always requested: a feature not requested here can never be loaded later. On D3D12 they
-		// are then loaded and unloaded per swap chain (apply_frame_generation_features()): with sl.dlss_g
-		// unloaded Streamline hands back a swap chain AMD's frame generation proxy can own (both
-		// together would generate frames twice), and Reflex and PCL are unloaded under AMD FSR too:
-		// NVIDIA's guidelines make Reflex unavailable under another vendor's frame generation.
+		// Always requested: a feature not requested here can never be loaded later. On D3D12 they are
+		// then loaded or unloaded per swap chain, see apply_frame_generation_features().
 		featuresToLoad.push_back(sl::kFeaturePCL);
 		featuresToLoad.push_back(sl::kFeatureReflex);
 		featuresToLoad.push_back(sl::kFeatureDLSS_G);
@@ -454,8 +437,7 @@ void StreamlineContext::initialize(bool d3d12) {
 	pref.applicationId = 0x90d07004;
 	pref.flags = sl::PreferenceFlags::eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins | sl::PreferenceFlags::eDisableCLStateTracking;
 
-	// Streamline only writes a log file when given a directory; left null, it logs to the console
-	// alone, and a crash takes the console with it. Kept in a static so the pointer stays valid.
+	// Streamline only writes a log file when given a directory. Static so the pointer stays valid.
 	static Char16String log_dir_w;
 	if (bool(GLOBAL_GET("rendering/streamline/streamline_log"))) {
 		pref.logLevel = sl::LogLevel::eVerbose;

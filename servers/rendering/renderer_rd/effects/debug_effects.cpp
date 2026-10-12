@@ -358,7 +358,7 @@ void DebugEffects::draw_motion_vectors(RID p_velocity, RID p_depth, RID p_dest_f
 
 	Projection correction;
 	correction.set_depth_correction(true, true, false);
-	// Same matrix as the upscalers use (camera_reprojection.h), so this view shows what they get.
+	// Same matrix as the upscalers use, so this view shows what they get.
 	Projection reprojection = (correction * p_previous_projection) * Projection(camera_view_delta(p_previous_transform, p_current_transform)) * (correction * p_current_projection).inverse();
 	RendererRD::MaterialStorage::store_camera(reprojection, motion_vectors.push_constant.reprojection_matrix);
 

@@ -46,17 +46,11 @@
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 
-// kBufferTypeUIAlpha and DLSSGOptions::enableUserInterfaceRecomposition exist since Streamline 2.12;
-// the headers in thirdparty/ are 2.10, where the option is the same field of the same struct
-// version (kStructVersion4) under the name bReserved16. The runtimes that load (2.12 in bin/, the
-// OTA DLSS-G plugin, 2.14.1 in exports) know both.
+// kBufferTypeUIAlpha and DLSSGOptions::enableUserInterfaceRecomposition (bReserved16 in the bundled
+// headers) exist since Streamline 2.12, in the same struct version.
 static constexpr sl::BufferType DLSS_BUFFER_TYPE_UI_ALPHA = 69; // sl::kBufferTypeUIAlpha
 
-// The token of the frame being drawn: the one the draw command carried onto the render
-// thread, or the main-thread token when no draw command set it — the very first frame, or a
-// direct draw. See RenderingServerDefault::draw for why the main-thread token alone was not
-// enough.
-// GODOT_PARALLEL_RECORDING_STATS=1: where the DLSS callback's time goes, printed every 240 calls.
+// GODOT_PARALLEL_RECORDING_STATS=1 prints where the DLSS callback's time goes.
 enum DLSSCallbackSection {
 	DLSS_SECTION_OPTIONS,
 	DLSS_SECTION_CONSTANTS,
@@ -82,14 +76,14 @@ static void dlss_callback_lap(DLSSCallbackSection p_section) {
 	dlss_callback_stats.lap_usec = now_usec;
 }
 
+// The token the draw command carried onto the render thread, or the main thread's one when no draw set it.
 static sl::FrameToken *sl_frame_token() {
 	StreamlineContext &sl = StreamlineContext::get();
 	return sl.render_token != nullptr ? sl.render_token : sl.last_token;
 }
 #endif
 
-// The compositor's back-buffer-sized HUD-less copy and UI alpha, see
-// DLSSEffect::set_frame_generation_hudless().
+// The compositor's back-buffer-sized HUD-less copy and UI alpha.
 static RID frame_generation_hudless;
 static RID frame_generation_ui_alpha;
 
@@ -113,12 +107,11 @@ bool RendererRD::DLSSEffect::frame_generation_hudless_double_buffered() {
 using namespace RendererRD;
 
 #ifdef ENABLE_DLSS
-// DLSS-G asked for by the DLSS pass just recorded (Viewport.frame_generation), enabled or not yet: set when the pass
-// is recorded, consumed by the compositor's HUD-less capture that follows it in the same frame.
+// Set when a DLSS pass asking for DLSS-G is recorded, consumed by the compositor's HUD-less capture
+// that follows it in the same frame.
 static bool frame_generation_dlssg_requested = false;
 
-// DLSS-G can be asked for: a game on hardware that supports it, with DLSS-G (not AMD FSR) as the
-// frame generation provider.
+// A game on supported hardware, with DLSS-G (not AMD FSR) as the frame generation provider.
 static bool dlssg_is_provider() {
 	const StreamlineContext &sl = StreamlineContext::get();
 	bool provider = sl.is_game && sl.streamline_capabilities.dlss_g_available;
@@ -130,19 +123,14 @@ static bool dlssg_is_provider() {
 
 // Texture layout/state constants (avoid including Vulkan/D3D12 headers here).
 static constexpr uint64_t DLSS_VK_IMAGE_LAYOUT_SHADER_READ_ONLY = 5;
-// Vulkan: the DLSS output is written by NGX, so the render graph holds it as a storage image around
-// the callback: TEXTURE_LAYOUT_STORAGE_OPTIMAL, i.e. VK_IMAGE_LAYOUT_GENERAL.
+// Vulkan: NGX writes the DLSS output, so the render graph holds it as a storage image (GENERAL layout).
 static constexpr uint64_t DLSS_VK_IMAGE_LAYOUT_GENERAL = 1;
-// D3D12: every texture handed to Streamline is held by the render graph in the GENERAL layout
-// (D3D12_BARRIER_LAYOUT_COMMON) and announced as D3D12_RESOURCE_STATE_COMMON. Streamline transitions
-// with legacy ResourceBarrier; mixed with Godot's enhanced barriers that is only valid through
-// COMMON (debug layer error #1350 otherwise, from NVIDIA's original integration on).
+// D3D12: textures handed to Streamline are held in the COMMON layout and announced as COMMON: Streamline's
+// legacy barriers may only meet Godot's enhanced barriers there.
 static constexpr uint64_t DLSS_D3D12_RESOURCE_STATE_COMMON = 0x0;
 
-// Single source for "is the DLSS output declared as written": the graph usage in upscale() and
-// the state announced to Streamline in _upscale_internal() must agree, or Streamline issues its
-// barriers from a state the resource is not in. NGX writes the output as a UAV, so in practice
-// it always carries the storage bit; without it, keep the old read declaration.
+// The graph usage in upscale() and the state announced to Streamline in _upscale_internal() must agree,
+// or Streamline issues its barriers from a state the resource is not in.
 static bool dlss_output_is_storage(RID p_output) {
 	return p_output.is_valid() && (RD::get_singleton()->texture_get_format(p_output).usage_bits & RD::TEXTURE_USAGE_STORAGE_BIT);
 }
@@ -150,9 +138,8 @@ static bool dlss_output_is_storage(RID p_output) {
 namespace RendererRD {
 class DLSSContextInner;
 
-// A texture as Streamline is told about it: format and native handles, resolved on the render thread. The DLSS
-// callback runs when the graph is replayed, which may be on another thread once the render thread has moved on to
-// the next frame (RD-REPLAY-THREAD-STUDY.md, step 1a): it must not look anything up through RenderingDevice.
+// A texture's format and native handles, resolved on the render thread. The DLSS callback may run on another
+// thread after the render thread has moved on, so it must not look anything up through RenderingDevice.
 struct DLSSResolvedTexture {
 	bool valid = false;
 	uint32_t width = 0;
@@ -182,9 +169,8 @@ struct DLSSCallbackPayload {
 	DLSSResolvedTexture rr_specular_albedo;
 	DLSSResolvedTexture rr_normal_roughness;
 	DLSSResolvedTexture rr_specular_hit_dist;
-	// The compositor sets the HUD-less color and UI alpha after the 3D pass that recorded this callback: they are
-	// captured when the frame's recording ends (DLSSEffect::finalize_frame_callbacks()), or by the callback itself
-	// when the graph is replayed earlier in the frame (a flush), on the render thread.
+	// The compositor sets the HUD-less color and UI alpha after the 3D pass: they are captured when the frame's
+	// recording ends, or by the callback itself if the graph is replayed earlier (a flush).
 	bool hudless_final = false;
 	DLSSResolvedTexture hudless;
 	DLSSResolvedTexture ui_alpha;
@@ -326,51 +312,28 @@ static Vector<unsigned int> g_dlss_freeViewportIndices;
 static unsigned int g_dlss_viewportIndex = 1;
 
 DLSSContextInner::~DLSSContextInner() {
-	// Release the per-viewport resources Streamline allocated for this context.
-	//
-	// Without this, destroying a context only returned its viewport index to the free list
-	// below -- which hands the very same index to the NEXT context created. Streamline then
-	// reconfigured the feature on a viewport whose previous allocation was still live and
-	// still referenced by command lists that had not retired, so every scaling-mode or
-	// quality change both leaked and aliased GPU resources. Under D3D12 that eventually
-	// removed the device (0x887A0005, faulting module nvwgf2umx.dll).
-	//
-	// Compare FSR2Context::~FSR2Context, which calls ffxFsr2ContextDestroy -- FSR2 never
-	// exhibited the crash.
+	// Order matters: flush, null every resource tag, then free. The viewport index is reused by
+	// the next context, and Streamline caches driver data per native resource.
 	StreamlineContext &sl_ctx = StreamlineContext::get();
 
-	// The frames already handed over to the replay thread run their callbacks (which may turn DLSS-G on for this
-	// viewport) before anything below.
+	// Frames already handed to the replay thread run their callbacks (which may enable DLSS-G) first.
 	RD::get_singleton()->wait_for_frame_threads();
 
-	// DLSS-G first. The only code that turns it off lives in _upscale_internal, which stops
-	// running the moment this context is gone -- switching the viewport to bilinear or FSR2
-	// left frame generation on, consuming depth and motion vectors that configure() was about
-	// to destroy and recreate at the same size. The DLSS-G guide requires eOff before any
-	// resolution change; dlssg_disable() does that and arms the usual re-enable delay.
-	// Sixteen bilinear/DLSS toggles hung the GPU without this; the game only survived them
-	// because its settings code happened to resize the swap chain every time, which reaches
-	// dlssg_disable() through the swap-chain marker.
+	// DLSS-G must be off before the buffers it reads are recreated; nothing else turns it off
+	// once this context is gone.
 	if (sl_ctx.dlssg_viewport == viewport) {
 		sl_ctx.dlssg_disable();
 	}
 
 	if (sl_ctx.slFreeResources != nullptr || sl_ctx.slSetTag != nullptr) {
-		// slFreeResources is documented as requiring any command list with a pending
-		// slEvaluateFeature to be flushed first, "to prevent invalid resource access on the
-		// GPU". Contexts are only destroyed when the render buffers are reconfigured -- a
-		// settings change, not a per-frame event -- so the stall is not on any hot path.
+		// slFreeResources requires command lists with a pending evaluation to be flushed first.
+		// Contexts are only destroyed when the render buffers are reconfigured.
 		RD::get_singleton()->_flush_and_stall_for_all_frames();
 	}
 
 	if (sl_ctx.slSetTag != nullptr) {
-		// Every buffer this context tags is tagged eValidUntilPresent, and the Streamline
-		// programming guide requires such tags to be set to null before the resource is
-		// destroyed, "in order to release the reference held by SL". The render buffers are
-		// about to be rebuilt -- the scaling input, depth, motion vectors and the RR buffers
-		// change size with the quality mode -- so drop every reference now, before any of them
-		// is freed and its address recycled for something else. A null tag needs no command
-		// list. Untagging a type that was never tagged is a no-op.
+		// eValidUntilPresent tags must be nulled before their resources are destroyed, so Streamline
+		// releases its references. Untagging a type that was never tagged is a no-op.
 		const sl::BufferType tagged_types[] = {
 			sl::kBufferTypeScalingInputColor,
 			sl::kBufferTypeScalingOutputColor,
@@ -395,22 +358,13 @@ DLSSContextInner::~DLSSContextInner() {
 	}
 
 	if (sl_ctx.slFreeResources != nullptr) {
-		// DLSS-RR allocates under its own feature id, so releasing only kFeatureDLSS would
-		// leave it behind. last_parameters records what this context actually evaluated.
-		//
-		// DLSS-G is deliberately NOT freed here. Its resources belong to the mode, not to the
-		// context: DLSSGMode::eOff releases them itself, and slFreeResources(kFeatureDLSS_G)
-		// is only meant for integrations that set eRetainResourcesWhenOff (this one does
-		// not). Worse, at this point DLSS-G is still eOn on this viewport with its Present
-		// hook live -- the on/off transitions are driven per frame from _upscale_internal
-		// and the new context reuses this very viewport index -- so freeing under it crashed
-		// the process on D3D12 the moment the frame-generation multiplier changed (2x -> 4x).
+		// DLSS-RR allocates under its own feature id. DLSS-G is not freed here: DLSSGMode::eOff
+		// releases its resources, and slFreeResources(kFeatureDLSS_G) is only for eRetainResourcesWhenOff.
 		if (last_parameters.dlss_rr) {
 			sl_ctx.slFreeResources(sl::kFeatureDLSS_RR, viewport);
 		}
 
-		// The NIS guide: "If previously tagged resources are destroyed (whether they are
-		// volatile or not), slFreeResources must be called unless NIS is no longer used."
+		// NIS requires slFreeResources once its tagged resources are destroyed.
 		if (sl_ctx.dlss_sharpening && last_parameters.sharpness > 0.0f) {
 			sl_ctx.slFreeResources(sl::kFeatureNIS, viewport);
 		}
@@ -464,15 +418,8 @@ static sl::float4x4 sl_make_identity_matrix() {
 	return ret;
 }
 
-// Streamline applies its matrices to row vectors, p' = p * M: sl_matrix_helpers.h composes
-// clipToPrevClip = clipToCameraView * viewToPrevView * viewToClipPrev (first transform on the
-// left) and keeps translations in row 3, and SL's own mvec.hlsl does mul(M, v) on a constant
-// buffer filled row by row, which under HLSL's default column_major packing is v * M.
-// Godot's Projection is the column-vector form (p' = M * p), so Streamline needs its transpose:
-// row i of the sl::float4x4 is column i of the Projection. The rows used to be copied as rows,
-// which handed Streamline M^T -- a camera translation then reprojected as almost no camera
-// motion, and a rotation with the wrong sign. Inverse pairs (clipToCameraView, prevClipToClip)
-// and a still camera (clipToPrevClip = identity) cannot tell the two layouts apart.
+// Streamline applies its matrices to row vectors (p' = p * M), Godot's Projection to column vectors:
+// row i of the sl::float4x4 is column i of the Projection.
 static sl::float4x4 sl_convert_matrix(const Projection &mtx) {
 	sl::float4x4 ret;
 	for (int i = 0; i < 4; i++) {
@@ -593,13 +540,8 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 	for (int i = 0; i < num_resources; i++) {
 		res[i].usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE;
 	}
-	// The output is WRITTEN by the callback (NGX, and NIS after it). Declared as a sample, the
-	// graph saw the callback as one more reader of that texture: nothing ordered the glow and
-	// tonemap passes, which also sample it, after the callback, and the graph's level reordering
-	// ran them first -- every frame displayed the previous frame's DLSS output. Measured in game:
-	// the 3D lagged the UI by exactly one frame of camera motion under DLSS only, and the lag
-	// vanished with --gpu-profile, whose timestamps serialize the graph. MetalFX declares its
-	// destination the same way (metal_fx.cpp).
+	// The callback writes the output: it must be declared as written, or the render graph may
+	// run the passes that read it before the callback.
 	if (payload->output_storage) {
 		res[1].usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE; // res[1] is p_params.output.
 	}
@@ -624,8 +566,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 			return;
 		}
 
-		// The state the render graph actually put the resource in; Streamline tracks nothing
-		// itself (eDisableCLStateTracking) and issues its barriers from this.
+		// The state the render graph put the resource in: with eDisableCLStateTracking, Streamline
+		// issues its barriers from this.
 		uint64_t texture_state = p_storage ? DLSS_VK_IMAGE_LAYOUT_GENERAL : DLSS_VK_IMAGE_LAYOUT_SHADER_READ_ONLY;
 		if (context->is_d3d12) {
 			texture_state = DLSS_D3D12_RESOURCE_STATE_COMMON;
@@ -735,28 +677,13 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 	if (StreamlineContext::get().slSetConstants != nullptr) {
 		sl::float4x4 mtxIdentity = sl_make_identity_matrix();
 
-		// Streamline forms its clip-space point from the pixel and the value it reads in the
-		// tagged depth buffer, then runs it through these matrices. That depth is reverse-Z in
-		// [0,1] (near = 1, depthInverted below). The matrices used to be the raw GL projection
-		// (z in [-1,1], near = -1, not reversed) and p_params.reprojection (z in [-1,1] reversed,
-		// y flipped) — three conventions in one struct, each disagreeing with the depth. Fed
-		// raw, the whole [0,1] range lands in the few centimetres in front of the near plane, so
-		// a camera translation reprojects the sky and a building 30 m away as if both were
-		// 10 cm from the eye; a rotation is a depth-independent homography and comes out right
-		// regardless. Seen as static geometry jumping for a frame under DLSS-G whenever the
-		// camera displacement changed (start of a walk; every physics tick with interpolation
-		// off), never on mouse look.
-		//
-		// So Streamline gets its own set, built in the depth buffer's convention: reverse-Z
-		// remapped to [0,1], y as the GL/D3D projection has it (up), un-jittered as required.
-		// p_params.reprojection is left untouched: the motion vector decode pass above depends
-		// on its [-1,1] convention (motion_vector_inc.glsl remaps depth*2-1 before using it).
+		// Streamline's matrices must be in the tagged depth buffer's clip space (reverse-Z, [0,1]).
+		// p_params.reprojection stays separate: the motion vector decode pass needs it in [-1,1].
 		Projection sl_corr;
 		sl_corr.set_depth_correction(false, true, true);
 		Projection sl_proj = sl_corr * p_params.cam_projection;
 		Projection sl_prev_proj = sl_corr * p_params.prev_cam_projection;
-		// Relative camera motion first (camera_reprojection.h): from the absolute transforms this
-		// was not the identity for a still camera a few km from the origin.
+		// Relative camera motion first, see camera_view_delta().
 		Projection sl_reproj = sl_prev_proj * Projection(camera_view_delta(p_params.prev_cam_transform, p_params.cam_transform)) * sl_proj.inverse();
 
 		context->constants.cameraViewToClip = sl_convert_matrix(sl_proj); // projection mtx (unjittered)
@@ -765,8 +692,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 		context->constants.clipToPrevClip = sl_convert_matrix(sl_reproj); // reprojection matrix
 		context->constants.prevClipToClip = sl_convert_matrix(sl_reproj.inverse()); // inverted reprojection matrix
 
-		// Basis stores its axes transposed, as rows: rows[i] is not axis i. For any camera not
-		// facing world -Z the rows describe a mirrored camera.
+		// Basis stores its axes as columns: rows[i] is not axis i.
 		const Basis &cam_basis = p_params.cam_transform.get_basis();
 		context->constants.cameraPos = sl_convert_vector(p_params.cam_transform.get_origin());
 		context->constants.cameraFwd = sl_convert_vector(-cam_basis.get_column(2));
@@ -816,16 +742,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 			assignResource(resources, resourceTags, numResources, p_payload.rr_specular_hit_dist, sl::kBufferTypeSpecularHitDistance, sl::ResourceLifecycle::eValidUntilPresent);
 		}
 
-		// DLSS-G's HUD-less color: the scene before any canvas, back-buffer-sized, in the back
-		// buffer's color space (RendererCompositorRD::capture_hudless()). Its content is written
-		// later in this frame, after the canvas; that is allowed for eValidUntilPresent, whose
-		// content and state only have to be right at Present. The compositor ends the frame with
-		// the texture sampled, so the read state assignResource() declares is the one it is in.
-		// Without one -- DLSS-G off, a frame where nothing was captured -- the tag is nulled, as
-		// the guide requires before the resource can go away.
-		// With it, the UI alpha (1 where the canvas changed the frame), which lets DLSS-G interpolate
-		// the scene and the UI separately and recompose them (enableUserInterfaceRecomposition, set
-		// below): the HUD-less color alone only attenuates HUD distortion.
+		// DLSS-G's HUD-less color and UI alpha, written later in this frame: eValidUntilPresent only
+		// requires them to be right at Present. Without them, the tags are nulled.
 		const bool dlssg_requested = p_params.dlss_g && dlssg_is_provider();
 		if ((dlssg_requested || StreamlineContext::get().dlssg_viewport == context->viewport) && p_payload.hudless.valid && p_payload.ui_alpha.valid) {
 			assignResource(resources, resourceTags, numResources, p_payload.hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent);
@@ -845,20 +763,16 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 
 	dlss_callback_lap(DLSS_SECTION_TAGS);
 
-	// Toggle DLSS Frame Generation (only enabled in game mode). On D3D12, sl.dlss_g is only loaded
-	// while frame generation is wanted (see the end of this block): until the swap chain has been
-	// recreated with it, slDLSSGSetOptions is null and this waits.
+	// Toggle DLSS Frame Generation (only enabled in game mode). On D3D12, this waits until the swap
+	// chain has been recreated with sl.dlss_g loaded.
 	if (StreamlineContext::get().slDLSSGSetOptions != nullptr && dlssg_is_provider() && StreamlineContext::get().dlssg_loaded) {
 		sl::DLSSGOptions dlssGOptions{};
 		bool wantActivateDLSSG = p_params.dlss_g;
 		bool canActivateDLSSG = StreamlineContext::get().dlssg_delay == 0;
 
-		// Multi Frame Generation: the count is what the caller asks, clamped to what the device
-		// reports (DLSSGState::numFramesToGenerateMax — 1 on 40-series, 3 on 50-series). Asking
-		// for more than the maximum is refused by the runtime, so it is clamped rather than passed.
+		// The runtime refuses more generated frames than the device reports, so the count is clamped.
 		uint32_t wantFrames = MAX(1, p_params.dlss_g_frames);
-		// Read only when a value is about to be applied: the state query also resets the
-		// "frames presented since last call" counter, and there is nothing to learn every frame.
+		// Only queried when applying a value: the query also resets the presented frames counter.
 		bool applyFrames = wantActivateDLSSG && (StreamlineContext::get().dlssg_viewport != context->viewport || StreamlineContext::get().dlssg_frames != wantFrames);
 		if (applyFrames && StreamlineContext::get().slDLSSGGetState != nullptr) {
 			sl::DLSSGState dlssGState{};
@@ -867,14 +781,11 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 			}
 		}
 
-		// UI recomposition needs the HUD-less color and the UI alpha tagged (DLSS-G guide 6.6); it
-		// follows their availability, re-setting the options when that changes.
+		// UI recomposition needs the HUD-less color and the UI alpha tagged.
 		const bool wantUiRecomposition = context->hudless_tagged;
 
-		// UI recomposition is decided when DLSS-G is enabled. Changing it on a running DLSS-G makes NGX
-		// recreate the feature, and the previous one's resources were never released (67 references
-		// left on the device at Streamline shutdown, 143 live D3D12 objects at exit). Turn DLSS-G off
-		// instead -- DLSSGMode::eOff releases its resources -- and let the usual path re-enable it.
+		// Changing UI recomposition on a running DLSS-G leaks the previous NGX feature: turn DLSS-G
+		// off instead (eOff releases its resources) and let the usual path re-enable it.
 		if (wantActivateDLSSG && StreamlineContext::get().dlssg_viewport == context->viewport && StreamlineContext::get().dlssg_ui_recomposition != wantUiRecomposition) {
 			WARN_PRINT(String("DLSS-G: UI recomposition ") + (wantUiRecomposition ? "available" : "unavailable") + ", restarting frame generation.");
 			StreamlineContext::get().dlssg_disable();
@@ -907,10 +818,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 			StreamlineContext::get().dlssg_viewport = sl::ViewportHandle(-1);
 		}
 
-		// Enable new DLSS-G context if needed. Wait a few frames for the HUD-less color and UI alpha
-		// (captured from the request on), so DLSS-G starts with UI recomposition rather than being
-		// restarted for it; without them by then (2D MSAA, several viewports on the window), start
-		// without.
+		// Enable new DLSS-G context if needed. Wait a few frames for the HUD-less color and UI alpha,
+		// so DLSS-G starts with UI recomposition rather than being restarted for it.
 		static constexpr int DLSSG_HUDLESS_WAIT_FRAMES = 5;
 		bool waitForHudless = false;
 		if (canActivateDLSSG && wantActivateDLSSG && StreamlineContext::get().dlssg_viewport != context->viewport && !wantUiRecomposition && StreamlineContext::get().dlssg_hudless_wait < DLSSG_HUDLESS_WAIT_FRAMES) {
@@ -936,10 +845,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 	}
 
 #ifdef D3D12_ENABLED
-	// DLSS-G guide, section 18: the swap chain is torn down and recreated every time DLSS-G is
-	// switched on or off, with sl.dlss_g loaded only while it is on; loaded but off, it renders
-	// off-screen and copies every frame. Asked here, done by the D3D12 driver before its next
-	// Present (Streamline::get_swap_chain_serial(), STREAMLINE_MARKER_BEFORE_SWAPCHAIN_CREATION).
+	// The swap chain is recreated whenever DLSS-G is switched on or off, with sl.dlss_g loaded only
+	// while it is on. The D3D12 driver does it before its next Present.
 	if (context->is_d3d12 && dlssg_is_provider()) {
 		StreamlineContext &sl = StreamlineContext::get();
 		if (p_params.dlss_g && !sl.dlssg_wanted) {
@@ -976,16 +883,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 
 	dlss_callback_lap(DLSS_SECTION_EVALUATE);
 
-	// NIS sharpening
-	// **************
-	// Off unless rendering/streamline/dlss_sharpening is set. `sharpness` is derived from the
-	// viewport's fsr_sharpness, whose default of 0.2 maps to a NIS sharpness of 0.9: every DLSS
-	// user got a heavy sharpening pass they never asked for. Worse, NIS is evaluated in place on
-	// the DLSS output, with the same resource tagged as both its input and its output -- not the
-	// layout its programming guide shows -- and on D3D12 that pass crashed the driver (read of
-	// null in nvwgf2umx.dll, same offset every time, inside the NIS evaluation) whenever the
-	// render buffers had just been reconfigured: a quality or frame-generation change, a
-	// bilinear/DLSS toggle. Skipping the pass removed the crash on the reporter's game.
+	// NIS sharpening, off unless rendering/streamline/dlss_sharpening is set. It runs in place on the
+	// DLSS output, which can crash the D3D12 driver right after the render buffers are reconfigured.
 	if (StreamlineContext::get().dlss_sharpening && p_params.sharpness > 0.0f && StreamlineContext::get().slNISSetOptions != nullptr && StreamlineContext::get().streamline_capabilities.nis_available) {
 		{ // Set NIS settings
 			sl::NISOptions options;
@@ -1021,9 +920,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 	}
 
 #ifdef D3D12_ENABLED
-	// PROTOTYPE (GODOT_FSR_FG): AMD FSR frame generation on top of DLSS upscaling. Depth and the
-	// motion vectors (decoded in place above, no (-1,-1) sentinel left) are final here, and the
-	// frame is presented right after this callback's command list is executed.
+	// AMD FSR frame generation on top of DLSS upscaling: depth and the decoded motion vectors are final here.
 	if (context->is_d3d12 && FSRFrameGenerationD3D12::is_requested() && !p_params.dlss_g) {
 		// Viewport.frame_generation off: no generation, context released.
 		FSRFrameGenerationD3D12::stop_generating();
@@ -1063,7 +960,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 void RendererRD::DLSSEffect::_upscale_internal_graph_callback(RenderingDeviceDriver *p_driver, RDD::CommandBufferID p_command_buffer, void *p_userdata) {
 	DLSSCallbackPayload *payload = (DLSSCallbackPayload *)p_userdata;
 	if (!payload->hudless_final) {
-		// Replayed before its frame's recording ended (a flush, on the render thread): the HUD-less state as it is now.
+		// Replayed before its frame's recording ended (a flush): take the HUD-less state as it is now.
 		dlss_capture_hudless(payload);
 		dlss_pending_payloads.erase(payload);
 	}
@@ -1091,13 +988,8 @@ bool DLSSEffect::frame_generation_wants_hudless() {
 		return true;
 	}
 #endif
-	// From the request on, not only once DLSS-G runs: it is enabled after a delay of several frames
-	// (dlssg_delay), by which time the HUD-less color and UI alpha are tagged and DLSS-G can start
-	// with UI recomposition. Turning recomposition on afterwards makes NGX recreate the feature, and
-	// the previous one was never released: its resources still held 67 references on the device
-	// when Streamline shut down (D3D12 debug layer: 143 live objects at exit).
-	// Consumed: the DLSS pass sets it again every frame it runs with DLSS-G asked for, so switching to
-	// another scaler (no DLSS pass any more) does not leave the capture running.
+	// From the request on, so the HUD-less color is tagged by the time DLSS-G is enabled. Consumed:
+	// the DLSS pass sets it again every frame, so switching to another scaler stops the capture.
 	const bool requested = frame_generation_dlssg_requested;
 	frame_generation_dlssg_requested = false;
 	return requested || StreamlineContext::get().dlssg_viewport != sl::ViewportHandle(-1);

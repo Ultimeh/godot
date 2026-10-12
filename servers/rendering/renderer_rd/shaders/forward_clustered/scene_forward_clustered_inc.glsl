@@ -166,9 +166,9 @@ layout(constant_id = 2) const bool sc_emulate_point_size = false;
 #endif
 
 #ifdef MODE_CUBE_LAYERED
-// The 6 faces of a cube shadow in one pass: a draw covers every face that sees its objects. draw_call.uv_offset (free in
-// depth passes) lists those faces, 3 bits each, and their count in bits 18-20; instance i of the draw is face
-// (i % count) of instance (i / count). With emulated point sizes the instance index is the vertex: one face per draw.
+// The 6 faces of a cube shadow in one pass. draw_call.uv_offset (unused in depth passes) lists the faces of the draw,
+// 3 bits each, and their count in bits 18-20; instance i of the draw is face (i % count) of instance (i / count).
+// With emulated point sizes, the instance index comes from the vertex index and a draw covers a single face.
 #define CUBE_FACE_COUNT ((draw_call.uv_offset >> 18u) & 7u)
 #undef INSTANCE_INDEX
 #ifdef POINT_SIZE_USED
@@ -422,9 +422,8 @@ layout(set = 1, binding = 38, std430) buffer restrict readonly SurfaceSlotBuffer
 }
 surface_slots;
 
-// The element of this invocation, loaded once: not every shader compiler merges repeated buffer loads, and the light
-// loops read the layer mask for every light. The vertex stage reads the buffers (load_element_data()) and passes the
-// values on (instance_data_interp), so the fragment stage reads no buffer for them (load_element_data_interp()).
+// The element of this invocation, loaded once since not every shader compiler merges repeated buffer loads.
+// The vertex stage reads the buffers and passes the values on, so the fragment stage reads no buffer for them.
 uint instance_slot;
 uint surface_slot;
 uint instance_flags;

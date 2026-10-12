@@ -862,11 +862,8 @@ public:
 		TextureLayout layout = TEXTURE_LAYOUT_UNDEFINED;
 	};
 
-	// Called right before a driver callback runs. The render graph's barriers already put these
-	// textures in those layouts, unless the driver does not follow them: D3D12 without enhanced
-	// barriers tracks states itself and only transitions on its own commands. Such a driver must
-	// put them exactly in the state of that layout here, because callbacks hand them to third-party
-	// code (Streamline, FidelityFX) together with that state.
+	// Called right before a driver callback runs. A driver that does not follow the graph's layouts (D3D12 without
+	// enhanced barriers) must put the textures in the state of those layouts, which callbacks pass to third-party code.
 	virtual void command_prepare_callback_textures(CommandBufferID p_cmd_buffer, VectorView<CallbackTexture> p_textures) {}
 
 	/*****************/
@@ -899,11 +896,8 @@ public:
 
 	/// Returns the underlying native command buffer handle (e.g. ID3D12GraphicsCommandList* or VkCommandBuffer).
 	virtual void *command_buffer_get_native_handle(CommandBufferID p_cmd_buffer) { return nullptr; }
-	// A driver callback records on the native command list directly and may leave its own
-	// pipeline, root signature or descriptor heaps bound (Streamline's generic dispatcher does,
-	// and slInit is told not to restore anything). A driver that remembers what it last bound
-	// in order to skip redundant binds must forget it here, or its next dispatch runs on the
-	// callback's state with the driver's descriptors.
+	// A driver callback records on the native command list and may leave its own state bound. A driver that skips
+	// redundant binds must forget what it last bound here.
 	virtual void command_buffer_invalidate_state_cache(CommandBufferID p_cmd_buffer) {}
 
 	/********************/
@@ -999,9 +993,7 @@ public:
 	virtual uint64_t get_resource_native_handle(DriverResource p_type, ID p_driver_id) = 0;
 	virtual uint64_t get_total_memory_used() = 0;
 	virtual uint64_t get_lazily_memory_used() = 0;
-	// Occupancy of the driver's shader-visible descriptor heap, when it has one with a fixed
-	// size. Empty on drivers that allocate descriptors on demand (Vulkan pools, Metal argument
-	// buffers), so a caller printing this must tolerate an empty string.
+	// Occupancy of the driver's shader-visible descriptor heap, when it has a fixed size. Empty otherwise.
 	virtual String get_descriptor_report() { return String(); }
 	virtual uint64_t limit_get(Limit p_limit) = 0;
 	virtual uint64_t api_trait_get(ApiTrait p_trait);

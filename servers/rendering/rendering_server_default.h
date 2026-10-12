@@ -225,16 +225,8 @@ public:
 
 	//these go through command queue if they are in another thread
 
-	// When queued, these carry a snapshot of the image rather than the caller's object. The
-	// caller keeps mutating its Image after the call -- the text server rasterizes the next
-	// glyph into the same atlas through ptrw() -- and with a separate render thread the queued
-	// command would read that live object. ptrw() forks the copy-on-write buffer whenever the
-	// render thread holds a reference to it, and CowData sets its pointer to null while it
-	// copies, so the render thread could observe an empty image ("Condition
-	// 'p_image->is_empty()' is true", and that upload silently lost). Image::duplicate() only
-	// shares the buffer (a refcount increment, no copy); the caller's next ptrw() then forks
-	// *its* side and the snapshot stays immutable. Same as the theora path, which already
-	// builds a fresh Image per frame for exactly this reason.
+	// When queued, these carry a snapshot of the image: the caller may keep writing to its Image (the text server's
+	// glyph atlas does) before the render thread reads it. Image::duplicate() shares the copy-on-write buffer.
 	virtual void texture_2d_update(RID p_texture, const Ref<Image> &p_image, int p_layer) override {
 		WRITE_ACTION
 		if (ASYNC_COND_PUSH) {

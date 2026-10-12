@@ -1235,11 +1235,7 @@ void ParticlesStorage::_particles_process(Particles *p_particles, double p_delta
 
 void ParticlesStorage::particles_set_view_axis(RID p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis) {
 	Particles *particles = particles_owner.get_or_null(p_particles);
-	// Not an error: RendererSceneCull::_scene_cull runs on worker threads and reaches here through
-	// RS::call_on_render_thread, which QUEUES the call from a non-server thread. With a separate
-	// render thread the main thread can queue the free() of these particles in between, so the
-	// deferred call legitimately lands on a base that no longer exists (GPUParticles3D freed the
-	// frame it was last visible). Nothing to align on a freed base; stay silent.
+	// Not an error: the scene cull queues this call, so the particles may have been freed before it runs.
 	if (particles == nullptr) {
 		return;
 	}

@@ -75,10 +75,8 @@ class RenderingShaderContainerD3D12 : public RenderingShaderContainer {
 
 public:
 	static constexpr uint32_t REQUIRED_SHADER_MODEL = 0x62; // D3D_SHADER_MODEL_6_2
-	// Root constants (push constants, NIR runtime data) live in a register space of their own, at registers 0 and 1. Every
-	// resource is in space 0 at register slot * GODOT_NIR_BINDING_MULTIPLIER (_assign_dxil_slots()). D3D12's GPU-based
-	// validation reserves memory in proportion to the register numbers of root parameters: at Mesa's set * 100000000 +
-	// binding * 100000, every root signature asked it for gigabytes and failed with E_OUTOFMEMORY.
+	// Root constants (push constants, NIR runtime data) live in register space 1, and resources in space 0 at compact
+	// slots (see _assign_dxil_slots()): GPU-based validation reserves memory in proportion to root parameter registers.
 	static constexpr uint32_t ROOT_CONSTANT_SPACE = 1;
 	static constexpr uint32_t ROOT_CONSTANT_REGISTER = 0;
 	static constexpr uint32_t RUNTIME_DATA_REGISTER = 1;

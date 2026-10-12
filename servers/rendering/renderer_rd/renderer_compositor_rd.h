@@ -109,15 +109,14 @@ protected:
 
 	HashMap<RID, RID> render_target_descriptors;
 
-	// Frame generation's HUD-less color, see capture_hudless(). One for the main window: DLSS-G and
-	// the FSR prototype only generate frames there.
+	// Frame generation's HUD-less color, see capture_hudless(). Frames are only generated for the main window.
 	struct Hudless {
 		RID render_target; // The render target captured this frame.
 		uint64_t captured_frame = UINT64_MAX;
 		RID pre_ui; // Copy of that render target before its canvas: its size and format.
 		RID pre_ui_uniform_set;
-		// pre_ui blitted exactly like the back buffer: its size, format, color space. Two, alternated,
-		// when the frame generator still reads the previous one during the next frame (FSR async).
+		// pre_ui blitted exactly like the back buffer. Two, alternated, when the frame generator still reads the
+		// previous one during the next frame.
 		RID screens[2];
 		RID screen_framebuffers[2];
 		uint32_t screen_index = 0;

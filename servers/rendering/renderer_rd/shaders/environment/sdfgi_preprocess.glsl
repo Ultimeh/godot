@@ -4,9 +4,8 @@
 
 #VERSION_DEFINES
 
-// Inputs only read are textures read with texelFetch(), not readonly images: the same texel, no filtering, through the
-// texture cache. On an Arc B580 a readonly image read took 2 to 3 times as long, on Vulkan and D3D12 alike (Godot's
-// D3D12 driver binds such images as UAVs). Images both read and written in one dispatch stay images.
+// Inputs that are only read are textures read with texelFetch() rather than readonly images, which go through a slower
+// path on some GPUs. Images both read and written in one dispatch stay images.
 #extension GL_EXT_samplerless_texture_functions : require
 
 #ifdef MODE_JUMPFLOOD_OPTIMIZED
@@ -83,10 +82,9 @@ uint get_facing(ivec3 p_pos) {
 	return (v >> ((ofs % 4) * 8)) & 0xFF;
 }
 
-// The occlusion of the workgroup's region: propagated here and written to dst_occlusion once, at the end. Every value
-// the passes below read was written earlier in the same dispatch by the same workgroup, inside its own region (the
-// regions of a dispatch do not overlap), so it never needed the image: read-write image accesses are the slow path on
-// Intel Arc. Kept as the 8 bits the R8_UNORM image stores, so the propagation computes the same values.
+// The occlusion of the workgroup's region, propagated here and written to dst_occlusion once at the end. This relies on
+// each workgroup only reading what it wrote in its own region, as the regions of a dispatch do not overlap. Values keep
+// the 8 bits of the R8_UNORM image, so the propagation computes the same results.
 shared uint occlusion_values[(OCCLUSION_SIZE * 2) * (OCCLUSION_SIZE * 2) * (OCCLUSION_SIZE * 2)];
 
 uint get_occlusion_offset(ivec3 p_pos) {

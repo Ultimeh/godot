@@ -123,10 +123,8 @@ vec3 screen_space_dither(vec2 frag_coord) {
 
 void main() {
 #ifdef UI_ALPHA
-	// 1 wherever the canvas changed the pixel, 0 elsewhere. The two texels come from the same format
-	// through the same sampler and coordinates, so equal means untouched. With the UI color taken
-	// as the final color there, Final = UI + (1 - alpha) * HUD-less holds exactly, as DLSS-G
-	// requires; behind a translucent UI the scene is simply treated as UI.
+	// 1 wherever the canvas changed the pixel, 0 elsewhere, so Final = UI + (1 - alpha) * HUD-less holds exactly,
+	// as DLSS-G requires. Behind a translucent UI the scene is treated as UI.
 	color = vec4(any(notEqual(texture(src_rt, uv).rgb, texture(pre_ui_rt, uv).rgb)) ? 1.0 : 0.0);
 	return;
 #endif

@@ -1537,13 +1537,9 @@ uint32_t RenderingDeviceGraph::_draw_list_instruction_size(const DrawListInstruc
 }
 
 uint32_t RenderingDeviceGraph::_plan_parallel_slices(const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, CommandBufferPool &r_command_buffer_pool) {
-	// Estimate the recording cost of every command, in bytes of draw list instructions (0.5-0.7 us per KiB with D3D12
-	// on NVIDIA): lists cost their instructions plus their render pass and about 768 bytes more per pipeline they bind,
-	// other commands (dispatches, clears, copies between resources) about 2 KiB, buffer or texture updates about
-	// 1.25 KiB per copy, and a driver callback (Streamline: DLSS, DLSS-G tags) about 64 KiB, as fitted on the slices of
-	// two game frames (a pipeline bind 0.6-1.35 us, a copy about 1 us, another command 1.7-2.3 us). Recording stops being
-	// parallel at the first draw list that splits the command buffer (the swap chain blit): from there on it switches
-	// command buffers, which only the serial path does.
+	// Estimate the recording cost of every command in bytes of draw list instructions, with fixed costs per render pass,
+	// pipeline bind, other command, copy and driver callback. Recording stops being parallel at the first draw list that
+	// switches command buffers (the swap chain blit), which only the serial path does.
 	const uint32_t COMMAND_COST = 2048;
 	const uint32_t RENDER_PASS_COST = 256;
 	const uint32_t COPY_COST = 1280;
@@ -1612,10 +1608,9 @@ uint32_t RenderingDeviceGraph::_plan_parallel_slices(const RecordedCommandSort *
 		return 0;
 	}
 
-	// Cut the commands into contiguous slices of about the same cost. Every command list costs the driver something at
-	// submission, so a slice much smaller than the others joins the one before it. A driver callback (Streamline) starts
-	// a slice that the thread ending the graph records first, in order, as callbacks always were; the commands after the
-	// callback fill that slice up to the next cut. A draw list too large for one slice is cut after one of its draws.
+	// Cut the commands into contiguous slices of about the same cost; a slice much smaller than the others joins the one
+	// before it. A driver callback starts a slice that the thread ending the graph records first, in order. A draw list
+	// too large for one slice is cut after one of its draws.
 	const uint64_t slice_cost = total_cost / parallel_slice_count;
 	parallel_replays.clear();
 	uint32_t slice_count = 0;
@@ -2326,10 +2321,9 @@ void RenderingDeviceGraph::initialize(RDD *p_driver, RenderPassCreationFunction 
 	driver_clears_with_copy_engine = driver->api_trait_get(RDD::API_TRAIT_CLEARS_WITH_COPY_ENGINE);
 	driver_buffers_require_transitions = driver->api_trait_get(RDD::API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS);
 
-	// The frame's commands are recorded in up to 6 command buffers at once (D3D12 with enhanced barriers, Vulkan on
-	// desktop; Adreno workaround off); GODOT_PARALLEL_RECORDING=N changes that count, 0 or 1 records serially. GODOT_PARALLEL_RECORDING_MIN
-	// is the smallest frame worth splitting, in bytes of commands. GODOT_PARALLEL_RECORDING_STATS=1 prints the cost of
-	// end() every 240 frames.
+	// Record the frame's commands in several command buffers at once (D3D12 with enhanced barriers, desktop Vulkan).
+	// GODOT_PARALLEL_RECORDING=N sets the count (0 or 1: serial), GODOT_PARALLEL_RECORDING_MIN the smallest frame worth
+	// splitting in bytes of commands, GODOT_PARALLEL_RECORDING_STATS=1 prints the cost of end().
 	const uint32_t DEFAULT_PARALLEL_SLICE_COUNT = 6;
 	command_queue_family = p_secondary_command_queue_family;
 	const String parallel_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_RECORDING");
@@ -3510,9 +3504,8 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 					parallel_slices_done.set(0);
 					parallel_claim.store(generation_bits, std::memory_order_release);
 
-					// Up to N - 1 workers; this thread is the N-th once its driver callbacks are recorded. When it has
-					// callbacks to record (a slice of their own, ~300 us with DLSS and DLSS-G), it would only take a whole
-					// slice after them and finish last: then N workers take the N slices.
+					// Up to N - 1 workers; this thread is the N-th. When it has driver callbacks to record, it would
+					// finish last if it took another slice after them, so N workers take the N slices.
 					const bool has_pinned_slices = parallel_claimable_slices.size() < parallel_slices.size();
 					const uint32_t worker_count = MIN(parallel_claimable_slices.size(), has_pinned_slices ? parallel_slice_count : parallel_slice_count - 1);
 					const bool use_workers = worker_count > 0;
@@ -3544,7 +3537,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 						const uint64_t wait_end_usec = OS::get_singleton()->get_ticks_usec();
 						stats_calling_usec = wait_begin_usec - calling_begin_usec;
 						stats_wait_usec = wait_end_usec - wait_begin_usec;
-						// Counted here rather than by each worker: counting after its slice delayed the join.
+						// Counted here rather than by each worker, so counting does not delay the join.
 						uint64_t last_worker_end_usec = 0;
 						for (ParallelSlice &slice : parallel_slices) {
 							_count_parallel_slice(slice);

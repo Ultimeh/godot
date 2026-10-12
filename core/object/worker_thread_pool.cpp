@@ -175,14 +175,8 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 			}
 		}
 
-		// SHUTDOWN RACE. _handle_runlevel() only marks a thread idle for PRE_EXIT_LANGUAGES
-		// when BOTH queues are empty. A thread woken by _switch_runlevel() while a
-		// low-priority task was still queued therefore skips the mark, finds nothing in the
-		// high-priority queue and goes back to sleep -- and nothing ever wakes it again once
-		// that task is done, so exit_languages_threads() waits forever. Seen in an editor
-		// dump (2026-09-14): runlevel 1, both queues empty, 5 of 16 threads idle, the other
-		// 11 asleep in _thread_function with signaled == false. The thread that drains the
-		// last task pokes the stragglers so they re-evaluate the runlevel.
+		// A thread woken for PRE_EXIT_LANGUAGES while a low-priority task was still queued went back to sleep
+		// without being marked idle. Wake the remaining threads once both queues are empty so they re-evaluate the runlevel.
 		if (unlikely(runlevel == RUNLEVEL_PRE_EXIT_LANGUAGES) && !task_queue.first() && !low_priority_task_queue.first()) {
 			for (uint32_t i = 0; i < threads.size(); i++) {
 				if (!threads[i].pre_exited_languages) {
@@ -582,13 +576,8 @@ void WorkerThreadPool::_wait_collaboratively(ThreadData *p_caller_pool_thread, T
 		}
 
 		if (task_to_process) {
-			// `yield_is_over` lives on the ThreadData, not on the Task, so it is shared between
-			// this waiter and whatever nested task we are about to run on the same pool thread.
-			// If that task yields too -- ResourceLoader does -- its wait consumes the flag, and
-			// the wake-up meant for us is gone. Our caller is then never notified again:
-			// notify_yield_over() is one-shot for ResourceLoader, and CommandQueueMT only
-			// re-notifies while its queue is empty. Stash the flag across the nested run so the
-			// nested waiter can only consume wake-ups that arrive during its own execution.
+			// `yield_is_over` belongs to the thread, so a nested task that yields would consume a wake-up meant for
+			// this waiter. Keep it aside during the nested run.
 			bool outer_yield_is_over;
 			{
 				MutexLock lock(task_mutex);
@@ -883,9 +872,7 @@ void WorkerThreadPool::exit_languages_threads() {
 	_switch_runlevel(RUNLEVEL_PRE_EXIT_LANGUAGES);
 	while (runlevel_data.pre_exit_languages.num_idle_threads != threads.size()) {
 		control_cond_var.wait(lock);
-		// Belt and braces for the race described in _process_task(): every time the count
-		// moves, poke the threads that have not reported yet so a lost wake-up cannot
-		// strand the shutdown.
+		// Wake the threads that have not reported yet, so a lost wake-up cannot block the shutdown (see _process_task()).
 		if (!task_queue.first() && !low_priority_task_queue.first()) {
 			for (uint32_t i = 0; i < threads.size(); i++) {
 				if (!threads[i].pre_exited_languages) {

@@ -389,13 +389,9 @@ static const glsl_type *_arrayed_resource_type(const glsl_type *p_type) {
 	return glsl_sampler_type(dim, glsl_sampler_type_is_shadow(p_type), true, result_type);
 }
 
-// Declares every 1D, 2D and cube texture, and every 1D and 2D image, as an array read at layer 0.
-// A slice of a texture array other than the first can only be a Texture2DArray view in D3D12 (a Texture2D view
-// cannot select a slice), and a shader that declares Texture2D over such a view breaks the rule that the view
-// dimension matches the declaration (Unreal enforces the same). NVIDIA honours the view's first slice anyway, but
-// GPU-based validation resolves the access as slice 0 of the resource (the sky radiance roughness passes showed up
-// as "UAV in SHADER_RESOURCE"), and nothing obliges another driver to honour it. With arrays everywhere, the
-// driver binds array views (RenderingDeviceDriverD3D12::uniform_set_create()) and the two always match.
+// Declares every 1D, 2D and cube texture, and every 1D and 2D image, as an array read at layer 0. Only an array view
+// can select a slice of a texture array, and D3D12 requires the view dimension to match the declaration, so the
+// driver binds array views everywhere (see RenderingDeviceDriverD3D12::uniform_set_create()).
 static bool _declare_resources_as_arrays(nir_shader *p_shader) {
 	bool changed = false;
 	nir_foreach_variable_with_modes(var, p_shader, nir_var_uniform | nir_var_image) {
@@ -478,15 +474,9 @@ static bool _declare_resources_as_arrays(nir_shader *p_shader) {
 	return true;
 }
 
-// Moves the constant arrays a shader indexes at run time out of the invocation, into global constants of the DXIL
-// module: what DXC does with a `static const` array. glslang copies a constant array into a local one before every
-// dynamic read of it, and nir_to_dxil keeps that local array (an `alloca`): SSAO and SSIL refill their 32-entry
-// `sample_pattern` (128 floats) at each tap. Intel's compiler puts such arrays in scratch memory; on an Arc B580 at
-// 1080p, SSAO and SSIL took ten times their Vulkan time (SSIL 2.8 ms against 0.25).
-// A local array qualifies when it is only read and stored through direct element derefs, and every store to an element
-// writes the same constant: a read then sees that constant, or reads an element never written, which is undefined
-// anyway. nir_opt_large_constants() does not take these arrays: they are filled in more than one block (once per
-// inlined call), and nir_to_dxil cannot read the constant data it produces.
+// Moves the constant arrays a shader indexes at run time into global constants of the DXIL module, as DXC does with a
+// `static const` array: glslang copies a constant array into a local one before every dynamic read, which nir_to_dxil
+// keeps as an `alloca`. Only arrays whose elements are only ever stored with the same constant qualify.
 static bool _move_constant_arrays_to_globals(nir_shader *p_shader) {
 	nir_function_impl *impl = nir_shader_get_entrypoint(p_shader);
 
@@ -741,15 +731,8 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 #endif
 		};
 
-		// Intel GPUs hang (DXGI_ERROR_DEVICE_HUNG) on the DXIL that a GLSL `discard` produces:
-		// SPIR-V has no conditional OpKill, so it is always a branch, and a divergent branch
-		// followed by a loop (the light loops) trips the driver. nir_to_dxil already runs
-		// nir_opt_peephole_select with these exact options in its optimization loop, but
-		// without `discard_ok`; that flag lets the pass hoist the discard out of the branch
-		// into a `discard_if(cond)`, which DXIL emits as a plain conditional `dx.op.discard`.
-		// Same semantics, no divergent control flow. Applied on every vendor on purpose: the
-		// shader cache is not keyed on the GPU, so gating it would break laptops with an
-		// Intel iGPU next to a discrete GPU. See godotengine/godot#118719, #120857, #122994.
+		// A GLSL `discard` reaches DXIL as a divergent branch, which hangs Intel GPUs when a loop follows it.
+		// `discard_ok` turns it into a conditional discard. Applied on every GPU: the shader cache is not keyed on it.
 		{
 			nir_opt_peephole_select_options peephole_options = {};
 			peephole_options.limit = 8;

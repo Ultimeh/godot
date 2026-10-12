@@ -8379,9 +8379,8 @@ void RenderingDevice::swap_buffers(bool p_present) {
 	}
 
 	if (submit_after_previous_frame && !submit_thread_enabled) {
-		// The CPU has recorded this frame while the GPU rendered the previous one; submit it only once that one
-		// has finished, so the GPU queue drains between frames (see vsync/submit_after_previous_frame). The
-		// submission thread does this wait itself, and this thread records the next frame meanwhile.
+		// Submit this frame only once the previous one has finished, so the GPU queue drains between frames. The
+		// submission thread does this wait itself when it runs.
 		_stall_for_frame((frame + frames.size() - 1) % frames.size());
 	}
 
@@ -8814,7 +8813,7 @@ void RenderingDevice::_replay_thread_func(void *p_userdata) {
 			rd->replay_jobs.remove_at(0);
 
 			// The previous frame is submitted and presented before this one's driver callbacks run: DLSS-G's tags of
-			// frame N+1 must follow Present(N), as when everything ran on the render thread.
+			// frame N+1 must follow Present(N).
 			if (rd->submit_jobs_done + 1 < job.id) {
 				const uint64_t wait_begin_usec = OS::get_singleton()->get_ticks_usec();
 				while (rd->submit_jobs_done + 1 < job.id) {
@@ -9319,11 +9318,11 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 		driver->command_timestamp_query_pool_reset(frames[0].command_buffer, frames[i].timestamp_pool, max_timestamp_query_elements);
 	}
 
-	// Vulkan only: the hiccups it removes were seen with Vulkan presentation; D3D12 did not need it.
+	// Only Vulkan presentation needs it.
 	submit_after_previous_frame = main_surface != 0 && frames.size() > 1 && driver->get_api_name() == "Vulkan" && bool(GLOBAL_GET("rendering/rendering_device/vsync/submit_after_previous_frame"));
 
-	// With a window, frames are submitted and presented by a thread of their own (GODOT_SUBMIT_THREAD=0: by the render
-	// thread, as before). D3D12, and Vulkan on desktop without OpenXR (its runtime submits to the main queue itself).
+	// With a window, frames are submitted and presented by a thread of their own (GODOT_SUBMIT_THREAD=0 disables it).
+	// D3D12, and Vulkan on desktop without OpenXR (its runtime submits to the main queue itself).
 	frame_stats.enabled = is_main_instance && (OS::get_singleton()->get_environment("GODOT_RD_STATS") == "1" || OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS_STATS") == "1");
 	bool submit_thread_api = driver->get_api_name() == "D3D12";
 	if (driver->get_api_name() == "Vulkan" && !OS::get_singleton()->has_feature("mobile")) {
@@ -9344,7 +9343,7 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 		submit_thread.start(_submit_thread_func, this);
 		print_verbose("RenderingDevice: frames are submitted and presented by a thread of their own.");
 
-		// And replayed by another (GODOT_RD_REPLAY_THREAD=0: by the render thread, as before).
+		// And replayed by another (GODOT_RD_REPLAY_THREAD=0 disables it).
 		replay_thread_enabled = OS::get_singleton()->get_environment("GODOT_RD_REPLAY_THREAD") != "0";
 		if (replay_thread_enabled) {
 			replay_thread.start(_replay_thread_func, this);

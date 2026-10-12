@@ -135,9 +135,7 @@ class CommandQueueMT {
 		pending.store(true);
 	}
 
-	// Negative control: setting GODOT_QUEUE_NOTIFY_ALWAYS=1 restores the previous behaviour of
-	// signalling the pump for every single command. Both paths live in the same binary so they
-	// can be compared back to back, on the same scene, without rebuilding.
+	// GODOT_QUEUE_NOTIFY_ALWAYS=1 wakes the pump for every command.
 	static inline const bool notify_every_command = []() {
 		const char *v = std::getenv("GODOT_QUEUE_NOTIFY_ALWAYS");
 		return v != nullptr && v[0] == '1';
@@ -147,38 +145,14 @@ class CommandQueueMT {
 	_FORCE_INLINE_ void _push_internal(Args &&...args) {
 		MutexLock mlock(mutex);
 
-		// Only wake the pump when the queue goes from empty to non-empty.
-		//
-		// notify_yield_over() locks the WorkerThreadPool's global task mutex, looks the task up
-		// in a hash map and signals a condition variable -- i.e. a kernel wake-up. Doing that for
-		// *every* command is what an ETW profile of this project showed: on a 400-entity scene,
-		// SwapContext accounted for 39% of the process' CPU samples and KeAlertThreadByThreadIdEx
-		// for 26%, with almost nothing left for actual work.
-		//
-		// While `pending` is true the pump has already been signalled and has not finished
-		// draining: _flush() re-reads command_mem.size() on every iteration under this same
-		// mutex, so commands appended in the meantime are picked up without a new signal.
-		// `pending` is only cleared by _flush(), also under this mutex, so the test cannot race.
+		// Only wake the pump when the queue goes from empty to non-empty: each wake-up is a kernel call. While `pending`
+		// is set, _flush() has not finished draining and picks up the commands appended meanwhile.
 		const bool was_idle = !pending.load(std::memory_order_relaxed);
 
 		create_command<T>(std::forward<Args>(args)...);
 
-		// A synchronous push always notifies, whatever `pending` says. `NeedsSync` is a template
-		// parameter, so for the fire-and-forget pushes -- the thousands per frame this whole
-		// change exists to make cheaper -- the condition folds back to `was_idle` at compile time
-		// and costs nothing. A synchronous caller is about to block on sync_cond_var anyway, so
-		// the wake-up is free next to the round trip it is already paying for.
-		//
-		// This is the safety net. The reasoning above assumes every consumed wake-up is followed
-		// by a drain, and the engine does not honour that everywhere: `yield_is_over` lives on the
-		// ThreadData so a nested yield can steal it, `flushing` is thread_local and shared across
-		// queues so _flush() can return without draining, and the physics pump skips its drain
-		// while `doing_sync` is armed. Any of those consumes a wake-up without draining, and with
-		// `pending` stuck true nothing would ever notify again -- an unrecoverable freeze,
-		// observed in a dump: main thread parked in push_and_sync, render pump asleep in yield().
-		// Because RenderingServer::sync() runs once per frame and is a synchronous push, it now
-		// acts as a heartbeat that drains everything. The worst case degrades to one frame of
-		// latency instead of a deadlock, and the global invariant no longer has to hold.
+		// A synchronous push always notifies, whatever `pending` says: a wake-up consumed without a drain would
+		// otherwise leave `pending` set and freeze the queue. RenderingServer::sync() then recovers it once per frame.
 		if (pump_task_id != WorkerThreadPool::INVALID_TASK_ID && (was_idle || NeedsSync || notify_every_command)) {
 			WorkerThreadPool::get_singleton()->notify_yield_over(pump_task_id);
 		}

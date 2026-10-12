@@ -95,8 +95,7 @@ void RenderSceneBuffersRD::update_sizes(NamedTexture &p_named_texture) {
 	}
 }
 
-// Shared by ensure_upscaled() and the preservation check in configure(), so the two cannot
-// drift apart and silently start disagreeing about whether a target can be reused.
+// Shared by ensure_upscaled() and configure(), which must agree on whether the upscaled target can be kept.
 static uint32_t upscaled_usage_bits(bool p_can_be_storage) {
 	uint32_t usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | (p_can_be_storage ? RD::TEXTURE_USAGE_STORAGE_BIT : 0) | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
 	usage_bits |= RD::TEXTURE_USAGE_INPUT_ATTACHMENT_BIT;
@@ -188,18 +187,8 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
 
 	update_samplers();
 
-	// The upscaled target is handed to the upscaler as its output. Under Streamline it is
-	// tagged kBufferTypeScalingOutputColor and, unlike the scaling input, is passed without a
-	// clone -- Streamline caches driver data for it keyed on the ID3D12Resource pointer.
-	// Destroying and recreating it on every scaling change lets the D3D12 allocator hand the
-	// same address back for an unrelated resource (NGX's own history buffers were observed
-	// landing on it), after which a cache hit binds a stale descriptor and the GPU hangs:
-	// device removed, 0x887A0005, faulting module nvwgf2umx.dll.
-	//
-	// Nothing about this target depends on the scaling mode or quality -- upscaler output is
-	// always target_size -- so recreating it was never necessary. Keep it whenever every
-	// parameter that defines it is unchanged; a differing size, format or usage still falls
-	// through to the normal destroy-and-recreate path below.
+	// Keep the upscaled target while its size, format and usage are unchanged. Streamline caches driver data keyed
+	// on its resource pointer, and a new resource reusing that address would hit a stale cache entry.
 	const NTKey upscaled_key(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
 	NamedTexture preserved_upscaled;
 	bool preserve_upscaled = false;

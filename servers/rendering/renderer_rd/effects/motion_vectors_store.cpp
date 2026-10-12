@@ -68,7 +68,7 @@ void MotionVectorsStore::process(Ref<RenderSceneBuffersRD> p_render_buffers,
 
 		Projection correction;
 		correction.set_depth_correction(true, true, false);
-		// Relative camera motion first: see camera_reprojection.h.
+		// Relative camera motion first, see camera_view_delta().
 		Projection reprojection = (correction * p_previous_projection) * Projection(camera_view_delta(p_previous_transform, p_current_transform)) * (correction * p_current_projection).inverse();
 		RendererRD::MaterialStorage::store_camera(reprojection, push_constant.reprojection_matrix);
 	}

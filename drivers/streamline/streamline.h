@@ -60,20 +60,18 @@ public:
 
 	void update_project_settings();
 
-	// D3D12: the kind of swap chain frame generation needs changed (DLSS-G to be loaded or
-	// unloaded, DLSS-G guide section 18). The D3D12 driver recreates a swap chain whose creation
-	// serial differs. Any thread.
+	// D3D12: bumped when DLSS-G must be loaded or unloaded, which requires a new swap chain.
+	// The D3D12 driver recreates a swap chain whose creation serial differs. Any thread.
 	uint32_t get_swap_chain_serial() const { return swap_chain_serial.get(); }
 	void bump_swap_chain_serial() { swap_chain_serial.increment(); }
 
-	// The frame token of the draw the render thread is executing, and the one a submission thread presents with:
-	// present markers must carry the token of the frame being presented, which the render thread has already left.
+	// Present markers must carry the token of the frame being presented, which the render thread has already left.
 	// 0 (the default on every thread) uses the draw's own token.
 	uint64_t get_render_frame_token() const;
 	static void set_present_frame_token(uint64_t p_token);
 
-	// Vulkan: Streamline's latency markers (vkSetLatencyMarkerNV) and the swap chain's present use the same
-	// VkSwapchainKHR, which needs external synchronization, from different threads: both hold this lock.
+	// Vulkan: latency markers and present use the same VkSwapchainKHR from different threads,
+	// which requires external synchronization.
 	static Mutex &get_swap_chain_mutex();
 
 	Streamline();

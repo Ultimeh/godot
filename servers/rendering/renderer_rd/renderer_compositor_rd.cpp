@@ -122,10 +122,8 @@ void RendererCompositorRD::blit_render_targets_to_screen(DisplayServerEnums::Win
 
 	RD::get_singleton()->draw_list_end();
 
-	// Frame generation's HUD-less color: the render target captured before its canvas goes through
-	// the very blit the back buffer just got, so both share size, format, color space and
-	// post-processing, as DLSS-G and FSR require. Only a single, plain blit has a HUD-less
-	// counterpart; anything else hands out none this frame.
+	// Frame generation's HUD-less color goes through the same blit as the back buffer, so both share size, format
+	// and color space. Only a single, plain blit has a HUD-less counterpart.
 	if (p_screen == DisplayServerEnums::MAIN_WINDOW_ID && hudless.pre_ui.is_valid()) {
 		const bool plain_blit = p_amount == 1 && !p_render_targets[0].lens_distortion.apply && !p_render_targets[0].multi_view.use_layer;
 		if (plain_blit && hudless.captured_frame == frame && p_render_targets[0].render_target == hudless.render_target) {
@@ -207,8 +205,7 @@ void RendererCompositorRD::_blit_hudless(DisplayServerEnums::WindowID p_screen, 
 	if (hudless.screens[0].is_valid()) {
 		const RD::TextureFormat screen_texture_format = RD::get_singleton()->texture_get_format(hudless.screens[0]);
 		if (screen_texture_format.format != screen_format || screen_texture_format.width != screen_width || screen_texture_format.height != screen_height) {
-			// Recreated at the back buffer's new size or format (a resize also turns DLSS-G off).
-			// The next DLSS pass nulls the old tag; RenderingDevice defers the actual release.
+			// The next DLSS pass nulls the old tag before RenderingDevice releases the textures.
 			RendererRD::DLSSEffect::set_frame_generation_hudless(RID(), RID());
 			_free_hudless_screens();
 			RD::get_singleton()->free_rid(hudless.ui_alpha);
@@ -242,12 +239,8 @@ void RendererCompositorRD::_blit_hudless(DisplayServerEnums::WindowID p_screen, 
 		tf.usage_bits = RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT;
 		Vector<RID> attachments;
 
-		// DLSS-G's UI alpha: single channel, back-buffer-sized, 0 where there is no UI (Streamline's
-		// "UI Alpha", preferred over "UI Color and Alpha"). Not R8: RenderingDevice creates D3D12
-		// resources in the typeless family and Streamline types its views from the resource's own
-		// format, with a table that has R16_TYPELESS but no R8_TYPELESS. An R8 UI alpha got an
-		// R8_TYPELESS SRV and the device was removed (DXGI_ERROR_INVALID_CALL) as soon as UI
-		// recomposition turned on.
+		// DLSS-G's UI alpha, 0 where there is no UI. Not R8: D3D12 resources are typeless and Streamline
+		// cannot create views for R8_TYPELESS.
 		tf.format = RD::DATA_FORMAT_R16_SFLOAT;
 		hudless.ui_alpha = RD::get_singleton()->texture_create(tf, RD::TextureView());
 		ERR_FAIL_COND(hudless.ui_alpha.is_null());
@@ -258,8 +251,7 @@ void RendererCompositorRD::_blit_hudless(DisplayServerEnums::WindowID p_screen, 
 	}
 
 	const BlitPipelines pipelines = _get_blit_pipelines_for_format(RD::get_singleton()->framebuffer_get_format(hudless.screen_framebuffer));
-	// Cleared like draw_list_begin_for_screen() clears the back buffer, for whatever the blit
-	// leaves uncovered (letterboxing).
+	// Cleared like the back buffer, for whatever the blit leaves uncovered (letterboxing).
 	const Color clear_color[1] = { Color() };
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(hudless.screen_framebuffer, RD::DRAW_CLEAR_COLOR_0, VectorView<Color>(clear_color, 1));
 	ERR_FAIL_COND(draw_list == RD::INVALID_ID);
@@ -301,16 +293,15 @@ void RendererCompositorRD::_blit_hudless(DisplayServerEnums::WindowID p_screen, 
 	RD::get_singleton()->draw_list_draw(draw_list, true);
 	RD::get_singleton()->draw_list_end();
 
-	// DLSS-G and FSR read these textures at Present, after everything recorded here, in the state
-	// they were told: a shader read (D3D12 NON_PIXEL_SHADER_RESOURCE, see dlss.cpp). Make the
-	// render graph's last use of them this frame a sample, so they are left in exactly that state.
+	// The frame generator reads these textures at Present in the state it was told, so the render graph's last use
+	// of them this frame must leave them in that state.
 	RD::CallbackResource ready[2];
 	ready[0].rid = hudless.screen;
 	ready[0].usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE;
 	ready[1].rid = hudless.ui_alpha;
 	ready[1].usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE;
 	if (RD::get_singleton()->get_device_api_name() == "D3D12") {
-		// Read by DLSS-G or AMD's swap chain at Present with legacy barriers from COMMON (dlss.cpp).
+		// Read at Present with legacy barriers from COMMON.
 		ready[0].usage = RD::CALLBACK_RESOURCE_USAGE_GENERAL;
 		ready[1].usage = RD::CALLBACK_RESOURCE_USAGE_GENERAL;
 	}
@@ -333,8 +324,7 @@ void RendererCompositorRD::_free_hudless_screens() {
 }
 
 void RendererCompositorRD::_free_hudless() {
-	// Stop handing the texture out first: the next DLSS pass then nulls its Streamline tag, before
-	// RenderingDevice's deferred free can release the resource.
+	// Stop handing the texture out first, so the next DLSS pass nulls its Streamline tag before the resource is released.
 	RendererRD::DLSSEffect::set_frame_generation_hudless(RID(), RID());
 	_free_hudless_screens();
 	if (hudless.ui_alpha.is_valid()) {

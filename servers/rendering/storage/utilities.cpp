@@ -55,10 +55,8 @@ Dependency::~Dependency() {
 #ifdef DEBUG_ENABLED
 		WARN_PRINT("Leaked instance dependency: Bug - did not call instance_notify_deleted when freeing.");
 #endif
-		// Always unlink, not only in debug builds: a tracker that outlives this dependency
-		// (instances leaked at exit are destroyed by ~RendererSceneCull *after* the storages)
-		// would otherwise dereference it from DependencyTracker::clear() — heap corruption
-		// (0xC0000374) or an access violation at process exit in release templates.
+		// Always unlink, not only in debug builds: instances leaked at exit are destroyed after the storages,
+		// and their trackers would otherwise dereference this dependency in DependencyTracker::clear().
 		for (const KeyValue<DependencyTracker *, uint32_t> &E : instances) {
 			E.key->dependencies.erase(this);
 		}

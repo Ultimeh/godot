@@ -138,8 +138,8 @@ layout(location = 9) out float dp_clip;
 
 #endif
 
-// Instance slot, flags, GI offset, layer mask. With MODE_CUBE_LAYERED, the cube face in the top 3 bits of the slot: no
-// varying of its own, the material's start at 15.
+// Instance slot, flags, GI offset, layer mask. With MODE_CUBE_LAYERED, the cube face is in the top 3 bits of the slot,
+// so it needs no varying of its own (the material's varyings start at 15).
 layout(location = 10) out flat uvec4 instance_data_interp;
 
 #ifdef USE_MULTIVIEW

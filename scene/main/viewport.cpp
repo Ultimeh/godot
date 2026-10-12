@@ -5084,9 +5084,8 @@ bool Viewport::get_frame_generation() const {
 	return frame_generation;
 }
 
-// Frames DLSS-G generates between two rendered ones, plus one: 2 is the classic 2x, 3 and 4
-// are Multi Frame Generation, which the runtime only grants on hardware that supports it
-// (DLSSGState::numFramesToGenerateMax). The renderer clamps to what the device reports.
+// 2 is 2x frame generation; 3 and 4 are Multi Frame Generation, which only some hardware supports.
+// The renderer clamps to what the device reports.
 void Viewport::set_frame_generation_multiplier(int p_multiplier) {
 	ERR_MAIN_THREAD_GUARD;
 	p_multiplier = CLAMP(p_multiplier, 2, 4);

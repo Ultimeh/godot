@@ -654,9 +654,8 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 			bool indirect = bool(surf->owner->base_flags & INSTANCE_DATA_FLAG_MULTIMESH_INDIRECT);
 
 			if constexpr (p_pass_mode == PASS_MODE_SHADOW_CUBE) {
-				// The faces that see the element, 3 bits each, their count in bits 18-20 (CUBE_FACE in the shader): one
-				// draw instanced once per face. Indirect draws and emulated point sizes can't multiply their instance
-				// count: one draw per face.
+				// The faces that see the element, 3 bits each, and their count in bits 18-20 (CUBE_FACE in the shader).
+				// Indirect draws and emulated point sizes can't multiply their instance count, so they draw once per face.
 				uint32_t faces = 0;
 				uint32_t face_count = 0;
 				for (uint32_t face = 0; face < 6; face++) {
@@ -2346,7 +2345,7 @@ void RenderForwardClustered::_process_ssr(Ref<RenderSceneBuffersRD> p_render_buf
 		correction.set_depth_correction(true);
 
 		Projection projection = correction * p_projections[v];
-		// Relative camera motion first: see camera_reprojection.h (float32 phantom motion far from the origin).
+		// Relative camera motion first, see camera_reprojection.h.
 		reprojections[v] = rb_data->ss_effects_data.ssr_last_frame_projections[v] * Projection(RendererRD::camera_view_delta(rb_data->ss_effects_data.ssr_last_frame_transform, p_transform)) * projection.inverse();
 
 		rb_data->ss_effects_data.ssr_last_frame_projections[v] = projection;
@@ -2424,8 +2423,8 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 		if (p_render_data->cube_shadows.size()) {
 			RENDER_TIMESTAMP("Render OmniLight Shadows");
-			// Cube shadows are rendered in their own way. In one pass per light where possible, all those lights in
-			// one shadow session; any other cube light face by face afterwards.
+			// Cube shadows are rendered in one pass per light where possible, all those lights in one shadow session;
+			// any other cube light is rendered face by face afterwards.
 			cube_shadow_rendered.resize(p_render_data->cube_shadows.size());
 			for (uint32_t i = 0; i < cube_shadow_rendered.size(); i++) {
 				cube_shadow_rendered[i] = false;
@@ -2674,7 +2673,7 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 			const Projection &cur_proj = p_render_data->scene_data->cam_projection;
 			const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
 			const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
-			// Relative camera motion first: see camera_reprojection.h. Every static pixel gets its
+			// Relative camera motion first, see camera_reprojection.h. Every static pixel gets its
 			// motion vector from this matrix (the velocity buffer holds the (-1,-1) sentinel there).
 			params.reprojection = (correction * prev_proj) * Projection(RendererRD::camera_view_delta(prev_transform, cur_transform)) * (correction * cur_proj).inverse();
 
@@ -2695,8 +2694,7 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
 			real_t fov = p_render_data->scene_data->cam_projection.get_fov();
 			real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
-			// get_fov() is horizontal; the vertical angle wants 1/aspect (see set_perspective and
-			// the FSR2 path above). With `aspect` a 75-degree camera was reported as 135 degrees.
+			// get_fov() is horizontal, so the vertical angle needs 1/aspect (as in the FSR2 path above).
 			real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, 1.0 / aspect);
 			Vector2 jitter = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
 			RendererRD::DLSSContext::Parameters params;
@@ -2736,10 +2734,8 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 			const Projection &cur_proj = p_render_data->scene_data->cam_projection;
 			const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
 			const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
-			// Relative camera motion first: see camera_reprojection.h. The mvec decode pass derives
-			// every static pixel's motion vector from this matrix; built from the absolute
-			// transforms it handed DLSS a constant 0.1-0.25 px drift for a still camera in the
-			// dungeons placed at (7000,0,-7000) / (-7000,0,0), which DLSS smeared into the floor.
+			// Relative camera motion first, see camera_reprojection.h. The motion vector decode pass
+			// derives every static pixel's motion vector from this matrix.
 			params.reprojection = (correction * prev_proj) * Projection(RendererRD::camera_view_delta(prev_transform, cur_transform)) * (correction * cur_proj).inverse();
 			params.cam_projection = cur_proj;
 			params.cam_transform = cur_transform;
@@ -2759,7 +2755,7 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 		}
 
 		RD::get_singleton()->draw_command_begin_label("MetalFX Temporal");
-		// Scale to Â±0.5.
+		// Scale to ±0.5.
 		Vector2 jitter = p_render_data->scene_data->taa_jitter * 0.5f;
 		jitter *= Vector2(1.0, -1.0); // Flip y-axis as bottom left is origin.
 
@@ -2815,7 +2811,7 @@ void RenderForwardClustered::_prepare_fsr_frame_generation(const RenderDataRD *p
 	const Projection &cur_proj = p_render_data->scene_data->cam_projection;
 	const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
 	const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
-	// As for FSR2 and DLSS: relative camera motion first, see camera_reprojection.h.
+	// Relative camera motion first, see camera_reprojection.h.
 	params.reprojection = (correction * prev_proj) * Projection(RendererRD::camera_view_delta(prev_transform, cur_transform)) * (correction * cur_proj).inverse();
 	params.cam_transform = cur_transform;
 
@@ -4038,10 +4034,8 @@ void RenderForwardClustered::_render_shadow_build() {
 		scene_state.curr_gpu_ptr[RENDER_LIST_SECONDARY] = reinterpret_cast<SceneState::ElementData *>(scene_state.instance_buffer[RENDER_LIST_SECONDARY].map_raw_for_upload(0u));
 	}
 
-	// 1. Sort: each pass is a run, a large one is cut in runs of at least 1024 elements merged afterwards. Runs of
-	// equal keys may then come out in another order than one sort would give; it only changes which of several
-	// identical surfaces is drawn first in a depth-only pass. Without the merge (GODOT_PARALLEL_SHADOW_MERGE=0) the
-	// pass is drawn run after run: no serial step, but each run repeats the state changes and splits the instancing.
+	// Sort: each pass is a run, a large one is cut in runs merged afterwards. Equal keys may then come out in another
+	// order than one sort would give, which only changes which identical surface is drawn first in a depth-only pass.
 	shadow_sort_runs.clear();
 	sort_reuse.shadow_pass_reused.resize(pass_count);
 	for (uint32_t i = 0; i < pass_count; i++) {
@@ -4147,7 +4141,7 @@ void RenderForwardClustered::_render_shadow_build() {
 	}
 	step_done(statistics_usec);
 
-	// 2. Instance data, element info and the marks for instancing, in ranges across all the passes.
+	// Instance data, element info and the marks for instancing, in ranges across all the passes.
 	shadow_repeats.resize(element_total);
 	shadow_pass_begins.resize(element_total);
 	memset(shadow_pass_begins.ptr(), 0, element_total);
@@ -4164,7 +4158,7 @@ void RenderForwardClustered::_render_shadow_build() {
 	}
 
 	step_done(render_list_split_stats.shadow_instance_usec);
-	// 3. Runs of instanced elements and draw calls, pass by pass, as _fill_instance_data() counts them.
+	// Runs of instanced elements and draw calls, pass by pass, as _fill_instance_data() counts them.
 	for (SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
 		RenderElementInfo *element_info = rl->element_info.ptr() + shadow_pass.element_from;
 		const uint8_t *repeat = shadow_repeats.ptr() + shadow_pass.element_from;
@@ -4480,7 +4474,7 @@ void RenderForwardClustered::_sort_reuse_begin_frame() {
 		sort_reuse.lists.erase(key);
 	}
 
-	// So a surface freed two frames ago is in no order any more.
+	// Surfaces retired two frames ago are in no kept order any more and can be freed.
 	uint32_t released = 0;
 	while (released < retired_surface_caches.size() && retired_surface_caches[released].frame + 2 <= frame) {
 		geometry_instance_surface_alloc.free(retired_surface_caches[released].surface);
@@ -4527,8 +4521,8 @@ RenderForwardClustered::SortReuseResult RenderForwardClustered::_sort_reuse_appl
 				continue;
 			}
 		}
-		// New to the list, a second time, or with other inputs: sorted apart. When that is most of the list, a full sort
-		// costs less.
+		// New to the list, a second time, or with other inputs: sorted apart. A full sort is cheaper when that is most
+		// of the list.
 		if ((r_fresh.size() + 1u) * 2u > p_count) {
 			return SORT_REUSE_NONE;
 		}
@@ -4719,9 +4713,8 @@ void RenderForwardClustered::_render_shadow_process() {
 void RenderForwardClustered::_render_shadow_end() {
 	RD::get_singleton()->draw_command_begin_label("Shadow Render");
 
-	// Every pass is cut in parts as _render_list_split() would cut it (one part below twice the range size), all parts
-	// recorded in one parallel run, each into a split reserved for its pass's draw list; the draw lists then open one
-	// after the other and take their parts in order.
+	// Every pass is cut in parts as _render_list_split() would cut it, and all parts are recorded in one parallel run
+	// into splits reserved for their pass's draw list; the draw lists then open in order and take their parts.
 	LocalVector<SceneState::ShadowPass> &shadow_passes = scene_state.shadow_passes;
 	const uint32_t pass_count = shadow_passes.size();
 	shadow_pass_first_part.resize(pass_count);
@@ -6927,12 +6920,8 @@ RenderGeometryInstance *RenderForwardClustered::geometry_instance_create(RID p_b
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) {
-	// Stamp the frame that will draw this transform. RendererSceneCull applies pending instance
-	// updates inside the draw, but also earlier, from the command queue, before begin_frame() has
-	// advanced the counter (freeing any instance does it; get_pending_frame_number() lists the other
-	// calls). Stamped with get_frame_number(), those updates looked one frame old, so age_out_motion()
-	// either dropped their motion before it was drawn or, with a +1 margin, kept a stopped object's
-	// motion one frame too long and doubled it when two consecutive frames took different paths.
+	// Stamp the frame that will draw this transform: instance updates may also be applied from the command queue,
+	// before begin_frame() advances the frame counter (see get_pending_frame_number()).
 	uint64_t frame = RSG::rasterizer->get_pending_frame_number();
 	if (unlikely(created_frame == 0)) {
 		created_frame = frame;
@@ -6949,11 +6938,8 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_transform(con
 	RenderGeometryInstanceBase::set_transform(p_transform, p_aabb, p_transformed_aabb);
 
 	if (unlikely(frame == created_frame)) {
-		// A new instance has no motion yet. instance_set_base() creates the geometry instance and sets
-		// its transform at once, and the queued update sets it again for the same frame: prev_transform
-		// would otherwise keep its identity default, and the first frame would show motion from the
-		// world origin (a spawn whose base is set before its transform). A geometry instance that
-		// replaces another one inherits its history instead (set_motion_history()).
+		// A new instance has no motion yet, rather than motion from the identity default. A geometry instance
+		// that replaces another one inherits its history instead (set_motion_history()).
 		prev_transform = transform;
 	}
 
@@ -7022,8 +7008,7 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_use_lightmap(
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::set_lightmap_capture(const Color *p_sh9) {
-	// The scene cull sets the capture every frame for captured instances and the list fill reads it every frame: the
-	// surfaces are rebuilt only when it appears or goes away (whether they can use a lightmap).
+	// Called every frame by the scene cull: the surfaces are rebuilt only when the capture appears or goes away.
 	if (p_sh9) {
 		if (lightmap_sh == nullptr) {
 			lightmap_sh = RenderForwardClustered::get_singleton()->geometry_instance_lightmap_sh.alloc();
@@ -7226,9 +7211,7 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 RenderForwardClustered::RenderForwardClustered() {
 	singleton = this;
 
-	// Large render lists are recorded on up to 6 threads, in ranges of at least 128 elements. GODOT_PARALLEL_DRAW_LISTS=N
-	// changes the thread count (0 or 1 records serially), GODOT_PARALLEL_DRAW_LISTS_MIN the range size;
-	// GODOT_PARALLEL_DRAW_LISTS_STATS=1 prints what was split every 240 frames.
+	// Large render lists are recorded on several threads; a thread count of 0 or 1 records them serially.
 	{
 		const String threads_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_DRAW_LISTS");
 		render_list_max_splits = threads_env.is_empty() ? 6 : uint32_t(CLAMP(threads_env.to_int(), 0, 16));
@@ -7244,21 +7227,17 @@ RenderForwardClustered::RenderForwardClustered() {
 		instance_slot_buffer.slot_size = sizeof(InstanceSlotData);
 		surface_slot_buffer.slot_size = sizeof(SurfaceSlotData);
 
-		// The render lists themselves are filled by up to 3 threads (memory bound: more threads only slow each other
-		// down), in chunks of at least 256 instances (1024 elements for the instance data). GODOT_PARALLEL_LIST_BUILD=N
-		// changes the chunk size, 0 fills them serially; GODOT_PARALLEL_LIST_BUILD_THREADS=N the thread count.
+		// Filling the render lists is memory bound, so it uses fewer threads than recording them. A chunk size of 0
+		// fills them serially.
 		const String list_build_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_LIST_BUILD");
 		list_build_min_instances = list_build_env.is_empty() ? 256 : uint32_t(MAX(list_build_env.to_int(), 0));
 		const String list_build_threads_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_LIST_BUILD_THREADS");
 		list_build_max_threads = MIN(render_list_max_splits, list_build_threads_env.is_empty() ? 3u : uint32_t(CLAMP(list_build_threads_env.to_int(), 0, 16)));
 
-		// Helper threads stay GODOT_PARALLEL_LINGER_US microseconds looking for the next parallel run of the scene
-		// being rendered (0: they leave as soon as theirs is done, every run wakes its own).
+		// How long helper threads keep looking for the next parallel run; 0 makes every run wake its own.
 		const String linger_env = OS::get_singleton()->get_environment("GODOT_PARALLEL_LINGER_US");
 		parallel_linger_usec = linger_env.is_empty() ? 1000 : uint64_t(MAX(linger_env.to_int(), 0));
 
-		// GODOT_PARALLEL_SHADOW_BUILD=0 sorts the shadow passes and writes their instance data one by one, as they are
-		// filled; GODOT_PARALLEL_SHADOW_MERGE=0 leaves a large pass in separately sorted runs.
 		shadow_build_parallel = OS::get_singleton()->get_environment("GODOT_PARALLEL_SHADOW_BUILD") != "0";
 		shadow_build_merge = OS::get_singleton()->get_environment("GODOT_PARALLEL_SHADOW_MERGE") != "0";
 		list_sort_parallel = OS::get_singleton()->get_environment("GODOT_PARALLEL_SORT") != "0";

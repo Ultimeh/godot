@@ -2113,10 +2113,8 @@ void GI::SDFGI::render_region(Ref<RenderSceneBuffersRD> p_render_buffers, int p_
 
 		push_constant.grid_size = cascade_size;
 		push_constant.cascade = cascade;
-		// Without occlusion nothing reads it: gi.glsl, the SDFGI direct light, the volumetric fog and the scene shaders
-		// all test use_occlusion first, and turning it on recreates SDFGI (sdfgi_update()). Its passes are skipped: on an
-		// Arc B580 the occlusion pass was half of each cascade scroll on D3D12 and 45 % on Vulkan. Only the SDFGI probes
-		// debug view reads the occlusion unconditionally.
+		// Without occlusion its passes are skipped: every reader tests use_occlusion first, and turning it on recreates
+		// SDFGI (see sdfgi_update()). Only the SDFGI probes debug view reads the occlusion unconditionally.
 		push_constant.store_occlusion = uses_occlusion ? 1 : 0;
 
 		if (cascades[cascade].dirty_regions != SDFGI::Cascade::DIRTY_ALL) {

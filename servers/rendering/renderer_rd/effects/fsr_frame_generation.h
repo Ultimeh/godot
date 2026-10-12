@@ -35,8 +35,8 @@
 
 namespace RendererRD {
 
-// PROTOTYPE (GODOT_FSR_FG): AMD FSR frame generation (D3D12) fed by the 3D pass when DLSS does not
-// upscale it: FSR2, TAA, native, MSAA. With DLSS upscaling, DLSSEffect hands FSR its inputs itself.
+// AMD FSR frame generation (D3D12) fed by the 3D pass when DLSS does not upscale it.
+// With DLSS upscaling, DLSSEffect hands FSR its inputs itself.
 class FSRFrameGenerationEffect {
 public:
 	struct Parameters {
@@ -80,7 +80,7 @@ private:
 	RID mvec_decode_pipeline;
 
 	// What one recorded prepare callback uses, resolved on the render thread: the callback may run on another
-	// thread after the render thread moved on (RD-REPLAY-THREAD-STUDY.md, step 1a). Owned and freed by the callback.
+	// thread after the render thread moved on. Owned and freed by the callback.
 	struct CallbackPayload {
 		Parameters params;
 		uint64_t depth_resource = 0;

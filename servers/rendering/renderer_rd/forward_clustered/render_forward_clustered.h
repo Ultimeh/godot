@@ -288,10 +288,8 @@ protected:
 	LocalVector<RD::DrawListID> render_list_split_ids;
 	RenderListParameters *render_list_split_params = nullptr;
 
-	// Every shadow pass of a _render_shadow_end() (often many: one per cube light, 6 per light without one-pass cubes),
-	// cut in parts as a draw list split would be, recorded in one _parallel_run into splits reserved ahead of their
-	// draw lists (RD::draw_list_split_detached_begin()); the draw lists then open in order and take their parts.
-	// GODOT_PARALLEL_SHADOW_PASSES=0 records them pass after pass, each split on its own if large.
+	// The shadow passes of a _render_shadow_end() are cut in parts and recorded in one _parallel_run() into splits
+	// reserved ahead of their draw lists (RD::draw_list_split_detached_begin()); the draw lists then take them in order.
 	bool shadow_passes_parallel = true;
 	LocalVector<uint32_t> shadow_pass_first_part; // Per shadow pass: its parts [first, first + count); count 0: none.
 	LocalVector<uint32_t> shadow_pass_part_count;
@@ -304,13 +302,9 @@ protected:
 
 	void _render_shadow_pass_part(uint32_t p_part);
 
-	// Work cut in parts that helper threads and the render thread take in turn (_parallel_run()). The claim holds the
-	// run's generation (high 32 bits) and the next part (low 32 bits); a run is closed (low bits all set) while the
-	// next one is published, and a claim made on a stale value fails its compare-exchange.
-	// Helpers are WorkerThreadPool tasks that stay a while (parallel_linger_usec) looking for the next run once theirs
-	// is done: waking a pool thread costs the render thread ~20 us (the pool notifies under its mutex), and a frame has
-	// a dozen runs close together. A run only wakes the helpers it lacks; each run says how many may join it.
-	// _render_scene() dismisses them when it returns (parallel_epoch): the graph replay that follows needs the cores.
+	// Parts taken in turn by helper threads and the render thread (_parallel_run()). The claim holds the run's generation
+	// (high 32 bits) and the next part (low 32 bits), so a claim made on a stale run fails its compare-exchange.
+	// Helpers linger for the next run, and _render_scene() dismisses them so they do not spin during the graph replay.
 	typedef void (RenderForwardClustered::*ParallelPart)(uint32_t p_part);
 	std::atomic<uint64_t> parallel_claim = { 0xFFFFFFFF };
 	SafeNumeric<uint32_t> parallel_part_count;
@@ -350,17 +344,14 @@ protected:
 		uint64_t shadow_elements = 0;
 		uint64_t shadow_usec = 0; // Sorting the shadow passes and writing their instance data, either path.
 		uint64_t shadow_draw_calls = 0; // Deferred builds only.
-		// Deferred shadow builds, step by step: copying each pass's elements as it is filled, checking for a kept order,
-		// sorting, keeping the new orders, writing the instance data, counting the instancing runs.
+		// Deferred shadow builds, step by step.
 		uint64_t shadow_copy_usec = 0;
 		uint64_t shadow_check_usec = 0;
 		uint64_t shadow_sort_usec = 0;
 		uint64_t shadow_store_usec = 0;
 		uint64_t shadow_instance_usec = 0;
 		uint64_t shadow_runs_usec = 0;
-		// What skipping unchanged instances in the fill could save: fills of the main view and of shadow passes whose
-		// camera (transform, projection, LOD settings) is the one of their previous fill, and the filled instances that
-		// moved this frame.
+		// Fills whose camera is the one of their previous fill, and the filled instances that moved this frame.
 		struct FillChanges {
 			uint32_t fills = 0;
 			uint32_t camera_still = 0;
@@ -387,8 +378,7 @@ protected:
 		uint32_t helpers_woken = 0;
 	} render_list_split_stats;
 
-	// GODOT_LIST_STABILITY_STATS=1 prints every 240 frames how much of each sorted list matches the same list the last
-	// time it was drawn (by view for the main lists, by light and pass for shadow passes). Statistics only.
+	// Statistics on how much of each sorted list matches the same list the last time it was drawn.
 	enum ListStabilityCategory {
 		LIST_STABILITY_OPAQUE,
 		LIST_STABILITY_MOTION,
@@ -432,8 +422,7 @@ protected:
 		HashMap<const void *, uint32_t> previous_index;
 	} list_stability;
 
-	// Which light and pass the next _render_shadow_append() draws, set by _render_shadow_pass(): the pass's key for
-	// sort_reuse and list_stability.
+	// The light and pass the next _render_shadow_append() draws, keying sort_reuse and list_stability.
 	uint64_t shadow_append_list_key = 0;
 	ListStabilityCategory shadow_append_stability_category = LIST_STABILITY_SHADOW_DIRECTIONAL;
 
@@ -746,7 +735,7 @@ protected:
 	void _fill_instance_data_range(RenderListType p_render_list, uint32_t p_offset, uint32_t p_from, uint32_t p_to);
 	void _fill_instance_data_part(uint32_t p_part);
 #ifdef DEBUG_ENABLED
-	// The record the scene shaders used to read per element, built only to check the slots.
+	// The full per-element record, built only to check the slots against it.
 	_FORCE_INLINE_ void _store_instance_data(const GeometryInstanceForwardClustered *p_inst, const GeometryInstanceSurfaceDataCache *p_surface, uint32_t p_flags, uint32_t p_gi_offset, SceneState::InstanceData *r_instance_data);
 #endif
 
@@ -940,8 +929,8 @@ protected:
 		SpinLock dirty_lock;
 
 #ifdef DEBUG_ENABLED
-		// GODOT_INSTANCE_SLOTS_CHECK=1: every element is also built the per-frame way (InstanceData) and compared
-		// with its slots; a difference is a change that marked nothing. Reported every 240 frames.
+		// Debug check: every element is also built as an InstanceData and compared with its slots;
+		// a difference is a change that did not mark the slot dirty.
 		bool check = false;
 		uint64_t frame = 0;
 		uint32_t frames = 0;
@@ -974,9 +963,8 @@ protected:
 		LocalVector<uint32_t> dirty; // Built since the last upload.
 	} surface_slots;
 
-	// Slots on the GPU: a persistently mapped buffer with one copy per frame in flight. A copy is brought up to date
-	// with the slots written since it was last mapped. Mapped once per frame, by the first list fill, before any draw
-	// of the frame is recorded.
+	// Slots on the GPU: a persistently mapped buffer with one copy per frame in flight, brought up to date with the slots
+	// written since it was last mapped. Mapped once per frame by the first list fill, before any draw is recorded.
 	struct SlotUploadBuffer {
 		uint32_t slot_size = 0;
 		RID buffer;
@@ -1086,9 +1074,8 @@ protected:
 
 	/* Render List */
 
-	// Ties (equal sort keys, or equal priority and depth in the alpha list) are ordered by surface address, so the same
-	// surfaces sort the same way every frame; SortArray is not stable. Equal keys stay contiguous: instancing is
-	// unchanged. GODOT_STABLE_SORT=0 leaves ties unordered.
+	// SortArray is not stable: ties are ordered by surface address so the same surfaces sort the same way every frame.
+	// Equal keys stay contiguous, so instancing is unchanged.
 	static inline bool sort_ties_by_surface = true;
 
 	struct RenderList {
@@ -1100,9 +1087,8 @@ protected:
 			element_info.clear();
 		}
 
-		// The order of the lists. The sorts below give the same order but compare copies of the keys
-		// (SortKeyElement, SortDepthElement), read once per element: comparing through the pointers reads the surfaces
-		// again at every comparison, and they are spread in memory.
+		// The sorts compare copies of the keys (SortKeyElement, SortDepthElement), which gives the same order as these
+		// comparators without reading the scattered surfaces again at every comparison.
 		struct SortByKey {
 			_FORCE_INLINE_ bool operator()(const GeometryInstanceSurfaceDataCache *A, const GeometryInstanceSurfaceDataCache *B) const {
 				if (A->sort.sort_key2 == B->sort.sort_key2 && A->sort.sort_key1 == B->sort.sort_key1) {
@@ -1180,10 +1166,9 @@ protected:
 
 	RenderList render_list[RENDER_LIST_MAX];
 
-	// Shadow passes are filled one after the other: filling writes per-pass values on instances and surfaces that
-	// several passes share. Sorting them and writing their instance data only reads a few of those values, copied per
-	// element as each pass is filled; that part runs later for all the passes at once (_render_shadow_build()):
-	// sorts on several threads (a large pass in sorted runs merged afterwards), then the instance data in ranges.
+	// Shadow passes are filled one after the other, since filling writes per-pass values on shared instances and surfaces.
+	// The values the sort and the instance data need are copied per element, so _render_shadow_build() can then process
+	// all passes at once on several threads.
 	struct ShadowElement {
 		uint64_t sort_key1;
 		uint64_t sort_key2;
@@ -1226,8 +1211,7 @@ protected:
 	bool shadow_build_parallel = true;
 	bool shadow_build_merge = true; // Off: a pass cut in several sort runs is drawn run after run, unmerged.
 
-	// The main view's lists sorted together (_sort_render_lists()): a large opaque list in runs merged afterwards, the
-	// motion and alpha lists whole, each a _parallel_run part. GODOT_PARALLEL_SORT=0 sorts them one after the other.
+	// The main view's lists are sorted in parallel: a large opaque list in runs merged afterwards, the others whole.
 	struct OpaqueSortRun {
 		uint32_t from = 0;
 		uint32_t count = 0;
@@ -1242,14 +1226,9 @@ protected:
 	void _sort_render_lists(uint64_t p_view_key);
 	void _sort_render_lists_part(uint32_t p_part);
 
-	// Each sorted list keeps the order it had the last time it was sorted (main lists by view, shadow passes by light
-	// and pass). When it holds the same surfaces with the same sort inputs, that order is what sorting would give: every
-	// comparison breaks ties by surface, so there is only one. When some elements are new or have other inputs, the
-	// others keep their kept order (a subsequence of a sorted list), the new ones are sorted apart and both are merged.
-	// GODOT_SORT_REUSE=0 sorts every list again.
-	// A kept order is forgotten when its list is not sorted for a frame, and a freed surface cache stays allocated two
-	// frames (retired_surface_caches): every kept order then points to allocated surfaces, which a check may mark, and
-	// a freed surface's address cannot come back as another surface while an order still holds it.
+	// Each sorted list keeps its last order; ties are broken by surface, so that order is unique and can be reused as is,
+	// or merged with the elements that are new or changed, sorted apart.
+	// A freed surface cache stays allocated two frames, so a kept order never points to a freed or reused address.
 	struct SortReuseEntry {
 		const GeometryInstanceSurfaceDataCache *surface = nullptr;
 		uint64_t sort_key1 = 0;
@@ -1268,7 +1247,7 @@ protected:
 	struct SortReuse {
 		bool enabled = true;
 #ifdef DEBUG_ENABLED
-		bool check = false; // GODOT_SORT_REUSE_CHECK=1: sorts every reused list anyway and compares the orders.
+		bool check = false; // Sorts every reused list anyway and compares the orders.
 #endif
 		uint32_t mark = 0;
 		uint64_t frame = 0;
@@ -1347,15 +1326,14 @@ protected:
 	void _render_shadow_begin();
 	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingServerTypes::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D(), bool p_cube_layered = false);
 
-	// Cube omni shadows with their 6 faces in one pass (SHADER_GROUP_CUBE_LAYERED): the culler's 6 caster lists of a
-	// light merged into cube_shadow_instances, each instance once with the faces that see it (cube_face_mask), drawn as
-	// _render_shadow_pass(CUBE_SHADOW_ALL_FACES). GODOT_SHADOW_CUBE_ONE_PASS=0 renders the faces one by one.
+	// Cube omni shadows with their 6 faces in one pass: the 6 caster lists of a light are merged into
+	// cube_shadow_instances, each instance once with the faces that see it (cube_face_mask).
 	enum {
 		CUBE_SHADOW_ALL_FACES = 6,
 	};
 	bool shadow_cube_one_pass = false;
-	// The gathered cube lights share one shadow session (one _render_shadow_end(), one parallel recording); each
-	// light's cubemap is copied into the atlas right after its draw list, before the next light reuses the cubemap.
+	// The gathered cube lights share one shadow session; each light's cubemap is copied into the atlas right after its
+	// draw list, before the next light reuses the cubemap.
 	bool cube_shadow_batching = false;
 	struct CubeShadowCopy {
 		RID light;
@@ -1429,9 +1407,8 @@ protected:
 
 	Scale3DMode _resolve_scale_3d_mode(Ref<RenderSceneBuffersRD> p_render_buffers) const;
 	void _render_3d_upscaling(const RenderDataRD *p_render_data, Scale3DMode p_scale_type, bool p_using_taa, double p_time_step, const DLSSRRGuideBuffers &p_dlss_rr);
-	// PROTOTYPE (GODOT_FSR_FG): whether this render feeds FSR frame generation (its motion vectors
-	// are then required), and its inputs once depth and motion vectors are final, after the
-	// temporal pass. With DLSS upscaling the DLSS pass hands them over instead.
+	// Whether this render feeds FSR frame generation (which requires motion vectors), and its inputs once depth and
+	// motion vectors are final. With DLSS upscaling the DLSS pass hands them over instead.
 	bool _feeds_fsr_frame_generation(const RenderDataRD *p_render_data) const;
 	void _prepare_fsr_frame_generation(const RenderDataRD *p_render_data, double p_time_step);
 	virtual void _free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers);

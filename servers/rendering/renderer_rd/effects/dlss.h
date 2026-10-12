@@ -59,13 +59,12 @@ public:
 		Projection reprojection;
 		Projection cam_projection;
 		Transform3D cam_transform;
-		// Previous camera, for the matrices handed to Streamline. `reprojection` above is
-		// built in the decode shader's convention (z in [-1,1], y flipped) and must stay so;
-		// Streamline gets a separate set built from these, in the depth buffer's convention.
+		// Previous camera, for Streamline's matrices in the depth buffer's clip space. `reprojection`
+		// stays in the decode shader's convention (z in [-1,1], y flipped): do not merge the two.
 		Projection prev_cam_projection;
 		Transform3D prev_cam_transform;
 		bool dlss_g = false;
-		int dlss_g_frames = 1; // generated frames between two rendered ones: 1 = 2x, 2 = 3x, 3 = 4x
+		int dlss_g_frames = 1; // Generated frames between two rendered ones: 1 = 2x, 2 = 3x, 3 = 4x.
 
 		// DLSS Ray Reconstruction buffers
 		bool dlss_rr = false; // Enable DLSS-RR mode instead of regular DLSS
@@ -96,19 +95,17 @@ public:
 	void upscale(const DLSSContext::Parameters &p_params);
 	bool is_ready(DLSSContext *context);
 
-	// Frame generation's HUD-less color (RendererCompositorRD::capture_hudless()): whether a
-	// frame generator (DLSS-G, or FSR's prototype) runs and wants one, and the back-buffer-sized
-	// copy the compositor keeps for it, null when there is none. Render thread only; the compositor
-	// asks once per frame, after the 3D pass (it consumes the DLSS pass's request).
+	// Frame generation's HUD-less color, captured by the compositor after the 3D pass. Render thread only;
+	// frame_generation_wants_hudless() consumes the DLSS pass's request, so it is asked once per frame.
 	static bool frame_generation_wants_hudless();
 	static void set_frame_generation_hudless(RID p_hudless, RID p_ui_alpha);
 	static RID get_frame_generation_hudless();
-	// Whether the frame generator reads the HUD-less color after the next frame has started (FSR's
-	// async workloads): the compositor then alternates two of them.
+	// The frame generator reads the HUD-less color after the next frame has started: the compositor
+	// then alternates two of them.
 	static bool frame_generation_hudless_double_buffered();
 
-	// The end of a frame's recording, before the graph is replayed: the DLSS callbacks recorded in it take the
-	// HUD-less color and UI alpha the compositor set after them. Render thread, from RendererCompositorRD::end_frame().
+	// Called before the graph is replayed: the DLSS callbacks recorded in the frame take the HUD-less
+	// color and UI alpha the compositor set after them. Render thread.
 	static void finalize_frame_callbacks();
 
 private:

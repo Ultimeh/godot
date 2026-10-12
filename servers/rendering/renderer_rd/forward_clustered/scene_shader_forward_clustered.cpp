@@ -816,7 +816,6 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		}
 
 		// Cube omni shadows render their 6 faces in one pass where the vertex shader can choose the layer.
-		// GODOT_SHADOW_CUBE_ONE_PASS=0 keeps the 6 passes.
 		if (RD::get_singleton()->has_feature(RD::SUPPORTS_SHADER_OUTPUT_LAYER) && OS::get_singleton()->get_environment("GODOT_SHADOW_CUBE_ONE_PASS") != "0") {
 			shader.enable_group(SHADER_GROUP_CUBE_LAYERED);
 		}

@@ -424,9 +424,8 @@ void main() {
 		irradiance += m * l_mult[i];
 	}
 
-	// The radiance has a loop of its own. Summed in the irradiance's loop (`radiance += m;`), Intel's shader compiler
-	// (Arc B580, Vulkan and D3D12) returned it 256 times too large: the specular probe layers saturated and every
-	// surface of medium roughness reflected white. Same operations in the same order, so other GPUs are unchanged.
+	// The radiance keeps a loop of its own: summed in the irradiance's loop, Intel's shader compiler returned it
+	// 256 times too large. Do not merge the two loops.
 	for (uint i = 0; i < SH_SIZE; i++) {
 		ivec2 average_pos = sh_pos + ivec2(0, i);
 		ivec4 average = imageLoad(lightprobe_average_texture, average_pos);

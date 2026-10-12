@@ -64,9 +64,8 @@ public:
 
 	virtual void reset_motion_vectors() = 0;
 
-	// Motion state that instance_set_base() carries from the geometry instance it frees to the one it
-	// creates in its place, so that replacing the base of a moving instance (a mesh swap, a CSG
-	// rebuild) keeps its motion vector. Renderers without motion vectors keep the defaults.
+	// Motion state that instance_set_base() carries over to the geometry instance it creates, so that replacing
+	// the base of a moving instance keeps its motion vector. Renderers without motion vectors keep the defaults.
 	struct MotionHistory {
 		Transform3D transform;
 		Transform3D prev_transform;

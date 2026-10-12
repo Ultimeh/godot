@@ -736,13 +736,8 @@ void RenderingDeviceDriverD3D12::_resource_transition_batch(CommandBufferInfo *p
 	}
 }
 
-// Legacy barriers only. On a COPY command list a texture may only be in COMMON: the copy implicitly
-// promotes it to COPY_DEST or COPY_SOURCE, and it decays back to COMMON when the command list has
-// executed. An explicit transition there is invalid (debug layer: "does not match expected layout
-// (D3D12_BARRIER_LAYOUT_COMMON) using D3D12_COMMAND_LIST_TYPE_COPY command list ... in
-// CopyTextureRegion", #1334, once per texture uploaded by the transfer workers), and recording the
-// promoted state would leave the tracker out of step with the decay. So leave a COMMON texture alone
-// and keep tracking it as COMMON.
+// Legacy barriers only. On a COPY command list a texture must stay in COMMON: the copy promotes it implicitly
+// and it decays back to COMMON once executed, so an explicit transition is invalid and must not be tracked.
 bool RenderingDeviceDriverD3D12::_texture_copy_promotes_implicitly(CommandBufferInfo *p_command_buffer, ResourceInfo *p_texture, uint32_t p_subresource) const {
 	if (p_command_buffer->list_type != D3D12_COMMAND_LIST_TYPE_COPY) {
 		return false;
@@ -1430,10 +1425,8 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 					IID_PPV_ARGS(main_texture.GetAddressOf()));
 			initial_state = D3D12_RESOURCE_STATE_COMMON;
 		} else {
-			// COMMON, not COPY_DEST: the transfer workers upload new textures on a COPY queue, which
-			// only accepts textures in COMMON and promotes them implicitly
-			// (_texture_copy_promotes_implicitly()). Created in COPY_DEST, every texture they uploaded
-			// failed validation (#1334). A direct-queue upload just transitions COMMON -> COPY_DEST once.
+			// COMMON, not COPY_DEST: the transfer workers upload on a COPY queue, which only accepts textures
+			// in COMMON and promotes them implicitly (see _texture_copy_promotes_implicitly()).
 			res = allocator->CreateResource(
 					&allocation_desc,
 					(D3D12_RESOURCE_DESC *)&resource_desc,
@@ -2347,10 +2340,8 @@ void RenderingDeviceDriverD3D12::command_prepare_callback_textures(CommandBuffer
 
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 
-	// The batched transitions are lazy and may merge states (a texture already in
-	// ALL_SHADER_RESOURCE counts as being in NON_PIXEL_SHADER_RESOURCE). The callback needs the
-	// exact state it will announce, so settle the pending batch, then transition explicitly and
-	// record the new state, which the callback's code restores before it returns.
+	// The batched transitions are lazy and may merge states, but the callback needs the exact state it announces:
+	// settle the pending batch, then transition explicitly. The callback restores that state before it returns.
 	_resource_transitions_flush(cmd_buf_info);
 
 	thread_local LocalVector<D3D12_RESOURCE_BARRIER> barriers;
@@ -2435,9 +2426,8 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 	}
 
 	for (uint32_t i = 0; i < p_texture_barriers.size(); i++) {
-		// A new one per barrier: a whole-resource barrier leaves the range fields untouched, and values left there by the
-		// previous barrier of the loop (another texture's layers or planes) made D3D12 skip subresources of this one
-		// (GPU-based validation: SRV/UAV accessed in the layout before the transition).
+		// A new one per barrier: a whole-resource barrier leaves the range fields untouched, and stale values from the
+		// previous texture would make D3D12 skip subresources of this one.
 		D3D12_TEXTURE_BARRIER texture_barrier_d3d12 = {};
 		const TextureBarrier &texture_barrier_rd = p_texture_barriers[i];
 		const TextureInfo *texture_info = (const TextureInfo *)(texture_barrier_rd.texture.id);
@@ -2663,8 +2653,7 @@ Error RenderingDeviceDriverD3D12::command_queue_execute_and_present(CommandQueue
 		}
 	}
 
-	// Most calls only submit command lists. Reflex must see present markers around real presents
-	// only, as on Vulkan; without this guard every submission sent it a present pair.
+	// Most calls only submit command lists. Reflex must see present markers around real presents only.
 	if (p_swap_chains.size() == 0) {
 		return OK;
 	}
@@ -2679,7 +2668,7 @@ Error RenderingDeviceDriverD3D12::command_queue_execute_and_present(CommandQueue
 			// Recreated by the next frame's swap_chain_resize(), after RenderingDevice's stall.
 			context_driver->surface_set_needs_resize(swap_chain->surface, true);
 		}
-		// PROTOTYPE (GODOT_FSR_FG): no generation from a stale configuration; and AMD's proxy Present
+		// FSR frame generation: no generation from a stale configuration, and AMD's proxy Present
 		// busy-waits for the previous frame, so block here instead.
 		FSRFrameGenerationD3D12::before_present(swap_chain->d3d_swap_chain.Get());
 		FSRFrameGenerationD3D12::wait_before_present(swap_chain->d3d_swap_chain.Get());
@@ -2865,8 +2854,8 @@ void RenderingDeviceDriverD3D12::_swap_chain_release(SwapChain *p_swap_chain) {
 	}
 
 	if (p_swap_chain->d3d_swap_chain) {
-		// PROTOTYPE (GODOT_FSR_FG): the frame generation and swap chain contexts go first; dropping
-		// the reference below then runs the AMD proxy's destructor.
+		// The FSR frame generation and swap chain contexts go first; dropping the reference below
+		// then runs the AMD proxy's destructor.
 		FSRFrameGenerationD3D12::release_swap_chain(p_swap_chain->d3d_swap_chain.Get());
 	}
 	p_swap_chain->d3d_swap_chain.Reset();
@@ -2996,7 +2985,7 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 	DXGI_SWAP_CHAIN_DESC1 swap_chain_desc = {};
 	if (swap_chain->d3d_swap_chain != nullptr) {
 		_swap_chain_release_buffers(swap_chain);
-		// PROTOTYPE (GODOT_FSR_FG): AMD's frame generation context goes before the old back buffers.
+		// AMD's frame generation context must be destroyed before ResizeBuffers().
 		FSRFrameGenerationD3D12::before_resize(swap_chain->d3d_swap_chain.Get());
 		res = swap_chain->d3d_swap_chain->ResizeBuffers(p_desired_framebuffer_count, surface->width, surface->height, DXGI_FORMAT_UNKNOWN, creation_flags);
 		if (!SUCCEEDED(res)) {
@@ -3042,7 +3031,7 @@ Error RenderingDeviceDriverD3D12::swap_chain_resize(CommandQueueID p_cmd_queue, 
 				res = context_driver->dxgi_factory_get()->CreateSwapChainForHwnd(command_queue->d3d_queue.Get(), surface->hwnd, &swap_chain_desc, nullptr, nullptr, swap_chain_1.GetAddressOf());
 			}
 		} else {
-			// PROTOTYPE (GODOT_FSR_FG): AMD's proxy swap chain for this window, or a plain one.
+			// AMD's FSR frame generation proxy swap chain for this window, or a plain one.
 			void *fsr_swap_chain = nullptr;
 			if (FSRFrameGenerationD3D12::create_swap_chain(surface->hwnd, &swap_chain_desc, context_driver->dxgi_factory_get(), command_queue->d3d_queue.Get(), device.Get(), &fsr_swap_chain)) {
 				swap_chain_1.Attach((IDXGISwapChain1 *)(IDXGISwapChain4 *)fsr_swap_chain);
@@ -3585,9 +3574,8 @@ void RenderingDeviceDriverD3D12::shader_destroy_modules(ShaderID p_shader) {
 /**** UNIFORM SET ****/
 /*********************/
 
-// Shaders declare every 1D, 2D and cube texture as an array (_declare_resources_as_arrays() in
-// rendering_shader_container_d3d12.cpp, so that a slice of a texture array, which only an array view can select,
-// matches its declaration); the views bound to them become arrays of one layer or one cube to match.
+// Shaders declare every 1D, 2D and cube texture as an array (see _declare_resources_as_arrays()), so the views
+// bound to them become arrays of one layer or one cube to match.
 static D3D12_SHADER_RESOURCE_VIEW_DESC _srv_desc_as_array(const D3D12_SHADER_RESOURCE_VIEW_DESC &p_desc) {
 	D3D12_SHADER_RESOURCE_VIEW_DESC desc = p_desc;
 	switch (p_desc.ViewDimension) {
@@ -6043,12 +6031,8 @@ void *RenderingDeviceDriverD3D12::command_buffer_get_native_handle(CommandBuffer
 }
 
 void RenderingDeviceDriverD3D12::command_buffer_invalidate_state_cache(CommandBufferID p_cmd_buffer) {
-	// Everything command_bind_*_pipeline, command_bind_*_uniform_sets and
-	// _command_check_descriptor_sets use to skip a redundant bind. Streamline's NIS dispatch
-	// binds its own heaps, root signature and PSO and restores none of them; with this cache
-	// left alone, the next compute dispatch (SSIL's mipmap chain, any pass after a render
-	// buffer reconfiguration) ran on Streamline's heaps with Godot's descriptor tables and the
-	// NVIDIA driver dereferenced null. Vulkan binds unconditionally and never had the problem.
+	// Everything the bind functions use to skip a redundant bind. Driver callbacks (such as Streamline's)
+	// bind their own heaps, root signature and PSO and restore none of them.
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	cmd_buf_info->graphics_pso = nullptr;
 	cmd_buf_info->compute_pso = nullptr;
@@ -6182,17 +6166,8 @@ uint64_t RenderingDeviceDriverD3D12::get_lazily_memory_used() {
 }
 
 String RenderingDeviceDriverD3D12::get_descriptor_report() {
-	// Everything a uniform set binds takes a slot in this one fixed-size heap, so running out
-	// of it is a hard failure ("not enough room in the RESOURCES descriptor heap") with no
-	// warning beforehand. The allocator already keeps the numbers: D3D12MA::VirtualBlock is
-	// sized in descriptors here (see DescriptorHeap::initialize), and GetStatistics() only
-	// reads counters it maintains anyway -- no iteration, nothing to pay for when unused.
-	//
-	// Called from any thread (RenderingServer::get_rendering_device() hands out the singleton
-	// directly and get_perf_report() has no render-thread guard), so this races with
-	// uniform_set_create()/free() on the rendering thread. Harmless for GetStatistics, which
-	// only reads three scalars off the metadata -- worst case is a number one allocation stale.
-	// CalculateStatistics() would NOT be safe here: it walks the block.
+	// May be called from any thread, racing with uniform_set_create()/free(). GetStatistics() only reads
+	// counters, so the worst case is a slightly stale number; CalculateStatistics() walks the block and is not safe.
 	if (resource_descriptor_heap.virtual_block == nullptr) {
 		return String();
 	}
@@ -6643,13 +6618,9 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 		barrier_capabilities.enhanced_barriers_supported = options12.EnhancedBarriersSupported;
 	}
 
-	// Streamline (DLSS, DLSS-RR, NIS, DLSS-G) and FidelityFX are handed textures with a legacy
-	// D3D12_RESOURCE_STATES and transition them with ResourceBarrier. D3D12 only allows mixing that with
-	// enhanced barriers on a resource in the COMMON layout: the textures handed to them are declared
-	// CALLBACK_RESOURCE_USAGE_GENERAL (RDD::TEXTURE_LAYOUT_GENERAL, D3D12_BARRIER_LAYOUT_COMMON) and
-	// announced in D3D12_RESOURCE_STATE_COMMON (dlss.cpp, fsr_frame_generation*.cpp,
-	// RendererCompositorRD::_blit_hudless()). Enhanced barriers stay on: the legacy model's per-command
-	// state tracking cost the render thread measurably more CPU in MySupCom.
+	// Streamline and FidelityFX transition the textures they are handed with legacy barriers, which may only meet
+	// enhanced ones in the COMMON layout: such textures are declared CALLBACK_RESOURCE_USAGE_GENERAL (layout COMMON)
+	// and announced in D3D12_RESOURCE_STATE_COMMON. Enhanced barriers stay on, as legacy state tracking costs more CPU.
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19 = {};
 	res = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &options19, sizeof(options19));

@@ -100,16 +100,13 @@ public:
 	void pcl_set_options(const sl::PCLOptions &opts);
 	void pcl_marker(sl::FrameToken *frameToken, sl::PCLMarker marker);
 	sl::FrameToken *get_new_frame_token();
-	// The token RenderingServerDefault::draw() sends with its frame: last_token, or a new one if a
-	// previous draw already used it.
+	// Returns last_token, or a new one if a previous draw already used it.
 	sl::FrameToken *get_frame_token_for_draw();
 
 	void dlssg_disable();
 
-	// D3D12, right before a swap chain is created: loads or unloads DLSS-G, Reflex and PCL for it
-	// (slSetFeatureLoaded). Under AMD FSR none of them; under DLSS-G, Reflex and PCL, and DLSS-G
-	// only while frame generation is wanted (DLSS-G guide, section 18: a swap chain created with
-	// DLSS-G unloaded is the native one, without its off-screen copy and extra queue).
+	// D3D12, right before a swap chain is created: loads or unloads DLSS-G, Reflex and PCL for it.
+	// DLSS-G is loaded only while frame generation is wanted, so other swap chains stay native.
 	void apply_frame_generation_features(bool p_fsr);
 	bool reflex_usable() const { return streamline_capabilities.reflex_available && reflex_loaded; }
 
@@ -123,12 +120,11 @@ public:
 	// last_token has been sent with a draw. See get_frame_token_for_draw().
 	bool last_token_drawn = false;
 
-	// The token of the frame the render thread is drawing. Set by the draw command itself
-	// (RenderingServerDefault::_draw), so it travels through the command queue with the frame
-	// it belongs to and cannot be renewed under the render thread's feet. Read by dlss.cpp.
+	// The token of the frame the render thread is drawing. Set by the draw command itself, so it
+	// travels through the command queue with its frame and the main thread cannot renew it meanwhile.
 	sl::FrameToken *render_token = nullptr;
 	bool is_game = false;
-	// rendering/streamline/dlss_sharpening: run the NIS sharpening pass after DLSS. Off by default, see dlss.cpp.
+	// Run the NIS sharpening pass after DLSS.
 	bool dlss_sharpening = false;
 
 	sl::ViewportHandle dlssg_viewport;
@@ -139,7 +135,7 @@ public:
 	bool dlssg_ui_recomposition = false;
 	// Frames DLSS-G's enabling has waited for the HUD-less color and UI alpha to be tagged.
 	int dlssg_hudless_wait = 0;
-	// DLSS-G loaded for the current swap chain, and wanted for the next one (dlss.cpp, D3D12).
+	// D3D12: DLSS-G loaded for the current swap chain, and wanted for the next one.
 	bool dlssg_loaded = true;
 	bool dlssg_wanted = false;
 	bool reflex_loaded = true; // Reflex and PCL together.
