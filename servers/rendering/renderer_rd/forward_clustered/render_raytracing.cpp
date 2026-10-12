@@ -1472,6 +1472,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_scale[1] = 1.0f;
 	mat.uv1_offset[0] = 0.0f;
 	mat.uv1_offset[1] = 0.0f;
+	mat.uv1_scale_z = 1.0f;
+	mat.uv1_offset_z = 0.0f;
+	mat.uv1_blend_sharpness = 1.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
 
@@ -1740,12 +1743,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.emission_strength = emission_energy_var;
 	}
 
-	// UV1 scale and offset (vec3 in Godot, we only use xy).
+	// UV1 scale and offset (z is only used by triplanar mapping).
 	Variant uv1_scale_var = material_storage->material_get_param(p_material_rid, "uv1_scale");
 	if (uv1_scale_var.get_type() == Variant::VECTOR3) {
 		Vector3 s = uv1_scale_var;
 		mat.uv1_scale[0] = s.x;
 		mat.uv1_scale[1] = s.y;
+		mat.uv1_scale_z = s.z;
 	}
 
 	Variant uv1_offset_var = material_storage->material_get_param(p_material_rid, "uv1_offset");
@@ -1753,6 +1757,22 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		Vector3 o = uv1_offset_var;
 		mat.uv1_offset[0] = o.x;
 		mat.uv1_offset[1] = o.y;
+		mat.uv1_offset_z = o.z;
+	}
+
+	// BaseMaterial3D's triplanar mapping is a shader feature, not a parameter: read it from its generated code.
+	if (!mat_data->is_custom_shader) {
+		const String code = material_storage->material_get_shader_code_rt(p_material_rid);
+		if (code.contains("varying vec3 uv1_triplanar_pos;")) {
+			mat.flags |= RT_MAT_FLAG_UV1_TRIPLANAR;
+			if (code.contains("uv1_triplanar_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz")) {
+				mat.flags |= RT_MAT_FLAG_UV1_WORLD_TRIPLANAR;
+			}
+			Variant sharpness_var = material_storage->material_get_param(p_material_rid, "uv1_blend_sharpness");
+			if (sharpness_var.get_type() == Variant::FLOAT) {
+				mat.uv1_blend_sharpness = sharpness_var;
+			}
+		}
 	}
 
 	// Point filtering: check if material requests nearest filtering (e.g. pixel art).

@@ -18,6 +18,8 @@ struct HitData {
 	vec3 geometry_normal; // World space, flipped for back-face hits.
 	vec3 tangent; // World space.
 	vec3 bitangent; // World space.
+	vec3 mesh_pos; // Mesh space: the instance transform of a compressed mesh also scales by its AABB.
+	vec3 mesh_normal; // Mesh space, not flipped.
 	vec2 uv; // Raw UV (no material scale/offset applied).
 	vec4 color; // Vertex color (white if not present).
 	bool is_front_face;
@@ -51,6 +53,7 @@ HitData compute_hit_data() {
 	if ((geom.flags & FLAG_PROCEDURAL) != 0u) {
 		h.uv = hit_attribs.bary_or_uv;
 		vec3 obj_normal = normalize(unpackSnorm4x8(hit_attribs.packed_normal).xyz);
+		h.mesh_normal = obj_normal;
 		vec3 obj_tangent = normalize(unpackSnorm4x8(hit_attribs.packed_tangent).xyz);
 		h.geometry_normal = normalize(normal_matrix * obj_normal);
 		h.tangent = normalize(normal_matrix * obj_tangent);
@@ -65,6 +68,7 @@ HitData compute_hit_data() {
 	{
 		// Triangle hit: reuse `attrs` from the top-level fetch (already has
 		// UV / TBN from FETCH_UV | FETCH_TBN or FETCH_ALL).
+		h.mesh_normal = attrs.normal;
 		h.geometry_normal = normalize(normal_matrix * attrs.normal);
 		h.tangent = normalize(normal_matrix * attrs.tangent);
 		h.bitangent = cross(h.geometry_normal, h.tangent) * attrs.bitangent_sign;
@@ -76,6 +80,10 @@ HitData compute_hit_data() {
 	}
 
 	h.hit_pos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+	h.mesh_pos = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT;
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		h.mesh_pos = h.mesh_pos * vec3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z) + vec3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z);
+	}
 
 	return h;
 }
@@ -99,6 +107,14 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 		return sample_bindless_texture_point(tex_idx, uv);
 	}
 	return sample_bindless_texture(tex_idx, uv);
+}
+
+/// BaseMaterial3D's triplanar_texture().
+vec4 sample_material_triplanar(uint tex_idx, vec3 weights, vec3 triplanar_pos, uint mat_flags) {
+	vec4 samp = sample_material_texture(tex_idx, triplanar_pos.xy, mat_flags) * weights.z;
+	samp += sample_material_texture(tex_idx, triplanar_pos.xz, mat_flags) * weights.y;
+	samp += sample_material_texture(tex_idx, triplanar_pos.zy * vec2(-1.0, 1.0), mat_flags) * weights.x;
+	return samp;
 }
 
 /// Apply tangent-space normal map to geometry normal.

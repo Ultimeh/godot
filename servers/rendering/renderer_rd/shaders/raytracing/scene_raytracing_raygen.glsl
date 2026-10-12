@@ -427,26 +427,55 @@ void main() {
 	MaterialData mat = materials[h.geometry_idx];
 	vec2 uv = h.uv * mat.uv1_scale + mat.uv1_offset;
 
+	// Triplanar mapping, set up as BaseMaterial3D's vertex() does: object space unless world triplanar.
+	bool triplanar = (mat.flags & MAT_FLAG_UV1_TRIPLANAR) != 0u;
+	vec3 triplanar_weights = vec3(0.0);
+	vec3 triplanar_pos = vec3(0.0);
+	HitData nh = h;
+	if (triplanar) {
+		bool world = (mat.flags & MAT_FLAG_UV1_WORLD_TRIPLANAR) != 0u;
+		vec3 n = world ? h.geometry_normal : h.mesh_normal;
+		vec3 pos = world ? h.hit_pos : h.mesh_pos;
+		triplanar_weights = pow(abs(n), vec3(mat.uv1_blend_sharpness));
+		triplanar_weights /= dot(triplanar_weights, vec3(1.0));
+		triplanar_pos = pos * vec3(mat.uv1_scale, mat.uv1_scale_z) + vec3(mat.uv1_offset, mat.uv1_offset_z);
+		triplanar_pos *= vec3(1.0, -1.0, 1.0);
+
+		vec3 an = abs(n);
+		vec3 tangent = normalize(vec3(0.0, 0.0, -1.0) * an.x + vec3(1.0, 0.0, 0.0) * (an.y + an.z));
+		vec3 binormal = normalize(vec3(0.0, 1.0, 0.0) * (an.x + an.z) + vec3(0.0, 0.0, -1.0) * an.y);
+		if (!world) {
+			// Same rotation compute_hit_data() applies to the mesh's tangents.
+			mat3 model_rotation = mat3(gl_ObjectToWorldEXT);
+			mat3 normal_matrix = mat3(normalize(model_rotation[0]), normalize(model_rotation[1]), normalize(model_rotation[2]));
+			tangent = normal_matrix * tangent;
+			binormal = normal_matrix * binormal;
+		}
+		nh.tangent = normalize(tangent);
+		nh.bitangent = normalize(binormal);
+	}
+
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
-		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
+		vec3 normal_sample = triplanar ? sample_material_triplanar(mat.normal_texture_idx, triplanar_weights, triplanar_pos, 0u).rgb : sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
-		final_normal = apply_normal_map(h, tangent_space_normal, mat.normal_map_depth);
+		final_normal = apply_normal_map(nh, tangent_space_normal, mat.normal_map_depth);
 	}
 
 	// Texture sampling.
-	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
+	vec4 albedo_tex = triplanar ? sample_material_triplanar(mat.albedo_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags).rgb;
+	vec3 orm = (triplanar ? sample_material_triplanar(mat.orm_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.orm_texture_idx, uv, mat.flags)).rgb;
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
 	vec3 emissive = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
-		emissive = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb * mat.emission_color * mat.emission_strength;
+		vec3 emission_tex = (triplanar ? sample_material_triplanar(mat.emission_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.emission_texture_idx, uv, mat.flags)).rgb;
+		emissive = emission_tex * mat.emission_color * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
 	}
 
