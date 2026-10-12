@@ -3323,7 +3323,7 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 			// RT: collect ALL instances inside the camera AABB for TLAS and light gathering.
 			// Frustum-visible instances are guaranteed to be inside the AABB (superset),
 			// so skip the AABB test for them. Only test AABB for non-frustum instances.
-			// Mask out editor-only layers (20+) so gizmos/grid don't enter the TLAS.
+			// Only the camera's layers (Camera3D.cull_mask), without the editor-only ones (20+) so gizmos/grid don't enter the TLAS.
 			//
 			// Visibility-range parity: instances that failed VIS_CHECK for raster (i.e. they
 			// have NEEDS_CHECK flags and are off-frustum) must be re-checked here, otherwise
@@ -3334,7 +3334,7 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 			// Prefer the parent: exclude the child from RT until the parent becomes
 			// HIDDEN_CLOSE_RANGE (fully faded out), matching the point where raster
 			// switches over. In-frustum children are subject to the same rule.
-			if (cull_data.cull->rt_enabled && (idata.layer_mask & ((1 << 20) - 1))) {
+			if (cull_data.cull->rt_enabled && (LAYER_CHECK & ((1 << 20) - 1))) {
 				// For off-frustum instances, also run VIS_CHECK to match raster gating.
 				bool rt_in_range = in_frustum || (cull_data.scenario->instance_aabbs[i].in_aabb(cull_data.cull->rt_aabb) && VIS_CHECK);
 				if (rt_in_range) {

@@ -92,7 +92,7 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 		binormal = rt_tbn.binormal;
 #endif
 		uv_interp = fetch_uv(rt_geom, rt_index, rt_index, rt_index, vec3(1.0, 0.0, 0.0));
-		uv2_interp = uv_interp;
+		uv2_interp = fetch_uv2(rt_geom, rt_index, rt_index, rt_index, vec3(1.0, 0.0, 0.0));
 		color_interp = fetch_color(rt_geom, rt_index, rt_index, rt_index, vec3(1.0, 0.0, 0.0));
 		rt_vertex_id = int(rt_index);
 

@@ -133,7 +133,7 @@ vec3 displace_vertex(DisplaceJob p_job, vec3 p_rest_position, TBNResult p_tbn, u
 	binormal = p_tbn.binormal;
 #endif
 	uv_interp = fetch_uv(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
-	uv2_interp = uv_interp;
+	uv2_interp = fetch_uv2(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
 	color_interp = fetch_color(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
 	rt_vertex_id = int(p_index);
 

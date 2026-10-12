@@ -53,7 +53,8 @@ struct GeometryData {
 	uint rest_vertex_address_hi;
 
 	uint layer_mask; // The instance's layers, against each light's cull mask.
-	uint _pad[2];
+	uint uv2_byte_offset;
+	uint uv2_scale_packed; // fp16 x, fp16 y
 };
 
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {

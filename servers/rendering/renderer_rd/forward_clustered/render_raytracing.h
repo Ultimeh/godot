@@ -91,7 +91,8 @@ struct alignas(16) RT_GeometryData {
 	uint32_t rest_vertex_buffer_address_lo;
 	uint32_t rest_vertex_buffer_address_hi;
 	uint32_t layer_mask; // The instance's VisualInstance3D layers, against each light's cull mask.
-	uint32_t _pad[2];
+	uint32_t uv2_byte_offset;
+	uint32_t uv2_scale_packed; // fp16 x, fp16 y
 };
 static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
 
