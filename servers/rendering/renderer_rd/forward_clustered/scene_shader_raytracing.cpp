@@ -808,6 +808,13 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.fragment_code = _texture_calls_with_gradients(_depth_buffer_reads(gen_code.code.has("fragment") ? gen_code.code["fragment"] : String()));
 	// The functions vertex() calls too: their derivatives are 0 there, raster's vertex() reads mip 0 as well.
 	r_entry.fragment_globals = _texture_calls_with_gradients(_depth_buffer_reads(gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]));
+	// Hit shaders cannot discard: a discarded hit is ignored by the any-hit shader, which every material that discards
+	// gets, and passed through by the closest hit (raytracing_custom_fragment_inc.glsl).
+	if (r_entry.fragment_code.contains("discard;") || r_entry.fragment_globals.contains("discard;")) {
+		r_entry.uses_alpha_clip = true;
+		r_entry.fragment_code = r_entry.fragment_code.replace("discard;", "{ rt_discarded = true; }");
+		r_entry.fragment_globals = r_entry.fragment_globals.replace("discard;", "{ rt_discarded = true; }");
+	}
 	if (p_is_procedural) {
 		r_entry.intersection_code = gen_code.code.has("intersection") ? gen_code.code["intersection"] : String();
 		r_entry.intersection_globals = gen_code.stage_globals[ShaderCompiler::STAGE_INTERSECTION];

@@ -55,6 +55,7 @@ layout(buffer_reference, std140) readonly buffer CustomMaterialUniforms{
 // texture #defines, and fragment_globals functions can all access them.
 // Assigned to real hit values in main() before use.
 CustomMaterialUniforms material = CustomMaterialUniforms(uint64_t(0));
+bool rt_discarded = false; // The material code discarded the hit (its `discard`).
 uint rt_instance_uniforms_ofs = 0u; // `instance uniform` values: global_shader_uniforms.data[rt_instance_uniforms_ofs + n].
 vec3 vertex = vec3(0.0);
 vec3 normal = vec3(0.0, 0.0, 1.0);

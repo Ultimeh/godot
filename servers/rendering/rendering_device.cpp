@@ -7047,6 +7047,16 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 	}
 #endif
 
+	// In every build: the binding below dereferences each set the pipeline expects. A set missing, of another format or
+	// freed since it was bound (the validation above is debug only) would crash a release build.
+	for (uint32_t i = 0; i < raytracing_list.state.set_count; i++) {
+		if (raytracing_list.state.sets[i].pipeline_expected_format == 0) {
+			continue;
+		}
+		ERR_FAIL_COND_MSG(raytracing_list.state.sets[i].pipeline_expected_format != raytracing_list.state.sets[i].uniform_set_format || !uniform_set_owner.owns(raytracing_list.state.sets[i].uniform_set),
+				"Uniform set (" + itos(i) + ") missing, freed or of another format: the rays were not traced.");
+	}
+
 	// Prepare descriptor sets if the API doesn't use pipeline barriers.
 	if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
 		for (uint32_t i = 0; i < raytracing_list.state.set_count; i++) {

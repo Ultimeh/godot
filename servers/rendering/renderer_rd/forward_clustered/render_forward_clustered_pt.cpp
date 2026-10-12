@@ -330,8 +330,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		}
 	}
 
-	// Execute raytracing (replaces the opaque + motion vector pass).
-	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
+	// Execute raytracing (replaces the opaque + motion vector pass). Without a uniform set this frame (the pipeline was
+	// being rebuilt for a new material), nothing is traced: RenderingDevice only validates sets in debug builds.
+	if (rb_data.is_valid() && raytracing && raytracing->get_shader() && rt_uniform_set.is_valid()) {
 		RD::get_singleton()->draw_command_begin_label("Raytracing");
 		RENDER_TIMESTAMP("TLAS Build");
 

@@ -170,3 +170,6 @@ vec2 alpha_texture_coordinate = vec2(0.0);
 {
 	/* RT_CUSTOM_FRAGMENT_CODE */
 }
+if (rt_discarded) {
+	RT_CUSTOM_REMOVED_POINT
+}
