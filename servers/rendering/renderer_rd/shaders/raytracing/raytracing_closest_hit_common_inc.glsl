@@ -561,7 +561,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
+				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count, geometries[h.geometry_idx].layer_mask);
 		ps.radiance += ps.throughput * direct_light;
 	}
 

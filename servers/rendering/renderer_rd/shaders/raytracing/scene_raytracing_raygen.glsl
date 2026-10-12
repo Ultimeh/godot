@@ -475,10 +475,14 @@ void main() {
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
+	// BaseMaterial3D: (emission + texture) or (emission * texture), times the energy; the texture defaults to black.
 	vec3 emissive = vec3(0.0);
-	if ((mat.flags & 2u) != 0u) {
-		vec3 emission_tex = (triplanar ? sample_material_triplanar(mat.emission_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.emission_texture_idx, uv, mat.flags)).rgb;
-		emissive = emission_tex * mat.emission_color * mat.emission_strength;
+	if ((mat.flags & MAT_FLAG_EMISSION) != 0u) {
+		vec3 emission_tex = vec3(0.0);
+		if ((mat.flags & 2u) != 0u) {
+			emission_tex = (triplanar ? sample_material_triplanar(mat.emission_texture_idx, triplanar_weights, triplanar_pos, mat.flags) : sample_material_texture(mat.emission_texture_idx, uv, mat.flags)).rgb;
+		}
+		emissive = ((mat.flags & MAT_FLAG_EMISSION_ADD) != 0u ? mat.emission_color + emission_tex : mat.emission_color * emission_tex) * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
 	}
 

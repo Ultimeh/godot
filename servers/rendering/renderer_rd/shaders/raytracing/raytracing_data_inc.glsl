@@ -52,7 +52,8 @@ struct GeometryData {
 	uint rest_vertex_address_lo;
 	uint rest_vertex_address_hi;
 
-	uint _pad[3];
+	uint layer_mask; // The instance's layers, against each light's cull mask.
+	uint _pad[2];
 };
 
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {
@@ -116,3 +117,5 @@ struct MaterialData {
 
 #define MAT_FLAG_UV1_TRIPLANAR 8u
 #define MAT_FLAG_UV1_WORLD_TRIPLANAR 16u
+#define MAT_FLAG_EMISSION 32u
+#define MAT_FLAG_EMISSION_ADD 64u

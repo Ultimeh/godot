@@ -89,7 +89,8 @@ struct alignas(16) RT_GeometryData {
 	// For displaced geometry: positions before vertex() moved them (float3 packed).
 	uint32_t rest_vertex_buffer_address_lo;
 	uint32_t rest_vertex_buffer_address_hi;
-	uint32_t _pad[3];
+	uint32_t layer_mask; // The instance's VisualInstance3D layers, against each light's cull mask.
+	uint32_t _pad[2];
 };
 static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
 
@@ -144,9 +145,9 @@ struct alignas(16) RT_LightData {
 	float indirect_energy;
 	float inv_spot_attenuation;
 	float cos_spot_angle;
-	float _pad0;
+	uint32_t cull_mask; // Light3D.light_cull_mask: the layers this light lights.
 	float spot_direction[3];
-	float _pad1;
+	float shadow_opacity; // 0 without shadows: no shadow ray, as raster.
 };
 static_assert(sizeof(RT_LightData) == 80, "RT_LightData must be 80 bytes for std430");
 
@@ -170,6 +171,8 @@ enum {
 	RT_MAT_FLAG_POINT_FILTER = 4u,
 	RT_MAT_FLAG_UV1_TRIPLANAR = 8u,
 	RT_MAT_FLAG_UV1_WORLD_TRIPLANAR = 16u,
+	RT_MAT_FLAG_EMISSION = 32u, // BaseMaterial3D's emission is enabled.
+	RT_MAT_FLAG_EMISSION_ADD = 64u, // Emission operator: add (else multiply).
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
@@ -194,12 +197,14 @@ enum {
 struct alignas(16) RT_DisplaceJob {
 	float model_matrix[16];
 	float inv_model_matrix[16];
+	float prev_model_matrix[16];
+	float prev_inv_model_matrix[16];
 	RT_GeometryData geometry; // The mesh surface as stored.
 	uint64_t material_address;
 	uint32_t tbn_words;
 	uint32_t pad;
 };
-static_assert(sizeof(RT_DisplaceJob) == 272, "RT_DisplaceJob must be 272 bytes for std430");
+static_assert(sizeof(RT_DisplaceJob) == 400, "RT_DisplaceJob must be 400 bytes for std430");
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
@@ -231,10 +236,20 @@ struct RTDeformedGeometrySource {
 	uint32_t cache_version = 0; ///< Changes when the resource behind `cache_key` is recycled.
 	uint32_t surface_counter = 0; ///< Changes when the underlying mesh surface changes.
 	bool force_rebuild = false; ///< Rebuild instead of refitting when the data changed.
+	uint32_t prev_offset = UINT32_MAX; ///< When set and the data changed: previous positions read from `prev_vb` there.
+};
+
+// BaseMaterial3D's billboard modes, which place the instance in vertex().
+enum RTBillboardMode : uint8_t {
+	RT_BILLBOARD_DISABLED,
+	RT_BILLBOARD_ENABLED,
+	RT_BILLBOARD_FIXED_Y,
 };
 
 struct RTMaterialData {
 	alignas(16) RT_MaterialData data = {};
+	RTBillboardMode billboard_mode = RT_BILLBOARD_DISABLED;
+	bool billboard_keep_scale = false;
 	uint32_t global_buffer_index = UINT32_MAX;
 	uint32_t rt_sbt_offset = 0;
 	bool is_custom_shader = false;
@@ -284,12 +299,13 @@ struct RTDeformedCacheEntry {
 	bool prev_pos_seeded = false; // False until the first owned->prev copy has run.
 
 	// Displacement by the material's vertex() (_displace_surfaces()).
-	RID displaced_vb; // [displaced float3 positions][rest TBN block][rest float3 positions].
+	RID displaced_vb; // [displaced float3 positions][rest TBN block][rest float3 positions][previous frame's displaced float3 positions].
 	uint32_t displaced_vb_capacity = 0; // Bytes; grow-only.
 	uint32_t displaced_frame = 0; // Last frame the surface was displaced; 0 = never.
 	uint64_t displaced_stamp = 0; // Bumped on each evaluation.
 	bool displaced_rebuild = false; // Evaluated this frame: vertex() may turn triangles on or off, so no refit.
 	uint32_t displaced_slot = 0;
+	uint32_t displaced_prev_offset = 0; // Bytes to the previous frame's positions in displaced_vb.
 	uint16_t displaced_material_counter = 0;
 	Transform3D displaced_transform;
 };

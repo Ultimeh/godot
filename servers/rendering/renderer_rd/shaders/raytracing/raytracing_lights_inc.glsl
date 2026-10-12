@@ -31,9 +31,9 @@ struct RTLightData {
 	float indirect_energy; // Godot indirect energy multiplier.
 	float inv_spot_attenuation; // Spot cone softness.
 	float cos_spot_angle; // Cosine of spot cone half-angle.
-	float _pad0;
+	uint cull_mask; // Layers this light lights (Light3D.light_cull_mask).
 	vec3 spot_direction; // Spot direction (normalized, world space).
-	float _pad1;
+	float shadow_opacity; // 0 when the light casts no shadow (no shadow ray), as raster.
 };
 
 // Light buffer SSBO (binding provided by the including shader via RT_LIGHT_BUFFER_BINDING).
@@ -253,6 +253,14 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 // Next Event Estimation (NEE) - Direct Light Sampling
 // ============================================================================
 
+// The light reaching the point: no shadow ray for a light without shadows, and its shadow opacity, as raster.
+float lights_shadow_visibility(RTLightData p_light, vec3 p_origin, vec3 p_direction, float p_max_dist, inout uint rng_state) {
+	if (p_light.shadow_opacity <= 0.0) {
+		return 1.0;
+	}
+	return lights_trace_shadow_ray(p_origin, p_direction, p_max_dist, rng_state) ? 1.0 : 1.0 - p_light.shadow_opacity;
+}
+
 // Evaluate direct lighting using NEE with stochastic light selection.
 // Uses mini-batch reservoir sampling for importance-weighted light selection.
 vec3 lights_evaluate_direct_lighting(
@@ -262,7 +270,8 @@ vec3 lights_evaluate_direct_lighting(
 		MaterialProperties material,
 		inout uint rng_state,
 		bool is_indirect_bounce,
-		uint light_count) {
+		uint light_count,
+		uint layer_mask) {
 	if (light_count == 0u) {
 		return vec3(0.0);
 	}
@@ -276,9 +285,12 @@ vec3 lights_evaluate_direct_lighting(
 		uint idx = min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
 		RTLightData test_light = rt_lights[idx];
 
-		// Range check for positional lights.
+		// Range check for positional lights; a light lights only the layers of its cull mask.
 		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT);
 		bool is_valid = !is_positional;
+		if ((test_light.cull_mask & layer_mask) == 0u) {
+			continue;
+		}
 		if (!is_valid) {
 			vec3 to_l = test_light.position - hit_pos;
 			float d2 = dot(to_l, to_l);
@@ -345,7 +357,8 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
+		float visibility = lights_shadow_visibility(light, hit_pos, L, shadow_dist, rng_state);
+		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
 
@@ -364,7 +377,7 @@ vec3 lights_evaluate_direct_lighting(
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
+		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * visibility;
 		return contribution / max(light_select_pdf, 1e-10);
 	}
 	// === CONE LIGHT PATH (directional) ===
@@ -378,7 +391,8 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
+		float visibility = lights_shadow_visibility(light, hit_pos, L, ls.max_distance, rng_state);
+		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
 
@@ -390,6 +404,6 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * indirect_mul * visibility / max(light_select_pdf, 1e-10);
 	}
 }

@@ -789,7 +789,10 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	// Per-frame copies run exactly once per frame, even when the same surface is visible from multiple viewports.
 	const bool first_touch_this_frame = entry.last_used_frame != current_frame;
 	if (first_touch_this_frame) {
-		if (entry.prev_pos_seeded) {
+		if (p_source.prev_offset != UINT32_MAX && data_changed) {
+			rd->buffer_copy(p_source.prev_vb, entry.prev_pos_vb, p_source.prev_offset, 0, pos_size);
+			entry.prev_pos_seeded = true;
+		} else if (entry.prev_pos_seeded) {
 			rd->buffer_copy(entry.owned_vb_full, entry.prev_pos_vb, 0, 0, pos_size);
 		}
 		if (data_changed || !entry.prev_pos_seeded) {
@@ -1160,7 +1163,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 				continue;
 			}
 			const uint32_t tbn_words = (format & RSE::ARRAY_FORMAT_NORMAL) ? ((format & RSE::ARRAY_FORMAT_TANGENT) ? 2 : 1) : 0;
-			const uint32_t size = vertex_count * (3 + tbn_words + 3) * sizeof(uint32_t);
+			const uint32_t size = vertex_count * (3 + tbn_words + 3 + 3) * sizeof(uint32_t);
 
 			RTDeformedCacheEntry *entry = _access_deformed_slot(surf->rt_deformed_handle);
 			bool evaluate = entry->displaced_frame == 0 || entry->displaced_slot != mat_data->rt_sbt_offset ||
@@ -1178,6 +1181,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			}
 			entry->displaced_frame = current_frame;
 			entry->displaced_rebuild = evaluate;
+			entry->displaced_prev_offset = vertex_count * (3 + tbn_words + 3) * sizeof(uint32_t);
 			if (!evaluate) {
 				continue;
 			}
@@ -1199,6 +1203,10 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			}
 			RendererRD::MaterialStorage::store_transform(inst->transform, data.model_matrix);
 			RendererRD::MaterialStorage::store_transform(inst->transform.affine_inverse(), data.inv_model_matrix);
+			// A teleported instance has no motion from its transform (Terrain3D moves its clipmap that way).
+			const Transform3D &prev_transform = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED ? inst->prev_transform : inst->transform;
+			RendererRD::MaterialStorage::store_transform(prev_transform, data.prev_model_matrix);
+			RendererRD::MaterialStorage::store_transform(prev_transform.affine_inverse(), data.prev_inv_model_matrix);
 			data.material_address = mat_data->data.uniform_address;
 			data.tbn_words = tbn_words;
 			job_data.push_back(data);
@@ -1997,9 +2005,24 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.uv1_offset_z = o.z;
 	}
 
-	// BaseMaterial3D's triplanar mapping is a shader feature, not a parameter: read it from its generated code.
+	// BaseMaterial3D's triplanar mapping and billboard modes are shader features, not parameters: read them from its
+	// generated code.
+	mat_data->billboard_mode = RT_BILLBOARD_DISABLED;
+	mat_data->billboard_keep_scale = false;
 	if (!mat_data->is_custom_shader) {
 		const String code = material_storage->material_get_shader_code_rt(p_material_rid);
+		if (code.contains("// Billboard Mode: Enabled")) {
+			mat_data->billboard_mode = RT_BILLBOARD_ENABLED;
+		} else if (code.contains("// Billboard Mode: Y-Billboard")) {
+			mat_data->billboard_mode = RT_BILLBOARD_FIXED_Y;
+		}
+		mat_data->billboard_keep_scale = code.contains("// Billboard Keep Scale: Enabled");
+		if (code.contains("// Emission: Enabled")) {
+			mat.flags |= RT_MAT_FLAG_EMISSION;
+			if (code.contains("// Emission Operator: Add")) {
+				mat.flags |= RT_MAT_FLAG_EMISSION_ADD;
+			}
+		}
 		if (code.contains("varying vec3 uv1_triplanar_pos;")) {
 			mat.flags |= RT_MAT_FLAG_UV1_TRIPLANAR;
 			if (code.contains("uv1_triplanar_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz")) {
@@ -2514,6 +2537,26 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
+// The instance transform BaseMaterial3D's billboard modes give in vertex() (MODELVIEW_MATRIX without the view).
+static Transform3D _billboard_transform(const Transform3D &p_model, const Transform3D &p_camera, RTBillboardMode p_mode, bool p_keep_scale) {
+	Basis basis = p_camera.basis;
+	if (p_mode == RT_BILLBOARD_FIXED_Y) {
+		const Vector3 up(0, 1, 0);
+		const Vector3 x = up.cross(p_camera.basis.get_column(2));
+		const Vector3 z = p_camera.basis.get_column(0).cross(up);
+		if (x.length_squared() < CMP_EPSILON2 || z.length_squared() < CMP_EPSILON2) {
+			return p_model; // Camera looking straight up or down: raster divides by zero there.
+		}
+		basis.set_column(0, x.normalized());
+		basis.set_column(1, up);
+		basis.set_column(2, z.normalized());
+	}
+	if (p_keep_scale) {
+		basis = basis * Basis::from_scale(p_model.basis.get_scale_abs());
+	}
+	return Transform3D(basis, p_model.origin);
+}
+
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
@@ -2629,6 +2672,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				geom.aabb_size_x = (float)ps->culling_aabb.size.x;
 				geom.aabb_size_y = (float)ps->culling_aabb.size.y;
 				geom.aabb_size_z = (float)ps->culling_aabb.size.z;
+				geom.layer_mask = inst->layer_mask;
 				geometry_data.push_back(geom);
 
 				if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
@@ -2803,6 +2847,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					src.cache_key = surf->rt_deformed_handle.get_id();
 					src.surface_counter = surface_counter;
 					src.force_rebuild = displaced->displaced_rebuild;
+					src.prev_vb = displaced->displaced_vb;
+					src.prev_offset = displaced->displaced_prev_offset;
 					surf_data = process_deformed_surface(surf, mesh_surface, src, dirty_blas_list, dirty_blas_update_list);
 					if (surf_data && surf_data->blas.is_valid()) {
 						// The rest positions follow the deformed vertex buffer's sections.
@@ -2848,7 +2894,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			// Compute or reuse cached final transform (instance * aabb_transform for compressed meshes).
 			Transform3D final_transform;
-			if (instance_static && surf->cached_final_transform_valid) {
+			const bool billboard = mat_data->billboard_mode != RT_BILLBOARD_DISABLED;
+			if (billboard) {
+				final_transform = _billboard_transform(instance_transform, p_render_data->scene_data->cam_transform, mat_data->billboard_mode, mat_data->billboard_keep_scale);
+				if (surf_data->is_compressed) {
+					final_transform = final_transform * surf_data->aabb_transform;
+				}
+			} else if (instance_static && surf->cached_final_transform_valid) {
 				final_transform = surf->cached_final_transform;
 			} else {
 				final_transform = instance_transform;
@@ -2862,8 +2914,19 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			blass.push_back(surf_data->blas);
 			geometry_data.push_back(surf_data->geometry);
+			geometry_data[geometry_data.size() - 1].layer_mask = inst->layer_mask;
 
-			if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
+			if (billboard) {
+				// Turning with the camera is motion too.
+				motion_indices.push_back((int32_t)motion_transforms.size());
+				RT_InstanceMotionData motion = {};
+				Transform3D prev_final = _billboard_transform(prev_instance_transform, p_render_data->scene_data->prev_cam_transform, mat_data->billboard_mode, mat_data->billboard_keep_scale);
+				if (surf_data->is_compressed) {
+					prev_final = prev_final * surf_data->aabb_transform;
+				}
+				RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_final, motion.prev_object_to_world);
+				motion_transforms.push_back(motion);
+			} else if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
 				motion_indices.push_back((int32_t)motion_transforms.size());
 				RT_InstanceMotionData motion = {};
 				Transform3D prev_final = prev_instance_transform;
@@ -2954,6 +3017,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			blass.push_back(merged_sd.blas);
 			blas_transforms.push_back(pending.instance_transform);
 			geometry_data.push_back(merged_sd.geometry);
+			geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
@@ -3012,6 +3076,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				blass.push_back(surf_data->blas);
 				blas_transforms.push_back(final_transform);
 				geometry_data.push_back(surf_data->geometry);
+				geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 				material_data.push_back(pending.mat_data->data);
 
@@ -3188,6 +3253,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.spot_direction[0] = 0.0f;
 		ld.spot_direction[1] = 0.0f;
 		ld.spot_direction[2] = 0.0f;
+		ld.cull_mask = ls->light_get_cull_mask(base);
+		ld.shadow_opacity = ls->light_has_shadow(base) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_OPACITY) : 0.0f;
 		rt_light_count++;
 	}
 
@@ -3236,6 +3303,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			ld.max_range_squared = 0.0f;
 		}
 		ld.specular_amount = ls->light_get_param(base, RSE::LIGHT_PARAM_SPECULAR) * 2.0f; // Matches rasterizer convention (light_storage.cpp), normalizes 0.5 default to 1.0.
+		ld.cull_mask = ls->light_get_cull_mask(base);
+		ld.shadow_opacity = ls->light_has_shadow(base) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_OPACITY) : 0.0f;
 		ld.indirect_energy = ls->light_get_param(base, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
 
 		if (type == RSE::LIGHT_SPOT) {
