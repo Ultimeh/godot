@@ -18,6 +18,12 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
+// A shadow ray goes toward the light: the faces raster's shadow pass draws, turned to the light, are hit from behind.
+#define RT_SHADOW_RAY_FLAGS gl_RayFlagsCullFrontFacingTrianglesEXT
+
+// TLAS instance masks (RT_INSTANCE_MASK_* in render_raytracing.h).
+#define RT_MASK_CAMERA 0x01
+#define RT_MASK_SHADOW 0x02
 
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;

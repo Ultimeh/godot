@@ -218,6 +218,9 @@ void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buf
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, RD::DATA_FORMAT_R8G8B8A8_SNORM, usage_bits, RD::TEXTURE_SAMPLES_1);
 	// Specular Hit Distance: Single channel distance (R16F is sufficient).
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST, RD::DATA_FORMAT_R16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	// The noisy color before the transparent pass draws on it: RR tells the transparents apart and keeps them
+	// sharp. The guide says to use the noisy color's format, or precision differences read as transparency.
+	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY, p_render_buffers->get_base_data_format(), usage_bits, RD::TEXTURE_SAMPLES_1);
 }
 
 void RenderRaytracing::dlss_rr_free_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -242,6 +245,11 @@ RID RenderRaytracing::dlss_rr_get_specular_albedo(RenderSceneBuffersRD *p_render
 RID RenderRaytracing::dlss_rr_get_normal_roughness(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
 	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS);
+}
+
+RID RenderRaytracing::dlss_rr_get_color_before_transparency(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY);
 }
 
 RID RenderRaytracing::dlss_rr_get_specular_hit_dist(RenderSceneBuffersRD *p_render_buffers) const {
@@ -2019,6 +2027,15 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			mat_data->billboard_mode = RT_BILLBOARD_FIXED_Y;
 		}
 		mat_data->billboard_keep_scale = code.contains("// Billboard Keep Scale: Enabled");
+		if (code.contains(", unshaded")) {
+			mat.flags |= RT_MAT_FLAG_UNSHADED;
+		}
+		if (code.contains("// Vertex Color Use as Albedo: Enabled")) {
+			mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_ALBEDO;
+			if (code.contains("// Vertex Color is sRGB: Enabled")) {
+				mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_SRGB;
+			}
+		}
 		if (code.contains("// Emission: Enabled")) {
 			mat.flags |= RT_MAT_FLAG_EMISSION;
 			if (code.contains("// Emission Operator: Add")) {
@@ -2096,7 +2113,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.transform = blas_transforms[i];
 		inst.blas = blass[i];
 		inst.flags = BitField<RD::AccelerationStructureInstanceFlagBits>(instance_flags[i]);
-		inst.mask = (i < instance_masks.size()) ? instance_masks[i] : 0xFF;
+		inst.mask = instance_masks[i];
 		uint32_t sbt_off = (i < sbt_offsets.size()) ? sbt_offsets[i] : 0;
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
 	}
@@ -2593,6 +2610,20 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	const bool collect_render_info = (p_render_data->render_info != nullptr);
 #endif
 
+	// Which rays see an instance, from its cast_shadow setting.
+	auto instance_mask = [](const RenderGeometryInstanceBase *p_instance) -> uint8_t {
+		switch (p_instance->data->cast_shadows) {
+			case RSE::SHADOW_CASTING_SETTING_OFF:
+				return RT_INSTANCE_MASK_CAMERA;
+			case RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY:
+				return RT_INSTANCE_MASK_SHADOW;
+			case RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED:
+				return RT_INSTANCE_MASK_CAMERA | RT_INSTANCE_MASK_SHADOW | RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW;
+			default:
+				return RT_INSTANCE_MASK_CAMERA | RT_INSTANCE_MASK_SHADOW;
+		}
+	};
+
 	// -----------------------------------------------------------------------
 	// Phase 1: CPU / buffer-update work
 	// -----------------------------------------------------------------------
@@ -2695,7 +2726,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(instance_mask(inst));
 			}
 			continue;
 		}
@@ -2993,7 +3024,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(instance_mask(inst));
 
 			surf = surf->next;
 		}
@@ -3024,7 +3055,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(instance_mask(pending.mm_surf->owner));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -3096,7 +3127,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(instance_mask(pending.mm_surf->owner));
 			}
 
 #ifdef TOOLS_ENABLED
@@ -3114,6 +3145,28 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 #endif
 		}
+	}
+
+	// The shadow rays ignore the faces turned away from the light, as raster's shadow pass culls them. A double-sided
+	// shadow caster gets a second instance only the shadow rays see, with face culling off.
+	const uint32_t instance_count = blass.size();
+	for (uint32_t i = 0; i < instance_count; i++) {
+		if (!(instance_masks[i] & RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW)) {
+			continue;
+		}
+		instance_masks[i] &= ~RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW;
+		if (instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
+			continue;
+		}
+		instance_masks[i] &= ~RT_INSTANCE_MASK_SHADOW;
+		blass.push_back(blass[i]);
+		blas_transforms.push_back(blas_transforms[i]);
+		geometry_data.push_back(geometry_data[i]);
+		material_data.push_back(material_data[i]);
+		sbt_offsets.push_back(sbt_offsets[i]);
+		motion_indices.push_back(motion_indices[i]);
+		instance_flags.push_back(instance_flags[i] | RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT);
+		instance_masks.push_back(RT_INSTANCE_MASK_SHADOW);
 	}
 
 	// Phase 3: BLAS / TLAS build.

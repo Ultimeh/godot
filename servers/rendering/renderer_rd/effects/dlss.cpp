@@ -169,6 +169,7 @@ struct DLSSCallbackPayload {
 	DLSSResolvedTexture rr_specular_albedo;
 	DLSSResolvedTexture rr_normal_roughness;
 	DLSSResolvedTexture rr_specular_hit_dist;
+	DLSSResolvedTexture rr_color_before_transparency;
 	// The compositor sets the HUD-less color and UI alpha after the 3D pass: they are captured when the frame's
 	// recording ends, or by the callback itself if the graph is replayed earlier (a flush).
 	bool hudless_final = false;
@@ -343,6 +344,7 @@ DLSSContextInner::~DLSSContextInner() {
 			sl::kBufferTypeSpecularAlbedo,
 			sl::kBufferTypeNormalRoughness,
 			sl::kBufferTypeSpecularHitDistance,
+			sl::kBufferTypeColorBeforeTransparency,
 			sl::kBufferTypeHUDLessColor,
 			DLSS_BUFFER_TYPE_UI_ALPHA,
 		};
@@ -510,11 +512,14 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 		payload->rr_specular_albedo = dlss_resolve_texture(p_params.dlss_rr_specular_albedo);
 		payload->rr_normal_roughness = dlss_resolve_texture(p_params.dlss_rr_normal_roughness);
 		payload->rr_specular_hit_dist = dlss_resolve_texture(p_params.dlss_rr_specular_hit_dist);
+		if (p_params.dlss_rr_color_before_transparency.is_valid()) {
+			payload->rr_color_before_transparency = dlss_resolve_texture(p_params.dlss_rr_color_before_transparency);
+		}
 	}
 	dlss_pending_payloads.push_back(payload);
 
 	// Inject DLSS into the render graph
-	RD::CallbackResource res[8]; // Increased for DLSS-RR buffers
+	RD::CallbackResource res[9]; // Color, output, depth, motion and the five DLSS-RR guides.
 	int num_resources = 0;
 	res[num_resources++].rid = p_params.color;
 	res[num_resources++].rid = p_params.output;
@@ -534,6 +539,9 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 		}
 		if (p_params.dlss_rr_specular_hit_dist.is_valid()) {
 			res[num_resources++].rid = p_params.dlss_rr_specular_hit_dist;
+		}
+		if (p_params.dlss_rr_color_before_transparency.is_valid()) {
+			res[num_resources++].rid = p_params.dlss_rr_color_before_transparency;
 		}
 	}
 
@@ -723,8 +731,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 
 	// Tag resources
 	if (StreamlineContext::get().slSetTag != nullptr) {
-		sl::Resource resources[10];
-		sl::ResourceTag resourceTags[10];
+		sl::Resource resources[12]; // Color, output, depth, motion, five DLSS-RR guides, DLSS-G HUD-less color and UI alpha.
+		sl::ResourceTag resourceTags[12];
 		int numResources = 0;
 
 		assignResource(resources, resourceTags, numResources, p_payload.color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent);
@@ -740,6 +748,9 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 			// kBufferTypeNormalRoughness for packed normal+roughness (XYZ=normal, W=roughness)
 			assignResource(resources, resourceTags, numResources, p_payload.rr_normal_roughness, sl::kBufferTypeNormalRoughness, sl::ResourceLifecycle::eValidUntilPresent);
 			assignResource(resources, resourceTags, numResources, p_payload.rr_specular_hit_dist, sl::kBufferTypeSpecularHitDistance, sl::ResourceLifecycle::eValidUntilPresent);
+			if (p_payload.rr_color_before_transparency.valid) {
+				assignResource(resources, resourceTags, numResources, p_payload.rr_color_before_transparency, sl::kBufferTypeColorBeforeTransparency, sl::ResourceLifecycle::eValidUntilPresent);
+			}
 		}
 
 		// DLSS-G's HUD-less color and UI alpha, written later in this frame: eValidUntilPresent only

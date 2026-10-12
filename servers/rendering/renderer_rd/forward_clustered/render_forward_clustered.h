@@ -1403,6 +1403,7 @@ protected:
 		RID specular_albedo;
 		RID normal_roughness;
 		RID specular_hit_dist;
+		RID color_before_transparency;
 	};
 
 	Scale3DMode _resolve_scale_3d_mode(Ref<RenderSceneBuffersRD> p_render_buffers) const;

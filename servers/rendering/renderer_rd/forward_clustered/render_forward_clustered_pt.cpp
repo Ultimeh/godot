@@ -449,6 +449,11 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
 	}
 
+	// DLSS RR's color before transparency guide: what the transparent pass is about to draw over.
+	if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
+		copy_effects->copy_to_rect(rb->get_internal_texture(), raytracing->dlss_rr_get_color_before_transparency(rb.ptr()), Rect2i(Point2i(), rb->get_internal_size()));
+	}
+
 	{
 		RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
@@ -500,6 +505,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			dlss_rr_guides.specular_albedo = raytracing->dlss_rr_get_specular_albedo(rb.ptr());
 			dlss_rr_guides.normal_roughness = raytracing->dlss_rr_get_normal_roughness(rb.ptr());
 			dlss_rr_guides.specular_hit_dist = raytracing->dlss_rr_get_specular_hit_dist(rb.ptr());
+			dlss_rr_guides.color_before_transparency = raytracing->dlss_rr_get_color_before_transparency(rb.ptr());
 		}
 		_render_3d_upscaling(p_render_data, scale_type, using_taa, time_step, dlss_rr_guides);
 	}

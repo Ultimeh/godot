@@ -177,6 +177,9 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
 	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
 	alpha *= mat.albedo_color.a;
+	if ((mat.flags & MAT_FLAG_VERTEX_COLOR_ALBEDO) != 0u) {
+		alpha *= fetch_color(geom, i0, i1, i2, bary).a;
+	}
 
 	return alpha >= 0.5;
 }
@@ -193,8 +196,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	// Ray queries are significantly faster, but can not handle complex alpha materials
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, origin, 0.001, direction, max_dist - 0.001);
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
 
 	while (rayQueryProceedEXT(shadow_rq)) {
 		if (rayQueryGetIntersectionTypeEXT(shadow_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -213,8 +216,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 #elif defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	return !(hitObjectIsHitEXT(hitObject));
@@ -235,8 +238,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).

@@ -80,7 +80,7 @@ void main() {
 
 			hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-			traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+			traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 #endif
 
 			ps = path_unpack(payload);
@@ -398,6 +398,11 @@ void main() {
 	m.metalness = metallic;
 	m.specular = specular;
 	m.emissive = emission * scene_data_block.data.emissive_exposure_normalization;
+#ifdef MODE_UNSHADED
+	m.unshaded = true;
+#else
+	m.unshaded = false;
+#endif
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 	if (any(isnan(m.normal))) {
 		m.normal = h.geometry_normal; // Material code can leave NaN normals (screen derivatives are zero here).
@@ -502,6 +507,9 @@ void main() {
 
 	// Texture sampling.
 	vec4 albedo_tex = triplanar ? sample_material_triplanar(mat.albedo_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.albedo_texture_idx, uv, uv_ddx, uv_ddy, mat.flags);
+	if ((mat.flags & MAT_FLAG_VERTEX_COLOR_ALBEDO) != 0u) {
+		albedo_tex *= material_vertex_color(fetch_color(geom, i0, i1, i2, bary), mat.flags); // HitData skips the color here.
+	}
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
 	vec3 orm = (triplanar ? sample_material_triplanar(mat.orm_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.orm_texture_idx, uv, uv_ddx, uv_ddy, mat.flags)).rgb;
 	float roughness = saturate(orm.g * mat.roughness);
@@ -527,6 +535,7 @@ void main() {
 	m.specular = mat.specular;
 	m.emissive = emissive;
 	m.normal = final_normal;
+	m.unshaded = (mat.flags & MAT_FLAG_UNSHADED) != 0u;
 
 #ifdef RT_DEBUG_ENABLED
 	{
@@ -665,6 +674,9 @@ void main() {
 	vec2 uv_ddy = (uv0 * bary_ddy.x + uv1 * bary_ddy.y + uv2 * bary_ddy.z) * mat.uv1_scale;
 	float alpha = textureGrad(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, uv_ddx, uv_ddy).a;
 	alpha *= mat.albedo_color.a;
+	if ((mat.flags & MAT_FLAG_VERTEX_COLOR_ALBEDO) != 0u) {
+		alpha *= fetch_color(geom, i0, i1, i2, bary).a;
+	}
 
 	if (alpha < 0.5) {
 		ignoreIntersectionEXT;

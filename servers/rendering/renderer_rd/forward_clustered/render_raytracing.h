@@ -50,6 +50,7 @@
 #define RB_TEX_DLSS_RR_SPECULAR_ALBEDO SNAME("specular_albedo")
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
+#define RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY SNAME("color_before_transparency")
 
 class RenderDataRD;
 class RenderSceneBuffersRD;
@@ -164,6 +165,13 @@ enum {
 	RT_CACHE_CHUNK_MASK = 255,
 };
 
+// TLAS instance masks: what the camera and bounce rays see, and what blocks the shadow rays, as GeometryInstance3D.cast_shadow.
+enum : uint8_t {
+	RT_INSTANCE_MASK_CAMERA = 1u,
+	RT_INSTANCE_MASK_SHADOW = 2u,
+	RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW = 0x80u, // Build-time only: the shadow rays need both faces, see build_tlas().
+};
+
 // Material flags for RT (matches GLSL mat_flags bit layout).
 enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
@@ -173,6 +181,9 @@ enum {
 	RT_MAT_FLAG_UV1_WORLD_TRIPLANAR = 16u,
 	RT_MAT_FLAG_EMISSION = 32u, // BaseMaterial3D's emission is enabled.
 	RT_MAT_FLAG_EMISSION_ADD = 64u, // Emission operator: add (else multiply).
+	RT_MAT_FLAG_UNSHADED = 128u,
+	RT_MAT_FLAG_VERTEX_COLOR_ALBEDO = 256u,
+	RT_MAT_FLAG_VERTEX_COLOR_SRGB = 512u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
@@ -447,7 +458,7 @@ class RenderRaytracing {
 	LocalVector<RID> blass;
 	LocalVector<Transform3D> blas_transforms;
 	LocalVector<uint32_t> instance_flags;
-	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
+	LocalVector<uint8_t> instance_masks; // RT_INSTANCE_MASK_* bits.
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
@@ -544,6 +555,7 @@ public:
 	RID dlss_rr_get_specular_albedo(RenderSceneBuffersRD *p_render_buffers) const;
 	RID dlss_rr_get_normal_roughness(RenderSceneBuffersRD *p_render_buffers) const;
 	RID dlss_rr_get_specular_hit_dist(RenderSceneBuffersRD *p_render_buffers) const;
+	RID dlss_rr_get_color_before_transparency(RenderSceneBuffersRD *p_render_buffers) const;
 
 	void register_raytracing_buffer_dependencies(RD::RaytracingListID p_list);
 

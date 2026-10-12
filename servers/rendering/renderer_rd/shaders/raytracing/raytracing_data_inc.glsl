@@ -119,3 +119,14 @@ struct MaterialData {
 #define MAT_FLAG_UV1_WORLD_TRIPLANAR 16u
 #define MAT_FLAG_EMISSION 32u
 #define MAT_FLAG_EMISSION_ADD 64u
+#define MAT_FLAG_UNSHADED 128u
+#define MAT_FLAG_VERTEX_COLOR_ALBEDO 256u
+#define MAT_FLAG_VERTEX_COLOR_SRGB 512u
+
+/// BaseMaterial3D's vertex color, as its albedo_tex *= COLOR reads it.
+vec4 material_vertex_color(vec4 p_color, uint p_flags) {
+	if ((p_flags & MAT_FLAG_VERTEX_COLOR_SRGB) != 0u) {
+		p_color.rgb = mix(pow((p_color.rgb + vec3(0.055)) * (1.0 / (1.0 + 0.055)), vec3(2.4)), p_color.rgb * (1.0 / 12.92), lessThan(p_color.rgb, vec3(0.04045)));
+	}
+	return p_color;
+}

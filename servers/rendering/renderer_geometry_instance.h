@@ -89,6 +89,7 @@ public:
 	virtual void set_softshadow_projector_pairing(bool p_softshadow, bool p_projector) = 0;
 
 	virtual void set_rt_procedural(bool p_procedural, const AABB &p_aabb) {}
+	virtual void set_rt_cast_shadows_setting(RSE::ShadowCastingSetting p_setting) {}
 	virtual void set_rt_procedural_bounds(const Vector<float> &p_aabb_data, bool p_expose_bounds) {}
 };
 
@@ -141,6 +142,7 @@ public:
 		bool use_baked_light = false;
 		bool use_dynamic_gi = false;
 		bool cast_double_sided_shadows = false;
+		RSE::ShadowCastingSetting cast_shadows = RSE::SHADOW_CASTING_SETTING_ON; // For the rays the path tracer casts.
 		bool dirty_dependencies = false;
 
 		DependencyTracker dependency_tracker;
@@ -163,6 +165,7 @@ public:
 	virtual void set_use_baked_light(bool p_enable) override;
 	virtual void set_use_dynamic_gi(bool p_enable) override;
 	virtual void set_instance_shader_uniforms_offset(int32_t p_offset) override;
+	virtual void set_rt_cast_shadows_setting(RSE::ShadowCastingSetting p_setting) override;
 	virtual void set_cast_double_sided_shadows(bool p_enable) override;
 
 	virtual void reset_motion_vectors() override;

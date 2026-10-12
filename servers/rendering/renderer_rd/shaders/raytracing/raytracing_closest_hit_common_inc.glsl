@@ -494,8 +494,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
-	// Emissive contribution.
-	ps.radiance += ps.throughput * m.emissive;
+	// Emissive contribution; raster's unshaded output is the albedo alone.
+	ps.radiance += ps.throughput * (m.unshaded ? m.albedo : m.emissive);
+	if (m.unshaded) {
+		m.metalness = 0.0;
+		m.roughness = 1.0;
+	}
 
 	// Bounce limit check.
 	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
@@ -540,7 +544,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 			rayQueryEXT spec_rq;
 			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
+					RT_MASK_CAMERA, spec_origin, 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(
@@ -558,6 +562,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}
 #endif
+
+	if (m.unshaded) {
+		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+		path_pack(payload, ps);
+		return;
+	}
 
 	// =================================================================
 	// NEE: Next Event Estimation (direct light sampling)
