@@ -83,6 +83,15 @@ public:
 
 		HashMap<String, String> code;
 
+		// With suppress_varying_io, the varyings are globals the caller interpolates itself.
+		struct Varying {
+			String name;
+			String type;
+			int array_size = 0;
+			bool interpolated = true; // False for flat and integer varyings.
+		};
+		Vector<Varying> varyings;
+
 		bool uses_global_textures = false;
 		bool uses_fragment_time = false;
 		bool uses_vertex_time = false;

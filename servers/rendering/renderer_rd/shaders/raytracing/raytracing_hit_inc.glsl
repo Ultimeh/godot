@@ -60,9 +60,17 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 	}
 }
 
+#ifndef RT_DISPLACE_PASS
 /// Convenience wrapper using gl_PrimitiveID (hit shaders only).
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
 	get_triangle_indices_ex(geom, gl_PrimitiveID, i0, i1, i2);
+}
+#endif
+
+/// Displaced geometry: a vertex's position before vertex() moved it (mesh space).
+vec3 fetch_rest_vertex(in GeometryData geom, uint index) {
+	FloatBuffer rest = FloatBuffer(uint64_t(geom.rest_vertex_address_lo) | (uint64_t(geom.rest_vertex_address_hi) << 32));
+	return vec3(rest.v[index * 3u], rest.v[index * 3u + 1u], rest.v[index * 3u + 2u]);
 }
 
 // ============================================================================
@@ -75,7 +83,7 @@ vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 
 	uint stride_words = geom.attribute_stride >> 2;
 	uint uv_word_off = geom.uv_byte_offset >> 2;
-	bool compressed = (geom.flags & FLAG_COMPRESSED) != 0u;
+	bool compressed = (geom.flags & (FLAG_COMPRESSED | FLAG_COMPRESSED_ATTRIBUTES)) != 0u;
 
 	vec2 uv0, uv1, uv2;
 

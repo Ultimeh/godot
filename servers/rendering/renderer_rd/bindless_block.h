@@ -49,6 +49,10 @@ public:
 	void finalize(RID p_shader, uint32_t p_set_index);
 
 	RID get_uniform_set() const { return uniform_set; }
+
+	// The same table in a second set, for shaders whose set layout differs from the finalized one (other stages).
+	// Every caller must share p_shader's layout.
+	RID get_secondary_uniform_set(RID p_shader, uint32_t p_set_index);
 	uint32_t get_texture_count() const { return textures.size(); }
 	bool is_initialized() const { return rd != nullptr; }
 	bool is_finalized() const { return uniform_set.is_valid(); }
@@ -66,4 +70,10 @@ private:
 	RD::TextureType texture_type = RD::TEXTURE_TYPE_2D;
 	RID uniform_set;
 	bool needs_refinalize = false;
+
+	uint64_t textures_version = 0; // Bumped whenever the table changes.
+	RID secondary_uniform_set;
+	uint64_t secondary_textures_version = 0;
+
+	RID _create_uniform_set(RID p_shader, uint32_t p_set_index);
 };

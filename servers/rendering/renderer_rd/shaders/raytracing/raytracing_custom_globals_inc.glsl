@@ -15,6 +15,7 @@
 #define fwidthCoarse(m_value) ((m_value) * 0.0)
 #define fwidthFine(m_value) ((m_value) * 0.0)
 #define SHADER_IS_SRGB false
+#define SHADER_SPACE_FAR 0.0
 
 layout(buffer_reference, std140) readonly buffer CustomMaterialUniforms{
 	/* RT_CUSTOM_UNIFORM_MEMBERS */
@@ -33,6 +34,7 @@ vec2 uv2_interp = vec2(0.0);
 vec4 color_interp = vec4(1.0);
 vec3 view = vec3(0.0, 0.0, -1.0);
 mat4 read_model_matrix = mat4(1.0);
+mat3 model_normal_matrix = mat3(1.0);
 mat4 read_view_matrix = mat4(1.0);
 mat4 rt_modelview_matrix = mat4(1.0);
 mat3 rt_modelview_normal_matrix = mat3(1.0);
@@ -40,6 +42,18 @@ mat4 inv_view_matrix = mat4(1.0);
 mat4 projection_matrix = mat4(1.0);
 mat4 inv_projection_matrix = mat4(1.0);
 float global_time = 0.0;
+float global_prev_time = 0.0;
+int rt_vertex_id = 0;
+int rt_instance_id = 0;
+float rt_point_size = 1.0;
+vec4 position = vec4(0.0);
+vec4 instance_custom = vec4(0.0);
+vec4 custom0_attrib = vec4(0.0);
+vec4 custom1_attrib = vec4(0.0);
+vec4 custom2_attrib = vec4(0.0);
+vec4 custom3_attrib = vec4(0.0);
+uvec4 bone_attrib = uvec4(0);
+vec4 weight_attrib = vec4(0.0);
 vec2 read_viewport_size = vec2(1.0);
 bool rt_front_facing = true;
 vec2 rt_screen_uv = vec2(0.0);

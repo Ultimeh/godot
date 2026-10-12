@@ -355,6 +355,14 @@ SceneShaderRaytracing::~SceneShaderRaytracing() {
 	if (raygen_shader_version.is_valid()) {
 		raygen_shader.version_free(raygen_shader_version);
 	}
+	for (const DisplaceProgram &program : displace_programs) {
+		if (program.shader.is_valid()) {
+			RD::get_singleton()->free_rid(program.shader);
+		}
+	}
+	if (displace_shader_version.is_valid()) {
+		displace_shader.version_free(displace_shader_version);
+	}
 
 	singleton = nullptr;
 }
@@ -455,6 +463,25 @@ static String _clamp_uniform_array_indices(const String &p_code, const String &p
 		from = index_end;
 	}
 	return result;
+}
+
+// On displaced geometry the hit shaders run vertex() at the triangle's three vertices: storage for each varying, the
+// copy after each run, and the barycentric blend (flat and integer varyings take the first vertex, as raster does).
+static void _varying_interpolation_code(const Vector<ShaderCompiler::GeneratedCode::Varying> &p_varyings, String &r_storage, String &r_save, String &r_blend) {
+	for (const ShaderCompiler::GeneratedCode::Varying &varying : p_varyings) {
+		const String corners = "rt_corner_" + varying.name;
+		const String array = varying.array_size > 0 ? "[" + itos(varying.array_size) + "]" : String();
+		r_storage += varying.type + " " + corners + "[3]" + array + ";\n";
+		r_save += corners + "[rt_corner] = " + varying.name + ";\n";
+		if (!varying.interpolated) {
+			r_blend += varying.name + " = " + corners + "[0];\n";
+		} else if (varying.array_size > 0) {
+			r_blend += "for (int rt_element = 0; rt_element < " + itos(varying.array_size) + "; rt_element++) {\n";
+			r_blend += varying.name + "[rt_element] = " + corners + "[0][rt_element] * rt_bary.x + " + corners + "[1][rt_element] * rt_bary.y + " + corners + "[2][rt_element] * rt_bary.z;\n}\n";
+		} else {
+			r_blend += varying.name + " = " + corners + "[0] * rt_bary.x + " + corners + "[1] * rt_bary.y + " + corners + "[2] * rt_bary.z;\n";
+		}
+	}
 }
 
 void SceneShaderRaytracing::_strip_texture_globals(String &r_globals, const String &p_tex_name) {
@@ -638,6 +665,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	bool detected_alpha_clip = false;
 	actions.usage_flag_pointers["ALPHA_SCISSOR_THRESHOLD"] = &detected_alpha_clip;
 	actions.usage_flag_pointers["ALPHA_HASH_SCALE"] = &detected_alpha_clip;
+	bool writes_vertex = false;
+	actions.write_flag_pointers["VERTEX"] = &writes_vertex;
 
 	HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniform_sink;
 	actions.uniforms = &uniform_sink;
@@ -652,6 +681,9 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 
 	r_entry.is_procedural = p_is_procedural;
 	r_entry.uses_alpha_clip = detected_alpha_clip;
+	r_entry.writes_vertex = writes_vertex && !p_is_procedural;
+	r_entry.uses_vertex_time = gen_code.uses_vertex_time;
+	r_entry.varyings = gen_code.varyings;
 	for (const String &define : gen_code.defines) {
 		if (define.contains("SKIP_TRANSFORM_USED") || define.contains("VERTEX_WORLD_COORDS_USED")) {
 			r_entry.defines += define;
@@ -674,6 +706,12 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 		r_entry.fragment_globals = _clamp_uniform_array_indices(r_entry.fragment_globals, member, kv.value.array_size);
 		r_entry.intersection_code = _clamp_uniform_array_indices(r_entry.intersection_code, member, kv.value.array_size);
 		r_entry.intersection_globals = _clamp_uniform_array_indices(r_entry.intersection_globals, member, kv.value.array_size);
+	}
+	// Conservative: any view, projection or scene data read in vertex() or the functions it may call.
+	for (const char *camera_identifier : { "read_view_matrix", "inv_view_matrix", "projection_matrix", "rt_modelview", "read_viewport_size", "scene_data_block" }) {
+		if (r_entry.vertex_code.contains(camera_identifier) || r_entry.fragment_globals.contains(camera_identifier)) {
+			r_entry.vertex_reads_camera = true;
+		}
 	}
 	r_entry.uniform_members = gen_code.uniforms;
 	r_entry.uniform_total_size = gen_code.uniform_total_size;
@@ -701,6 +739,60 @@ const SceneShaderRaytracing::CustomShaderEntry *SceneShaderRaytracing::get_custo
 		return nullptr;
 	}
 	return &slot.entry;
+}
+
+RID SceneShaderRaytracing::get_displace_pipeline(uint32_t p_slot_index, RID &r_shader) {
+	const CustomShaderEntry *entry = get_custom_shader_entry(p_slot_index);
+	if (!entry || !entry->writes_vertex || displace_template.is_empty()) {
+		return RID();
+	}
+	if (displace_programs.size() < hit_group_slots.size()) {
+		displace_programs.resize(hit_group_slots.size());
+	}
+	DisplaceProgram &program = displace_programs[p_slot_index];
+	if (program.pipeline.is_valid() || program.failed) {
+		r_shader = program.shader;
+		return program.pipeline;
+	}
+	program.failed = true;
+
+	String tex_defines;
+	for (const TextureUniformInfo &tui : entry->texture_uniforms) {
+		const String id = _uniform_identifier(tui.name);
+		tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
+	}
+
+	String source = displace_template;
+	source = source.replace("/* RT_CUSTOM_DEFINES */", entry->defines);
+	source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry->fragment_globals);
+	source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", entry->uniform_members.is_empty() ? String("float _rt_pad;") : entry->uniform_members);
+	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
+	source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + entry->vertex_code + "\n}\n");
+	source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
+
+	Vector<String> sources;
+	sources.resize(RD::SHADER_STAGE_MAX);
+	sources.write[RD::SHADER_STAGE_COMPUTE] = source;
+	Vector<RD::ShaderStageSPIRVData> stages;
+	Vector<uint8_t> binary;
+	{
+		MutexLock lock(spirv_compile_mutex);
+		stages = ShaderRD::compile_stages(sources, {});
+		if (!stages.is_empty()) {
+			binary = RD::get_singleton()->shader_compile_binary_from_spirv(stages, "RT displace");
+		}
+	}
+	if (binary.is_empty()) {
+		WARN_PRINT(vformat("RT: the vertex() of hit group %d failed to compile for displacement; its surfaces are traced undisplaced.", p_slot_index));
+		return RID();
+	}
+	program.shader = RD::get_singleton()->shader_create_from_bytecode(binary);
+	ERR_FAIL_COND_V(!program.shader.is_valid(), RID());
+	program.pipeline = RD::get_singleton()->compute_pipeline_create(program.shader);
+	ERR_FAIL_COND_V(!program.pipeline.is_valid(), RID());
+	program.failed = false;
+	r_shader = program.shader;
+	return program.pipeline;
 }
 
 bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const {
@@ -1060,6 +1152,8 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			vertex_function = "void rt_run_vertex_shader() {\n" + entry.vertex_code + "\n}\n";
 			vertex_call = "rt_run_vertex_shader();";
 		}
+		String varying_storage, varying_save, varying_blend;
+		_varying_interpolation_code(entry.varyings, varying_storage, varying_save, varying_blend);
 
 		// Procedural with no fragment stage: default material shading.
 		String fragment_code = entry.fragment_code;
@@ -1091,6 +1185,9 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
 			s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
 			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
+			s = s.replace("/* RT_CUSTOM_VARYING_STORAGE */", varying_storage);
+			s = s.replace("/* RT_CUSTOM_VARYING_SAVE */", varying_save);
+			s = s.replace("/* RT_CUSTOM_VARYING_BLEND */", varying_blend);
 			si.ch_src = s;
 		}
 		if (entry.uses_alpha_clip) {
@@ -1102,6 +1199,9 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
 			s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
 			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
+			s = s.replace("/* RT_CUSTOM_VARYING_STORAGE */", varying_storage);
+			s = s.replace("/* RT_CUSTOM_VARYING_SAVE */", varying_save);
+			s = s.replace("/* RT_CUSTOM_VARYING_BLEND */", varying_blend);
 			si.ah_src = s;
 		}
 		if (entry.is_procedural && !ctx.is_template.is_empty()) {
@@ -1526,6 +1626,16 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		modes_ptr[mask] = _raygen_variant_preamble(mask);
 	}
 	raygen_shader.initialize(modes, p_defines);
+
+	// Source template of the displacement pass; each slot's material code is injected into it.
+	displace_shader.initialize({ "" }, p_defines);
+	displace_shader_version = displace_shader.version_create(false);
+	if (displace_shader_version.is_valid()) {
+		Vector<String> displace_sources = displace_shader.version_build_variant_stage_sources(displace_shader_version, 0);
+		if (displace_sources.size() > RD::SHADER_STAGE_COMPUTE) {
+			displace_template = displace_sources[RD::SHADER_STAGE_COMPUTE];
+		}
+	}
 
 	// Slot 0: default HG (source_hash stays zero).
 	{

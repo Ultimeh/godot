@@ -721,6 +721,13 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						decl += " = " + _typestr(varying.type) + "(0);\n";
 					}
 					r_gen_code.stage_globals[STAGE_FRAGMENT] += decl;
+
+					GeneratedCode::Varying info;
+					info.name = name_str;
+					info.type = type_str;
+					info.array_size = varying.array_size;
+					info.interpolated = SL::is_float_type(varying.type) && varying.interpolation != SL::INTERPOLATION_FLAT;
+					r_gen_code.varyings.push_back(info);
 				} else {
 					String vcode;
 					String interp_mode = _interpstr(varying.interpolation);
@@ -1649,6 +1656,7 @@ Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, Iden
 
 	r_gen_code.defines.clear();
 	r_gen_code.code.clear();
+	r_gen_code.varyings.clear();
 	for (int i = 0; i < STAGE_MAX; i++) {
 		r_gen_code.stage_globals[i] = String();
 	}

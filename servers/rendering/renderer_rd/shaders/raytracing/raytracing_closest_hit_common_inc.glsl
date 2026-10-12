@@ -85,6 +85,21 @@ HitData compute_hit_data() {
 		h.mesh_pos = h.mesh_pos * vec3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z) + vec3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z);
 	}
 
+	if ((geom.flags & FLAG_DISPLACED) != 0u) {
+		// The TBN block holds the rest frame (vertex()'s input); the geometric normal comes from the displaced triangle.
+		uint i0, i1, i2;
+		get_triangle_indices(geom, i0, i1, i2);
+		FloatBuffer vb = FloatBuffer(geom.vertex_address);
+		vec3 p0 = vec3(vb.v[i0 * 3u], vb.v[i0 * 3u + 1u], vb.v[i0 * 3u + 2u]);
+		vec3 p1 = vec3(vb.v[i1 * 3u], vb.v[i1 * 3u + 1u], vb.v[i1 * 3u + 2u]);
+		vec3 p2 = vec3(vb.v[i2 * 3u], vb.v[i2 * 3u + 1u], vb.v[i2 * 3u + 2u]);
+		vec3 face_normal = transpose(mat3(gl_WorldToObjectEXT)) * cross(p1 - p0, p2 - p0);
+		if (dot(face_normal, face_normal) > 1e-20) {
+			face_normal = normalize(face_normal);
+			h.geometry_normal = dot(face_normal, gl_WorldRayDirectionEXT) > 0.0 ? -face_normal : face_normal;
+		}
+	}
+
 	return h;
 }
 

@@ -58,6 +58,7 @@ void BindlessBlock::begin_frame() {
 
 	texture_to_index.clear();
 	texture_to_index[default_texture] = 0;
+	textures_version++;
 
 	for (uint32_t i = 1; i < textures.size(); i++) {
 		if (!rd->texture_is_valid(textures[i])) {
@@ -97,6 +98,7 @@ uint32_t BindlessBlock::add_texture(RID p_texture) {
 	if (is_finalized()) {
 		needs_refinalize = true;
 	}
+	textures_version++;
 
 	uint32_t index;
 	if (free_indices_count > 0) {
@@ -123,10 +125,27 @@ void BindlessBlock::finalize(RID p_shader, uint32_t p_set_index) {
 	if (uniform_set.is_valid() && rd->uniform_set_is_valid(uniform_set)) {
 		rd->free_rid(uniform_set);
 	}
-	uniform_set = RID();
+	uniform_set = _create_uniform_set(p_shader, p_set_index);
+	ERR_FAIL_COND_MSG(!uniform_set.is_valid(), "Failed to create bindless uniform set.");
 
-	Vector<RD::Uniform> uniforms;
+	needs_refinalize = false;
+}
 
+RID BindlessBlock::get_secondary_uniform_set(RID p_shader, uint32_t p_set_index) {
+	ERR_FAIL_COND_V_MSG(!is_initialized(), RID(), "BindlessBlock not initialized.");
+
+	if (secondary_uniform_set.is_valid() && rd->uniform_set_is_valid(secondary_uniform_set) && secondary_textures_version == textures_version) {
+		return secondary_uniform_set;
+	}
+	if (secondary_uniform_set.is_valid() && rd->uniform_set_is_valid(secondary_uniform_set)) {
+		rd->free_rid(secondary_uniform_set);
+	}
+	secondary_uniform_set = _create_uniform_set(p_shader, p_set_index);
+	secondary_textures_version = textures_version;
+	return secondary_uniform_set;
+}
+
+RID BindlessBlock::_create_uniform_set(RID p_shader, uint32_t p_set_index) {
 	RD::Uniform u;
 	u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 	u.binding = 0;
@@ -134,13 +153,12 @@ void BindlessBlock::finalize(RID p_shader, uint32_t p_set_index) {
 	for (uint32_t i = 0; i < textures.size(); i++) {
 		u.append_id(textures[i]);
 	}
-	uniforms.push_back(u);
 
-	uniform_set = rd->uniform_set_create(uniforms, p_shader, p_set_index);
-	ERR_FAIL_COND_MSG(!uniform_set.is_valid(), "Failed to create bindless uniform set.");
-	rd->set_resource_name(uniform_set, "Bindless Texture Set");
-
-	needs_refinalize = false;
+	RID set = rd->uniform_set_create(Vector<RD::Uniform>{ u }, p_shader, p_set_index);
+	if (set.is_valid()) {
+		rd->set_resource_name(set, "Bindless Texture Set");
+	}
+	return set;
 }
 
 void BindlessBlock::clear() {
@@ -148,6 +166,10 @@ void BindlessBlock::clear() {
 		rd->free_rid(uniform_set);
 	}
 	uniform_set = RID();
+	if (secondary_uniform_set.is_valid() && rd && rd->uniform_set_is_valid(secondary_uniform_set)) {
+		rd->free_rid(secondary_uniform_set);
+	}
+	secondary_uniform_set = RID();
 	textures.clear();
 	texture_to_index.clear();
 	free_indices.clear();

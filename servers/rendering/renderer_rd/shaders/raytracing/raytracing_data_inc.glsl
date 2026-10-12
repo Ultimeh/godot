@@ -48,7 +48,11 @@ struct GeometryData {
 	uint prev_vertex_address_lo;
 	uint prev_vertex_address_hi;
 
-	uint _pad[5];
+	// For displaced geometry: positions before vertex() moved them (float3 packed).
+	uint rest_vertex_address_lo;
+	uint rest_vertex_address_hi;
+
+	uint _pad[3];
 };
 
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {

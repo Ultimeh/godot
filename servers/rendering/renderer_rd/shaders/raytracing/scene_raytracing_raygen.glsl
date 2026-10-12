@@ -368,6 +368,9 @@ void main() {
 #ifdef RT_CUSTOM_HIT_GROUP
 	uint rt_geometry_idx = h.geometry_idx;
 	vec3 rt_hit_pos = h.hit_pos;
+	uint rt_i0, rt_i1, rt_i2;
+	get_triangle_indices(geometries[h.geometry_idx], rt_i0, rt_i1, rt_i2);
+	vec3 rt_bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 	vec2 rt_uv = h.uv;
 	vec4 rt_color = h.color;
 	vec3 rt_normal = h.geometry_normal;
@@ -600,6 +603,10 @@ void main() {
 
 	vec3 rt_hit_pos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 	vec4 rt_color = fetch_color(geom, i0, i1, i2, bary);
+	uint rt_i0 = i0;
+	uint rt_i1 = i1;
+	uint rt_i2 = i2;
+	vec3 rt_bary = bary;
 
 #define RT_CUSTOM_REMOVED_POINT ignoreIntersectionEXT;
 #include "raytracing_custom_fragment_inc.glsl"

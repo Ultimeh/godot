@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/math/projection.h"
 #include "core/math/transform_3d.h"
 #include "core/string/string_name.h"
 #include "core/templates/hash_map.h"
@@ -85,7 +86,10 @@ struct alignas(16) RT_GeometryData {
 	// For deformed geometry: previous-frame position buffer used for motion vectors.
 	uint32_t prev_vertex_buffer_address_lo;
 	uint32_t prev_vertex_buffer_address_hi;
-	uint32_t _pad[5];
+	// For displaced geometry: positions before vertex() moved them (float3 packed).
+	uint32_t rest_vertex_buffer_address_lo;
+	uint32_t rest_vertex_buffer_address_hi;
+	uint32_t _pad[3];
 };
 static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
 
@@ -180,7 +184,22 @@ enum {
 	RT_GEOM_FLAG_PROCEDURAL = 2u,
 	// Set when the BLAS uses a per-frame-deformed vertex buffer.
 	RT_GEOM_FLAG_DEFORMED = 4u,
+	// Deformed by the material's vertex(): the rest positions are kept for the hit shaders.
+	RT_GEOM_FLAG_DISPLACED = 8u,
+	// Uncompressed positions over a compressed attribute buffer (deformed copies of compressed meshes).
+	RT_GEOM_FLAG_COMPRESSED_ATTRIBUTES = 16u,
 };
+
+// Must match GLSL DisplaceJob (raytracing_displace.glsl, std430).
+struct alignas(16) RT_DisplaceJob {
+	float model_matrix[16];
+	float inv_model_matrix[16];
+	RT_GeometryData geometry; // The mesh surface as stored.
+	uint64_t material_address;
+	uint32_t tbn_words;
+	uint32_t pad;
+};
+static_assert(sizeof(RT_DisplaceJob) == 272, "RT_DisplaceJob must be 272 bytes for std430");
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
@@ -211,6 +230,7 @@ struct RTDeformedGeometrySource {
 	uint64_t cache_key = 0; ///< Caller-defined cache identity.
 	uint32_t cache_version = 0; ///< Changes when the resource behind `cache_key` is recycled.
 	uint32_t surface_counter = 0; ///< Changes when the underlying mesh surface changes.
+	bool force_rebuild = false; ///< Rebuild instead of refitting when the data changed.
 };
 
 struct RTMaterialData {
@@ -262,6 +282,16 @@ struct RTDeformedCacheEntry {
 	uint32_t cached_vertex_count = 0;
 	uint32_t cached_full_size = 0;
 	bool prev_pos_seeded = false; // False until the first owned->prev copy has run.
+
+	// Displacement by the material's vertex() (_displace_surfaces()).
+	RID displaced_vb; // [displaced float3 positions][rest TBN block][rest float3 positions].
+	uint32_t displaced_vb_capacity = 0; // Bytes; grow-only.
+	uint32_t displaced_frame = 0; // Last frame the surface was displaced; 0 = never.
+	uint64_t displaced_stamp = 0; // Bumped on each evaluation.
+	bool displaced_rebuild = false; // Evaluated this frame: vertex() may turn triangles on or off, so no refit.
+	uint32_t displaced_slot = 0;
+	uint16_t displaced_material_counter = 0;
+	Transform3D displaced_transform;
 };
 
 /// Cache entry for a per-(MultiMesh, surface) merged BLAS.
@@ -378,6 +408,13 @@ class RenderRaytracing {
 	LocalVector<RID> merged_mm_active_this_frame;
 
 	RTDeformedCacheEntry *_access_deformed_slot(RID &r_handle);
+
+	// Material vertex() evaluated per vertex before the BLAS builds (raytracing_displace.glsl).
+	RID displace_job_buffer;
+	uint32_t displace_job_capacity = 0;
+	Transform3D displace_camera_transform;
+	Projection displace_camera_projection;
+	void _displace_surfaces(const RenderDataRD *p_render_data);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
 
 	LocalVector<uint32_t> material_free_slots;

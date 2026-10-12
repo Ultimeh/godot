@@ -33,6 +33,7 @@
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h" // IWYU pragma: keep
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_displace.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
@@ -365,6 +366,10 @@ public:
 		HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniforms;
 		Vector<TextureUniformInfo> texture_uniforms; // Sampler2D packed as bindless indices after UBO
 		bool uses_alpha_clip = false; // Writes ALPHA_SCISSOR_THRESHOLD; needs per-HG any-hit
+		bool writes_vertex = false; // vertex() moves VERTEX: the BLAS needs the displaced positions.
+		bool uses_vertex_time = false;
+		bool vertex_reads_camera = false; // vertex() reads the view or projection.
+		Vector<ShaderCompiler::GeneratedCode::Varying> varyings; // Interpolated by the hit shaders on displaced geometry.
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
 	};
@@ -436,6 +441,10 @@ public:
 	uint32_t get_hit_group_slot_count() const { return hit_group_slots.size(); }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+
+	// Compute pipeline running the slot's vertex() on every vertex (raytracing_displace.glsl); invalid if the slot
+	// does not displace or failed to compile. Compiled on first use.
+	RID get_displace_pipeline(uint32_t p_slot_index, RID &r_shader);
 	void drain_completed_compiles();
 	void finalize_custom_shaders();
 
@@ -482,6 +491,16 @@ private:
 	HashMap<uint32_t, VariantCompileContext> variant_compile_contexts;
 
 	bool _ensure_variant_compile_context(uint32_t p_rt_flags);
+
+	RaytracingDisplaceShaderRD displace_shader;
+	RID displace_shader_version;
+	String displace_template;
+	struct DisplaceProgram {
+		RID shader;
+		RID pipeline;
+		bool failed = false;
+	};
+	LocalVector<DisplaceProgram> displace_programs; // Parallel to hit_group_slots.
 
 	bool async_compilation_enabled = true;
 	Mutex spirv_compile_mutex; // Serialize glslang calls (RD::shader_compile_spirv_from_source).

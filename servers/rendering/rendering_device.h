@@ -1507,6 +1507,8 @@ public:
 	};
 
 	Error blas_build(RID p_blas);
+	// False once freed, including by a freed dependency (a mesh buffer the BLAS was built from).
+	bool acceleration_structure_is_valid(RID p_acceleration_structure);
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
 
