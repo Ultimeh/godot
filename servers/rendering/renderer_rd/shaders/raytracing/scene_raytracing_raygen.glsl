@@ -599,6 +599,14 @@ void main() {
 	m.unshaded = (mat.flags & MAT_FLAG_UNSHADED) != 0u;
 	m.ao = 1.0;
 	m.ao_light_affect = 0.0;
+	if ((mat.flags & MAT_FLAG_AO_TEXTURE) != 0u) {
+		vec4 ao_tex = triplanar ? sample_material_triplanar(mat.ao_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.ao_texture_idx, uv, uv_ddx, uv_ddy, mat.flags);
+		m.ao = clamp(ao_tex[mat.ao_channel], 0.0, 1.0);
+		m.ao_light_affect = mat.ao_light_affect;
+	} else if ((mat.flags & MAT_FLAG_AO_ORM) != 0u) {
+		m.ao = clamp(orm.r, 0.0, 1.0);
+		m.ao_light_affect = mat.ao_light_affect;
+	}
 	m.backlight = vec3(0.0);
 	if ((mat.flags & MAT_FLAG_BACKLIGHT) != 0u) {
 		m.backlight = mat.backlight;

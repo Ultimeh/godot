@@ -1824,6 +1824,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.backlight[1] = 0.0f;
 	mat.backlight[2] = 0.0f;
 	mat.backlight_texture_idx = 0;
+	mat.ao_texture_idx = 0;
+	mat.ao_channel = 0;
+	mat.ao_light_affect = 0.0f;
+	mat.ao_pad = 0;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -2125,6 +2129,31 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat_data->billboard_keep_scale = code.contains("// Billboard Keep Scale: Enabled");
 		if (code.contains(", unshaded")) {
 			mat.flags |= RT_MAT_FLAG_UNSHADED;
+		}
+		// Ambient occlusion: its own texture on UV1 (triplanar too), or the ORM texture's red channel. Not on UV2.
+		if (code.contains("AO = dot(texture(texture_ambient_occlusion, base_uv)") || code.contains("AO = dot(triplanar_texture(texture_ambient_occlusion, uv1_power_normal")) {
+			const RID ao_rd = get_material_texture("texture_ambient_occlusion");
+			if (ao_rd.is_valid()) {
+				mat.ao_texture_idx = bindless_block->add_texture(ao_rd);
+				mat.flags |= RT_MAT_FLAG_AO_TEXTURE;
+				const Variant channel_var = material_storage->material_get_param(p_material_rid, "ao_texture_channel");
+				Vector4 channel_mask(1, 0, 0, 0);
+				if (channel_var.get_type() == Variant::VECTOR4) {
+					channel_mask = channel_var;
+				} else if (channel_var.get_type() == Variant::PLANE) {
+					const Plane p = channel_var;
+					channel_mask = Vector4(p.normal.x, p.normal.y, p.normal.z, p.d);
+				}
+				mat.ao_channel = channel_mask.y > 0.5f ? 1 : (channel_mask.z > 0.5f ? 2 : (channel_mask.w > 0.5f ? 3 : 0));
+			}
+		} else if (code.contains("AO = orm_tex.r;")) {
+			mat.flags |= RT_MAT_FLAG_AO_ORM;
+		}
+		if (mat.flags & (RT_MAT_FLAG_AO_TEXTURE | RT_MAT_FLAG_AO_ORM)) {
+			const Variant affect_var = material_storage->material_get_param(p_material_rid, "ao_light_affect");
+			if (affect_var.get_type() == Variant::FLOAT) {
+				mat.ao_light_affect = affect_var;
+			}
 		}
 		// texture_filter is a sampler hint in the generated code, not a parameter.
 		if (code.contains(", filter_linear_mipmap_anisotropic")) {
