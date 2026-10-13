@@ -2126,6 +2126,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		if (code.contains(", unshaded")) {
 			mat.flags |= RT_MAT_FLAG_UNSHADED;
 		}
+		// texture_filter is a sampler hint in the generated code, not a parameter.
+		if (code.contains(", filter_linear_mipmap_anisotropic")) {
+			mat.flags |= RT_MAT_FLAG_ANISOTROPIC_FILTER;
+		}
 		if (code.contains("// Vertex Color Use as Albedo: Enabled")) {
 			mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_ALBEDO;
 			if (code.contains("// Vertex Color is sRGB: Enabled")) {
@@ -3945,8 +3949,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 16-27: Material samplers (12 filter/repeat combinations for custom shaders).
-	RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default().append_uniforms(uniforms, 16);
+	// Bindings 16-27: Material samplers (12 filter/repeat combinations). The view's own, as raster's: they carry the mipmap
+	// bias of its 3D scaling (DLSS) and the project's anisotropic filtering level.
+	rb->get_samplers().append_uniforms(uniforms, 16);
 
 	// Binding 29: Front layer reflection output (RGBA16F: reflected radiance, view depth of the transparent surface).
 	{

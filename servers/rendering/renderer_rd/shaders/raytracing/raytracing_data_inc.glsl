@@ -128,6 +128,7 @@ struct MaterialData {
 #define MAT_FLAG_SPECULAR_DISABLED 1024u
 #define MAT_FLAG_BACKLIGHT 2048u
 #define MAT_FLAG_HAS_BACKLIGHT_TEX 4096u
+#define MAT_FLAG_ANISOTROPIC_FILTER 8192u
 
 /// BaseMaterial3D's vertex color, as its albedo_tex *= COLOR reads it.
 vec4 material_vertex_color(vec4 p_color, uint p_flags) {

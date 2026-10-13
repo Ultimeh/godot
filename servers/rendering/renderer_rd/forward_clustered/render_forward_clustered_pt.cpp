@@ -180,6 +180,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// Captured from build_tlas/update_uniform_set so the trace-dispatch block
 	// below can bind without RenderRaytracing keeping hidden "current" state.
 	RID rt_uniform_set;
+	RTViewportState *rt_state = nullptr;
 	bool using_depth_reconstruct = false;
 
 	// The path tracer produces the opaque color, but transparents are still
@@ -214,10 +215,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			raytracing->dlss_rr_free_buffers(rb.ptr());
 		}
 
-		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
-		if (rt_state) {
-			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
-		}
+		rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 	} else if (rb_data.is_valid() && raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
 		// No RT shader available: free DLSS RR buffers so DLSS falls back to SR.
 		raytracing->dlss_rr_free_buffers(rb.ptr());
@@ -344,14 +342,18 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
 	}
 
+	// The trace's uniform set is made last, with its output textures: the sky setup above can create the radiance texture,
+	// and freeing the previous one freed a set made with it ("uniform_set is null" on the first frames).
+	if (rt_state) {
+		raytracing->rt_ensure_textures(rb.ptr());
+		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
+	}
+
 	// Execute raytracing (replaces the opaque + motion vector pass). Without a uniform set this frame (the pipeline was
 	// being rebuilt for a new material), nothing is traced: RenderingDevice only validates sets in debug builds.
 	if (rb_data.is_valid() && raytracing && raytracing->get_shader() && rt_uniform_set.is_valid()) {
 		RD::get_singleton()->draw_command_begin_label("Raytracing");
 		RENDER_TIMESTAMP("TLAS Build");
-
-		// Ensure raytracing output textures exist.
-		raytracing->rt_ensure_textures(rb.ptr());
 
 		RENDER_TIMESTAMP("Pathtracer");
 

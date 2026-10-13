@@ -129,6 +129,9 @@ vec4 sample_material_texture_grad(uint tex_idx, vec2 uv, vec2 uv_ddx, vec2 uv_dd
 	if ((mat_flags & 4u) != 0u) {
 		return sample_bindless_texture_point(tex_idx, uv);
 	}
+	if ((mat_flags & MAT_FLAG_ANISOTROPIC_FILTER) != 0u) {
+		return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT), uv, uv_ddx, uv_ddy);
+	}
 	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, uv_ddx, uv_ddy);
 }
 

@@ -196,6 +196,7 @@ enum {
 	RT_MAT_FLAG_SPECULAR_DISABLED = 1024u, // No specular from the lights (render_mode specular_disabled).
 	RT_MAT_FLAG_BACKLIGHT = 2048u,
 	RT_MAT_FLAG_HAS_BACKLIGHT_TEX = 4096u,
+	RT_MAT_FLAG_ANISOTROPIC_FILTER = 8192u, // texture_filter LINEAR_WITH_MIPMAPS_ANISOTROPIC.
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
