@@ -192,6 +192,11 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
 bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
+	// A light within 2 mm of the surface would give the ray an empty interval (tmax below tmin), which Vulkan leaves
+	// undefined: it is visible.
+	if (!(max_dist > 0.002)) {
+		return true;
+	}
 #ifdef USE_RAY_QUERY_SHADOWS
 	// Ray queries are significantly faster, but can not handle complex alpha materials
 	rayQueryEXT shadow_rq;

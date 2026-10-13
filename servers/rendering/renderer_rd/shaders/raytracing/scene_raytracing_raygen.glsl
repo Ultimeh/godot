@@ -119,7 +119,7 @@ void main() {
 		fs.offset_normal = vec3(0.0, 0.0, 1.0);
 		fs.next_ray_dir = vec3(0.0, 0.0, 1.0);
 		path_pack(payload, fs);
-		traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_FRONT_LAYER, 0, 0, 0, origin.xyz, 0.001, direction.xyz, opaque_t, 0);
+		traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_FRONT_LAYER, 0, 0, 0, origin.xyz, 0.001, direction.xyz, max(opaque_t, 0.001), 0);
 		fs = path_unpack(payload);
 
 		if (!is_path_terminated(fs.packed_bounces_flags)) {
