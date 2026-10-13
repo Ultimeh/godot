@@ -524,8 +524,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
-	// Emissive contribution; raster's unshaded output is the albedo alone.
-	ps.radiance += ps.throughput * (m.unshaded ? m.albedo : m.emissive);
+	// Emissive contribution; raster's unshaded output is the albedo alone. An unshaded surface is seen, in reflections too,
+	// but lights nothing, as in raster: its albedo after a diffuse bounce made small unshaded shapes (candle flames) into
+	// lights only rare paths reach, noise the denoiser turned into a shimmer.
+	ps.radiance += ps.throughput * (m.unshaded ? (diffuse_bounces == 0u ? m.albedo : vec3(0.0)) : m.emissive);
 	if (m.unshaded) {
 		m.metalness = 0.0;
 		m.roughness = 1.0;
