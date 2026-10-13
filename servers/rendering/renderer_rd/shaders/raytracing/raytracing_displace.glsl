@@ -50,6 +50,16 @@ struct DisplaceJob {
 	uint64_t material_address;
 	uint tbn_words; // 0, 1 (normal) or 2 (normal and tangent) per vertex.
 	uint instance_uniforms_ofs;
+	// A merged MultiMesh when mm_instance_count is not 0: one thread per vertex of each instance, MODEL_MATRIX = model_matrix
+	// * the instance's transform, the positions written over the merged ones (in the MultiMesh's space, the BLAS's).
+	uint mm_instance_count;
+	uint mm_vertex_count; // Per instance, in the merged buffers.
+	uint mm_stride; // Of the MultiMesh buffer, in floats.
+	uint mm_offset; // Instances to skip in it.
+	uint mm_use_remap; // 1: the merged vertices are a LOD view's, mm_remap maps them to the mesh's.
+	uint mm_color_offset; // In floats in an instance, or 0xFFFFFFFF without colors.
+	uint mm_custom_offset; // Same for the custom data.
+	uint mm_pad;
 };
 
 layout(set = 0, binding = 30, std430) readonly buffer DisplaceJobs {
@@ -69,6 +79,22 @@ layout(set = 3, binding = 1, std430) restrict readonly buffer MaterialDependency
 	uint v[];
 }
 material_dependency;
+
+layout(set = 3, binding = 2, std430) restrict readonly buffer MultiMeshTransforms {
+	float v[];
+}
+mm_transforms;
+
+layout(set = 3, binding = 3, std430) restrict readonly buffer MultiMeshRemap {
+	uint v[];
+}
+mm_remap;
+
+// The previous frame's displaced positions of a merged MultiMesh, for its motion vectors.
+layout(set = 3, binding = 4, std430) restrict writeonly buffer MultiMeshPrevious {
+	uint v[];
+}
+mm_previous;
 
 layout(push_constant, std430) uniform Params {
 	uint job_index;
@@ -90,6 +116,9 @@ vec3 fetch_position(in GeometryData p_geom, uint p_index) {
 	FloatBuffer vb = FloatBuffer(p_geom.vertex_address);
 	return vec3(vb.v[p_index * 3u], vb.v[p_index * 3u + 1u], vb.v[p_index * 3u + 2u]);
 }
+
+// A MultiMesh instance's color, multiplied into COLOR as raster does.
+vec4 rt_displace_instance_color = vec4(1.0);
 
 uint pack_unorm16x2(vec2 p_value) {
 	uvec2 u = uvec2(clamp(p_value, 0.0, 1.0) * 65535.0);
@@ -134,7 +163,7 @@ vec3 displace_vertex(DisplaceJob p_job, vec3 p_rest_position, TBNResult p_tbn, u
 #endif
 	uv_interp = fetch_uv(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
 	uv2_interp = fetch_uv2(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
-	color_interp = fetch_color(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
+	color_interp = fetch_color(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0)) * rt_displace_instance_color;
 	rt_vertex_id = int(p_index);
 
 	/* RT_CUSTOM_VERTEX_CALL */
@@ -166,7 +195,69 @@ void main() {
 		float value = global_shader_uniforms.data[0].x + scene_data_block.data.time;
 		value += texelFetch(sampler2D(bindless_textures[nonuniformEXT(index)], SAMPLER_NEAREST_CLAMP), ivec2(0), 0).r;
 		value += texelFetch(sampler2DArray(bindless_texture_arrays[nonuniformEXT(index)], SAMPLER_NEAREST_CLAMP), ivec3(0), 0).r;
-		dst.v[0] = material_dependency.v[0] + floatBitsToUint(value);
+		dst.v[0] = material_dependency.v[0] + floatBitsToUint(value) + floatBitsToUint(mm_transforms.v[0]) + mm_remap.v[0];
+		mm_previous.v[0] = 0u;
+	}
+
+	if (job.mm_instance_count != 0u) {
+		if (index >= job.mm_instance_count * job.mm_vertex_count) {
+			return;
+		}
+		uint instance = index / job.mm_vertex_count;
+		uint merged_vertex = index % job.mm_vertex_count;
+		uint source_vertex = job.mm_use_remap != 0u ? mm_remap.v[merged_vertex] : merged_vertex;
+
+		// The instance's transform: three rows of the MultiMesh buffer.
+		uint base = (job.mm_offset + instance) * job.mm_stride;
+		mat4 instance_transform = transpose(mat4(
+				vec4(mm_transforms.v[base + 0u], mm_transforms.v[base + 1u], mm_transforms.v[base + 2u], mm_transforms.v[base + 3u]),
+				vec4(mm_transforms.v[base + 4u], mm_transforms.v[base + 5u], mm_transforms.v[base + 6u], mm_transforms.v[base + 7u]),
+				vec4(mm_transforms.v[base + 8u], mm_transforms.v[base + 9u], mm_transforms.v[base + 10u], mm_transforms.v[base + 11u]),
+				vec4(0.0, 0.0, 0.0, 1.0)));
+		if (job.mm_color_offset != 0xFFFFFFFFu) {
+			uint o = base + job.mm_color_offset;
+			rt_displace_instance_color = vec4(mm_transforms.v[o], mm_transforms.v[o + 1u], mm_transforms.v[o + 2u], mm_transforms.v[o + 3u]);
+		}
+		if (job.mm_custom_offset != 0xFFFFFFFFu) {
+			uint o = base + job.mm_custom_offset;
+			instance_custom = vec4(mm_transforms.v[o], mm_transforms.v[o + 1u], mm_transforms.v[o + 2u], mm_transforms.v[o + 3u]);
+		}
+		DisplaceJob instance_job = job;
+		instance_job.model_matrix = job.model_matrix * instance_transform;
+		instance_job.inv_model_matrix = inverse(instance_job.model_matrix);
+		instance_job.prev_model_matrix = job.prev_model_matrix * instance_transform;
+		instance_job.prev_inv_model_matrix = inverse(instance_job.prev_model_matrix);
+
+		GeometryData mm_geom = job.geom;
+		vec3 mm_rest = fetch_position(mm_geom, source_vertex);
+		TBNResult mm_tbn;
+		mm_tbn.normal = vec3(0.0, 1.0, 0.0);
+		mm_tbn.tangent = vec3(1.0, 0.0, 0.0);
+		mm_tbn.binormal = vec3(0.0, 0.0, 1.0);
+		mm_tbn.bitangent_sign = 1.0;
+		if (mm_geom.normal_byte_offset != OFFSET_NONE) {
+			mm_tbn = (mm_geom.flags & FLAG_COMPRESSED) != 0u ? fetch_tbn_compressed_vertex(mm_geom, source_vertex) : fetch_tbn_uncompressed_vertex(mm_geom, source_vertex);
+		}
+		material = CustomMaterialUniforms(job.material_address);
+		rt_instance_uniforms_ofs = job.instance_uniforms_ofs;
+		rt_instance_id = int(instance);
+
+		vec3 mm_previous_position = displace_vertex(instance_job, mm_rest, mm_tbn, source_vertex, true);
+		vec3 mm_position = displace_vertex(instance_job, mm_rest, mm_tbn, source_vertex, false);
+		// A removed point (NaN) collapses onto the instance's origin instead: the BLAS is refit every frame, and a
+		// refit cannot turn triangles on or off.
+		mm_previous_position = any(isnan(mm_previous_position)) ? vec3(0.0) : mm_previous_position;
+		mm_position = any(isnan(mm_position)) ? vec3(0.0) : mm_position;
+		mm_previous_position = (instance_transform * vec4(mm_previous_position, 1.0)).xyz;
+		mm_position = (instance_transform * vec4(mm_position, 1.0)).xyz;
+
+		dst.v[index * 3u] = floatBitsToUint(mm_position.x);
+		dst.v[index * 3u + 1u] = floatBitsToUint(mm_position.y);
+		dst.v[index * 3u + 2u] = floatBitsToUint(mm_position.z);
+		mm_previous.v[index * 3u] = floatBitsToUint(mm_previous_position.x);
+		mm_previous.v[index * 3u + 1u] = floatBitsToUint(mm_previous_position.y);
+		mm_previous.v[index * 3u + 2u] = floatBitsToUint(mm_previous_position.z);
+		return;
 	}
 
 	GeometryData geom = job.geom;

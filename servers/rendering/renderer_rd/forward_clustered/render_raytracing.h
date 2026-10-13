@@ -233,8 +233,18 @@ struct alignas(16) RT_DisplaceJob {
 	uint64_t material_address;
 	uint32_t tbn_words;
 	uint32_t instance_uniforms_ofs;
+	// A merged MultiMesh (_displace_merged_multimeshes()), when mm_instance_count is not 0: one thread per vertex of each
+	// instance, MODEL_MATRIX = model_matrix * the instance's transform.
+	uint32_t mm_instance_count;
+	uint32_t mm_vertex_count; // Per instance, in the merged buffers.
+	uint32_t mm_stride; // Of the MultiMesh buffer, in floats.
+	uint32_t mm_offset; // Instances to skip in it (its motion vectors double buffer).
+	uint32_t mm_use_remap; // 1: the merged vertices are a LOD view's (binding 3 maps them to the mesh's).
+	uint32_t mm_color_offset; // In floats in an instance, or UINT32_MAX without colors.
+	uint32_t mm_custom_offset; // Same for the custom data.
+	uint32_t mm_pad;
 };
-static_assert(sizeof(RT_DisplaceJob) == 400, "RT_DisplaceJob must be 400 bytes for std430");
+static_assert(sizeof(RT_DisplaceJob) == 432, "RT_DisplaceJob must be 432 bytes for std430");
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
@@ -364,6 +374,12 @@ struct RTMergedMMEntry {
 	uint32_t last_used_frame = 0;
 	uint64_t cached_mm_last_change = 0;
 	bool blas_built_once = false;
+	// Displaced by the material's vertex() near the camera: the positions it wrote are the BLAS's, and the previous
+	// frame's give the motion vectors.
+	bool displaced = false;
+	bool displaced_this_frame = false; // Its positions moved this frame: the previous ones are valid.
+	RID merged_prev_buffer; // float3 per merged vertex, the previous frame's displaced positions.
+	uint32_t prev_capacity_bytes = 0;
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
 };
 
@@ -469,6 +485,32 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} lod_compact_shader;
 	RID lod_view_dummy_buffer; // Bound in the merge's LOD view slots when a MultiMesh keeps its full mesh.
+
+	// Merged MultiMeshes whose material's vertex() moves them (wind), displaced after the merge.
+	struct MMDisplaceRequest {
+		RID merged_vtx_buffer;
+		RID merged_prev_buffer;
+		RID mm_gpu_buffer;
+		RID remap_buffer; // A LOD view's, or none.
+		void *mesh_surface = nullptr;
+		uint32_t mm_count = 0;
+		uint32_t vertex_count = 0; // Per instance, in the merged buffers.
+		uint32_t mm_stride = 0;
+		uint32_t mm_offset = 0;
+		uint32_t mm_color_offset = UINT32_MAX;
+		uint32_t mm_custom_offset = UINT32_MAX;
+		RTMaterialData *mat_data = nullptr;
+		Transform3D transform;
+		Transform3D prev_transform;
+		uint32_t instance_uniforms_ofs = 0;
+	};
+	LocalVector<MMDisplaceRequest> mm_displace_requests;
+	RID mm_displace_job_buffer;
+	uint32_t mm_displace_job_capacity = 0;
+	RID displace_dummy_buffer; // Bound in the displacement's MultiMesh slots for the other jobs.
+	bool displace_camera_moved = false;
+	LocalVector<RD::Uniform> _displace_frame_uniforms(RID p_job_buffer);
+	void _displace_merged_multimeshes();
 
 	// The volumetric fog applied over the traced color.
 	struct VolumetricFogShader {
@@ -598,6 +640,12 @@ class RenderRaytracing {
 			uint32_t p_surface_index,
 			uint32_t p_surface_counter,
 			uint32_t p_lod,
+			bool p_displace,
+			bool p_reevaluate,
+			RTMaterialData *p_mat_data,
+			const Transform3D &p_transform,
+			const Transform3D &p_prev_transform,
+			uint32_t p_instance_uniforms_ofs,
 			RD::ComputeListID p_compute_list,
 			LocalVector<RID> &r_dirty_blas_list,
 			LocalVector<RID> &r_dirty_blas_update_list,

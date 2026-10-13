@@ -76,6 +76,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		lod_compact_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(lod_compact_shader.version_shader[i]);
 	}
 	lod_view_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
+	displace_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
 
 	Vector<String> fog_modes;
 	fog_modes.push_back("\n");
@@ -115,6 +116,12 @@ RenderRaytracing::~RenderRaytracing() {
 	lod_compact_shader.shader.version_free(lod_compact_shader.version);
 	if (lod_view_dummy_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(lod_view_dummy_buffer);
+	}
+	if (displace_dummy_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(displace_dummy_buffer);
+	}
+	if (mm_displace_job_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(mm_displace_job_buffer);
 	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 }
@@ -453,6 +460,10 @@ void RenderRaytracing::cleanup_caches() {
 				rd->free_rid(e->replicated_idx_buffer);
 				e->replicated_idx_buffer = RID();
 			}
+			if (e->merged_prev_buffer.is_valid()) {
+				rd->free_rid(e->merged_prev_buffer);
+				e->merged_prev_buffer = RID();
+			}
 			merged_mm_pool.free(live[i]);
 		}
 	}
@@ -615,6 +626,7 @@ void RenderRaytracing::prepare_frame() {
 	instance_flags.clear();
 	instance_masks.clear();
 	front_layer_instance_count = 0;
+	mm_displace_requests.clear();
 	sbt_offsets.clear();
 	geometry_data.clear();
 	material_data.clear();
@@ -690,6 +702,10 @@ void RenderRaytracing::prepare_frame() {
 			if (e->replicated_idx_buffer.is_valid()) {
 				rd->free_rid(e->replicated_idx_buffer);
 				e->replicated_idx_buffer = RID();
+			}
+			if (e->merged_prev_buffer.is_valid()) {
+				rd->free_rid(e->merged_prev_buffer);
+				e->merged_prev_buffer = RID();
 			}
 			merged_mm_pool.free(live[i]);
 		}
@@ -1191,6 +1207,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 
 	const bool camera_moved = p_render_data->scene_data->cam_transform != displace_camera_transform || p_render_data->scene_data->cam_projection != displace_camera_projection;
+	displace_camera_moved = camera_moved;
 	displace_camera_transform = p_render_data->scene_data->cam_transform;
 	displace_camera_projection = p_render_data->scene_data->cam_projection;
 
@@ -1307,6 +1324,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			data.material_address = mat_data->data.uniform_address;
 			data.tbn_words = tbn_words;
 			data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
+			data.mm_instance_count = 0;
 			job_data.push_back(data);
 
 			mat_ubo_pool_ensure_initialized();
@@ -1344,6 +1362,45 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 	}
 	rd->buffer_update(displace_job_buffer, 0, job_data.size() * sizeof(RT_DisplaceJob), job_data.ptr());
 
+	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(displace_job_buffer);
+
+	RD::get_singleton()->draw_command_begin_label("RT Displace Surfaces");
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	RID bound_pipeline;
+	LocalVector<RID> job_sets;
+	for (uint32_t i = 0; i < jobs.size(); i++) {
+		const Job &job = jobs[i];
+		if (job.pipeline != bound_pipeline) {
+			rd->compute_list_bind_compute_pipeline(compute_list, job.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(job.shader, 0, frame_uniforms), 0);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_set, 1);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_array_set, 2);
+			bound_pipeline = job.pipeline;
+		}
+
+		RD::Uniform output(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, job.entry->displaced_vb);
+		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, job.material_buffer);
+		RD::Uniform mm_transforms(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, lod_view_dummy_buffer);
+		RD::Uniform mm_remap(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, lod_view_dummy_buffer);
+		RD::Uniform mm_previous(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, displace_dummy_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous }, job.shader, 3, /*p_linear_pool=*/true);
+		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
+		job_sets.push_back(job_set);
+
+		const uint32_t push_constant[4] = { i, 0, 0, 0 };
+		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
+		rd->compute_list_dispatch_threads(compute_list, job.vertex_count, 1, 1);
+	}
+	rd->compute_list_end();
+	for (const RID &job_set : job_sets) {
+		rd->free_rid(job_set);
+	}
+	RD::get_singleton()->draw_command_end_label();
+}
+
+LocalVector<RD::Uniform> RenderRaytracing::_displace_frame_uniforms(RID p_job_buffer) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	LocalVector<RD::Uniform> frame_uniforms;
 	{
 		RD::Uniform u;
@@ -1365,16 +1422,97 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 		RD::Uniform u;
 		u.binding = 30;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
-		u.append_id(displace_job_buffer);
+		u.append_id(p_job_buffer);
 		frame_uniforms.push_back(u);
 	}
+	return frame_uniforms;
+}
 
-	RD::get_singleton()->draw_command_begin_label("RT Displace Surfaces");
+void RenderRaytracing::_displace_merged_multimeshes() {
+	if (mm_displace_requests.is_empty()) {
+		return;
+	}
+	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RD *rd = RD::get_singleton();
+
+	struct Job {
+		const MMDisplaceRequest *request = nullptr;
+		RID shader;
+		RID pipeline;
+		RID material_buffer;
+	};
+	LocalVector<Job> jobs;
+	LocalVector<RT_DisplaceJob> job_data;
+	for (const MMDisplaceRequest &request : mm_displace_requests) {
+		RID program_shader;
+		const RID pipeline = rt_shader->get_displace_pipeline(request.mat_data->rt_sbt_offset, program_shader);
+		if (!pipeline.is_valid()) {
+			continue;
+		}
+		const uint64_t format = mesh_storage->mesh_surface_get_format(request.mesh_surface);
+
+		RT_DisplaceJob data = {};
+		RTSurfaceData source;
+		RID vertex_buffer, attribute_buffer;
+		_fill_surface_geometry_data(request.mesh_surface, false, &source, &vertex_buffer, &attribute_buffer);
+		data.geometry = source.geometry;
+		if (vertex_buffer.is_valid()) {
+			data.geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+		}
+		if (attribute_buffer.is_valid()) {
+			data.geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+		}
+		RendererRD::MaterialStorage::store_transform(request.transform, data.model_matrix);
+		RendererRD::MaterialStorage::store_transform(request.transform.affine_inverse(), data.inv_model_matrix);
+		RendererRD::MaterialStorage::store_transform(request.prev_transform, data.prev_model_matrix);
+		RendererRD::MaterialStorage::store_transform(request.prev_transform.affine_inverse(), data.prev_inv_model_matrix);
+		data.material_address = request.mat_data->data.uniform_address;
+		data.tbn_words = (format & RSE::ARRAY_FORMAT_NORMAL) ? ((format & RSE::ARRAY_FORMAT_TANGENT) ? 2 : 1) : 0;
+		data.instance_uniforms_ofs = request.instance_uniforms_ofs;
+		data.mm_instance_count = request.mm_count;
+		data.mm_vertex_count = request.vertex_count;
+		data.mm_stride = request.mm_stride;
+		data.mm_offset = request.mm_offset;
+		data.mm_use_remap = request.remap_buffer.is_valid() ? 1 : 0;
+		data.mm_color_offset = request.mm_color_offset;
+		data.mm_custom_offset = request.mm_custom_offset;
+		job_data.push_back(data);
+
+		mat_ubo_pool_ensure_initialized();
+		Job job;
+		job.request = &request;
+		job.shader = program_shader;
+		job.pipeline = pipeline;
+		job.material_buffer = request.mat_data->uniform_buffer.is_valid() ? request.mat_data->uniform_buffer : mat_ubo_pool_buffer;
+		jobs.push_back(job);
+	}
+	if (jobs.is_empty()) {
+		return;
+	}
+
+	const RID bindless_set = bindless_block->get_secondary_uniform_set(jobs[0].shader, 1);
+	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(jobs[0].shader, 2);
+	ERR_FAIL_COND_MSG(!bindless_set.is_valid() || !bindless_array_set.is_valid(), "RT: no bindless tables for the MultiMesh displacement.");
+
+	if (mm_displace_job_capacity < job_data.size()) {
+		if (mm_displace_job_buffer.is_valid()) {
+			rd->free_rid(mm_displace_job_buffer);
+		}
+		mm_displace_job_capacity = Math::next_power_of_2(job_data.size());
+		mm_displace_job_buffer = rd->storage_buffer_create(mm_displace_job_capacity * sizeof(RT_DisplaceJob));
+		rd->set_resource_name(mm_displace_job_buffer, "RT MultiMesh displace jobs");
+	}
+	rd->buffer_update(mm_displace_job_buffer, 0, job_data.size() * sizeof(RT_DisplaceJob), job_data.ptr());
+	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(mm_displace_job_buffer);
+
+	rd->draw_command_begin_label("RT Displace MultiMeshes");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	RID bound_pipeline;
 	LocalVector<RID> job_sets;
 	for (uint32_t i = 0; i < jobs.size(); i++) {
 		const Job &job = jobs[i];
+		const MMDisplaceRequest &request = *job.request;
 		if (job.pipeline != bound_pipeline) {
 			rd->compute_list_bind_compute_pipeline(compute_list, job.pipeline);
 			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(job.shader, 0, frame_uniforms), 0);
@@ -1383,21 +1521,25 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			bound_pipeline = job.pipeline;
 		}
 
-		RD::Uniform output(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, job.entry->displaced_vb);
+		// The displaced positions replace the merged ones, which the BLAS build reads next.
+		RD::Uniform output(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, request.merged_vtx_buffer);
 		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, job.material_buffer);
-		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material }, job.shader, 3, /*p_linear_pool=*/true);
+		RD::Uniform mm_transforms(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, request.mm_gpu_buffer);
+		RD::Uniform mm_remap(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, request.remap_buffer.is_valid() ? request.remap_buffer : lod_view_dummy_buffer);
+		RD::Uniform mm_previous(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, request.merged_prev_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous }, job.shader, 3, /*p_linear_pool=*/true);
 		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
 		job_sets.push_back(job_set);
 
 		const uint32_t push_constant[4] = { i, 0, 0, 0 };
 		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
-		rd->compute_list_dispatch_threads(compute_list, job.vertex_count, 1, 1);
+		rd->compute_list_dispatch_threads(compute_list, request.mm_count * request.vertex_count, 1, 1);
 	}
 	rd->compute_list_end();
 	for (const RID &job_set : job_sets) {
 		rd->free_rid(job_set);
 	}
-	RD::get_singleton()->draw_command_end_label();
+	rd->draw_command_end_label();
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,6 +2547,12 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		uint32_t p_surface_index,
 		uint32_t p_surface_counter,
 		uint32_t p_lod,
+		bool p_displace,
+		bool p_reevaluate,
+		RTMaterialData *p_mat_data,
+		const Transform3D &p_transform,
+		const Transform3D &p_prev_transform,
+		uint32_t p_instance_uniforms_ofs,
 		RD::ComputeListID p_compute_list,
 		LocalVector<RID> &r_dirty_blas_list,
 		LocalVector<RID> &r_dirty_blas_update_list,
@@ -2474,6 +2622,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			}
 			if (old->replicated_idx_buffer.is_valid()) {
 				rd_local->free_rid(old->replicated_idx_buffer);
+			}
+			if (old->merged_prev_buffer.is_valid()) {
+				rd_local->free_rid(old->merged_prev_buffer);
 			}
 			merged_mm_pool.free(h);
 			h = RID();
@@ -2609,8 +2760,24 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	ERR_FAIL_COND_V(!vtx_buf.is_valid(), false);
 	uint64_t vtx_bda = rd->buffer_get_device_address(vtx_buf);
 
+	// Positions displaced while near the camera go back to rest once it is no longer displaced.
 	const bool needs_rebake = first_touch_this_frame &&
-			(transforms_changed || !entry.blas_built_once);
+			(transforms_changed || !entry.blas_built_once || (entry.displaced && !p_displace));
+
+	// --- Displacement by the material's vertex(), after the merge (_displace_merged_multimeshes()) ---
+	const uint32_t merged_pos_bytes = p_mm_count * vertex_count * 12;
+	if (p_displace && (!entry.merged_prev_buffer.is_valid() || entry.prev_capacity_bytes < merged_pos_bytes || entry.prev_capacity_bytes / 2 > merged_pos_bytes)) {
+		if (entry.merged_prev_buffer.is_valid()) {
+			rd->free_rid(entry.merged_prev_buffer);
+		}
+		entry.prev_capacity_bytes = merged_pos_bytes;
+		entry.merged_prev_buffer = rd->storage_buffer_create(merged_pos_bytes, {}, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+		ERR_FAIL_COND_V(!entry.merged_prev_buffer.is_valid(), false);
+		rd->set_resource_name(entry.merged_prev_buffer, "RT MM displaced prev [" + itos(cache_key) + "]");
+		entry.displaced = false; // Its previous positions are not written yet.
+	}
+	// Evaluated after every merge, and every frame when vertex() reads the time or the camera.
+	const bool displace_now = p_displace && first_touch_this_frame && (needs_rebake || p_reevaluate || !entry.displaced);
 
 	// --- Single merged dispatch: bake vertices + TBN + attributes + (optional) indices ---
 	if (needs_rebake) {
@@ -2753,14 +2920,41 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + "]");
 	}
 
-	if (needs_rebake) {
+	if (needs_rebake || displace_now) {
 		if (!entry.blas_built_once) {
 			r_dirty_blas_list.push_back(entry.blas);
 			entry.blas_built_once = true;
 		} else {
 			r_dirty_blas_update_list.push_back(entry.blas);
 		}
+	}
+	if (needs_rebake) {
 		entry.cached_mm_last_change = mm_last_change;
+	}
+	if (displace_now) {
+		MMDisplaceRequest request;
+		request.merged_vtx_buffer = entry.merged_vtx_buffer;
+		request.merged_prev_buffer = entry.merged_prev_buffer;
+		request.mm_gpu_buffer = p_mm_gpu_buffer;
+		request.remap_buffer = lod_view ? lod_view->vertex_remap_buffer : RID();
+		request.mesh_surface = p_mesh_surface;
+		request.mm_count = p_mm_count;
+		request.vertex_count = vertex_count;
+		request.mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
+		request.mm_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
+		// The 3D layout: 12 floats of transform, then 4 of color and 4 of custom data when used.
+		const bool mm_colors = mesh_storage->multimesh_uses_colors(p_mm_rid);
+		request.mm_color_offset = mm_colors ? 12 : UINT32_MAX;
+		request.mm_custom_offset = mesh_storage->multimesh_uses_custom_data(p_mm_rid) ? (mm_colors ? 16 : 12) : UINT32_MAX;
+		request.mat_data = p_mat_data;
+		request.transform = p_transform;
+		request.prev_transform = p_prev_transform;
+		request.instance_uniforms_ofs = p_instance_uniforms_ofs;
+		mm_displace_requests.push_back(request);
+	}
+	if (first_touch_this_frame) {
+		entry.displaced = p_displace;
+		entry.displaced_this_frame = displace_now;
 	}
 
 	// --- Populate r_surf_data from the metadata already computed above, then override merged buffer addresses.
@@ -2776,6 +2970,13 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	geom.vertex_count = p_mm_count * vertex_count;
 	geom.position_stride = 12; // float3, uncompressed
 	geom.flags &= ~RT_GEOM_FLAG_COMPRESSED;
+	if (entry.displaced_this_frame) {
+		// Moving with its vertex() this frame: the previous positions give the motion vectors.
+		const uint64_t prev_address = rd->buffer_get_device_address(entry.merged_prev_buffer);
+		geom.flags |= RT_GEOM_FLAG_DEFORMED;
+		geom.prev_vertex_buffer_address_lo = static_cast<uint32_t>(prev_address & 0xFFFFFFFFULL);
+		geom.prev_vertex_buffer_address_hi = static_cast<uint32_t>(prev_address >> 32);
+	}
 
 	// TBN section starts after all positions in the merged vertex buffer.
 	if (has_tbn) {
@@ -2902,6 +3103,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t surface_counter;
 		uint32_t lod;
 		const RTLodView *lod_view;
+		bool displace; // Its material's vertex() moves it and it is near enough.
+		bool reevaluate; // That vertex() reads the time or the camera.
 		Transform3D instance_transform;
 		Transform3D prev_instance_transform;
 		bool transform_moved;
@@ -3119,6 +3322,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.surface_counter = surface_counter;
 				pending.lod = lod;
 				pending.lod_view = lod_view;
+				// Near the camera, a material whose vertex() moves the MultiMesh (wind) is evaluated on it, as raster draws it.
+				pending.displace = false;
+				pending.reevaluate = false;
+				static const float mm_displacement_distance = GLOBAL_GET("rendering/pathtracing/multimesh_displacement_distance");
+				if (mm_displacement_distance > 0.0f && lod_distance <= mm_displacement_distance && mat_data->rt_sbt_offset > 0) {
+					const SceneShaderRaytracing::CustomShaderEntry *displace_cse = rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
+					RID displace_shader;
+					if (displace_cse && displace_cse->writes_vertex && rt_shader_singleton->get_displace_pipeline(mat_data->rt_sbt_offset, displace_shader).is_valid()) {
+						pending.displace = true;
+						pending.reevaluate = displace_cse->uses_vertex_time || (displace_cse->vertex_reads_camera && displace_camera_moved);
+					}
+				}
 				pending.instance_transform = instance_transform;
 				pending.prev_instance_transform = prev_instance_transform;
 				pending.transform_moved = transform_moved;
@@ -3353,6 +3568,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter, pending.lod,
+						pending.displace, pending.reevaluate, pending.mat_data, pending.instance_transform, pending.prev_instance_transform,
+						uint32_t(pending.mm_surf->owner->shader_uniforms_offset),
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
@@ -3496,6 +3713,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 
 	RD::get_singleton()->compute_list_end();
+
+	// After the merges: the displaced positions overwrite the merged ones before the BLAS builds read them.
+	_displace_merged_multimeshes();
 
 	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 	finalize_buffers(state);
@@ -4096,6 +4316,9 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 		}
 		if (e->replicated_idx_buffer.is_valid()) {
 			rd->raytracing_list_add_buffer_dependency(p_list, e->replicated_idx_buffer, /*p_writable=*/false);
+		}
+		if (e->displaced && e->merged_prev_buffer.is_valid()) {
+			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_prev_buffer, /*p_writable=*/false);
 		}
 	}
 }
