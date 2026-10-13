@@ -132,7 +132,10 @@ void main() {
 			rs.rng_state = fs.rng_state;
 			vec3 ray_origin = offset_ray_origin(origin.xyz + direction.xyz * fs.hit_t, fs.offset_normal);
 			vec3 ray_dir = fs.next_ray_dir;
-			[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
+			// The reflected point's direct light and one indirect bounce, as Lumen's front layer reflections: a full path
+			// for every pixel of a window close to the camera doubled the cost of the trace.
+			uint front_layer_bounces = min(max_bounces, 1u);
+			[[dont_unroll]] for (uint bounce = 0u; bounce <= front_layer_bounces; bounce++) {
 				path_pack(payload, rs);
 				traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 				rs = path_unpack(payload);
