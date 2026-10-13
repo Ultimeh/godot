@@ -706,11 +706,12 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
 	} else if (entry->ptr->blas.is_valid()) {
-		if (entry->cached_rid_version == mesh_version) {
-			// Same mesh, surface data changed: BLAS is still live, free explicitly.
+		// Same mesh, surface data changed: the BLAS is still live after a region update, but already freed with the old
+		// vertex buffer when the mesh replaced its surfaces (AnimatedSprite3D, Label3D...). A version mismatch means the old
+		// mesh was deleted, which freed it too.
+		if (entry->cached_rid_version == mesh_version && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
 			RD::get_singleton()->free_rid(entry->ptr->blas);
 		}
-		// Version mismatch: old mesh was deleted, BLAS already cascade-freed by RD.
 		entry->ptr->blas = RID();
 	}
 

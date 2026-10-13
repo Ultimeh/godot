@@ -147,8 +147,9 @@ vec3 displace_vertex(DisplaceJob p_job, vec3 p_rest_position, TBNResult p_tbn, u
 #else
 	vec3 displaced = vertex;
 #endif
-	// A point vertex() removed (NaN) makes its triangles inactive in the BLAS, which needs a NaN x.
-	if (any(isnan(displaced))) {
+	// A point vertex() removed (NaN) makes its triangles inactive in the BLAS, which needs a NaN x. An infinite one too
+	// (an effect dividing by a zero duration): raster clips it, but a BLAS built from it is invalid.
+	if (any(isnan(displaced)) || any(isinf(displaced))) {
 		displaced = vec3(uintBitsToFloat(0x7fc00000u));
 	}
 	return displaced;

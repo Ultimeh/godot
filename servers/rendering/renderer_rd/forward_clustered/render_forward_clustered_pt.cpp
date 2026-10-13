@@ -170,6 +170,24 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	RID rt_uniform_set;
 	bool using_depth_reconstruct = false;
 
+	// The path tracer produces the opaque color, but transparents are still
+	// rasterized on top, which needs the reflection-probe / light / decal buffers
+	// and the cluster grid to be valid for the current frame. Before the acceleration structures, as raster renders its
+	// shadows before the opaque pass: the shadow passes recorded between the TLAS build and the trace left the TLAS
+	// faulty (VK_NV_ray_tracing_validation FAULTY_AS, then a device loss) whenever the volumetric fog was on.
+	if (rb_data.is_valid() && is_environment(p_render_data->environment) && environment_get_volumetric_fog_enabled(p_render_data->environment)) {
+		// The volumetric fog lights its volume through the shadow maps, as in raster: render them, then update it.
+		_pre_opaque_render(p_render_data, false, false, false, false, nullptr, RID());
+	} else {
+		uint32_t pt_directional_light_count = 0;
+		uint32_t pt_positional_light_count = 0;
+		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
+		if (rb_data.is_valid()) {
+			// Frees the volume of a fog just turned off.
+			_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, false, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes);
+		}
+	}
+
 	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
 		RENDER_TIMESTAMP("Build Acceleration Structures");
 		RID rt_environment = p_render_data->environment.is_valid() ? p_render_data->environment : RID();
@@ -312,22 +330,6 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		RENDER_TIMESTAMP("Process Pre Opaque Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
-	}
-
-	// The path tracer produces the opaque color, but transparents are still
-	// rasterized on top, which needs the reflection-probe / light / decal buffers
-	// and the cluster grid to be valid for the current frame.
-	if (rb_data.is_valid() && is_environment(p_render_data->environment) && environment_get_volumetric_fog_enabled(p_render_data->environment)) {
-		// The volumetric fog lights its volume through the shadow maps, as in raster: render them, then update it.
-		_pre_opaque_render(p_render_data, false, false, false, false, nullptr, RID());
-	} else {
-		uint32_t pt_directional_light_count = 0;
-		uint32_t pt_positional_light_count = 0;
-		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
-		if (rb_data.is_valid()) {
-			// Frees the volume of a fog just turned off.
-			_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, false, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes);
-		}
 	}
 
 	// Execute raytracing (replaces the opaque + motion vector pass). Without a uniform set this frame (the pipeline was
