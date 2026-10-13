@@ -84,6 +84,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	volumetric_fog_shader.version = volumetric_fog_shader.shader.version_create();
 	volumetric_fog_shader.version_shader = volumetric_fog_shader.shader.version_get_shader(volumetric_fog_shader.version, 0);
 	volumetric_fog_shader.pipeline = RD::get_singleton()->compute_pipeline_create(volumetric_fog_shader.version_shader);
+
+	Vector<String> sky_guide_modes;
+	sky_guide_modes.push_back("\n");
+	sky_guide_shader.shader.initialize(sky_guide_modes);
+	sky_guide_shader.version = sky_guide_shader.shader.version_create();
+	sky_guide_shader.version_shader = sky_guide_shader.shader.version_get_shader(sky_guide_shader.version, 0);
+	sky_guide_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_guide_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -124,6 +131,7 @@ RenderRaytracing::~RenderRaytracing() {
 		RD::get_singleton()->free_rid(mm_displace_job_buffer);
 	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
+	sky_guide_shader.shader.version_free(sky_guide_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -4355,6 +4363,31 @@ void RenderRaytracing::apply_volumetric_fog(const RenderDataRD *p_render_data, b
 	rd->compute_list_bind_compute_pipeline(compute_list, volumetric_fog_shader.pipeline);
 	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(volumetric_fog_shader.version_shader, 0, color, depth, fog_map, sampler), 0);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(VolumetricFogShader::PushConstant));
+	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+	rd->compute_list_end();
+}
+
+void RenderRaytracing::dlss_rr_write_background_albedo(const RenderDataRD *p_render_data) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+	if (!dlss_rr_has_buffers(rb.ptr()) || !rt_has_depth_texture(rb.ptr())) {
+		return;
+	}
+
+	SkyGuideShader::PushConstant push_constant = {};
+	const Size2i size = rb->get_internal_size();
+	push_constant.size[0] = size.width;
+	push_constant.size[1] = size.height;
+
+	RD::Uniform color(RD::UNIFORM_TYPE_TEXTURE, 0, rb->get_internal_texture());
+	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
+	RD::Uniform albedo(RD::UNIFORM_TYPE_IMAGE, 2, dlss_rr_get_diffuse_albedo(rb.ptr()));
+
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, sky_guide_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_guide_shader.version_shader, 0, color, depth, albedo), 0);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SkyGuideShader::PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
 	rd->compute_list_end();
 }

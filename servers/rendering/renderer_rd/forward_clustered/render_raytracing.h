@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_lod_compact.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_sky_guide.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -528,6 +529,18 @@ class RenderRaytracing {
 		RID pipeline;
 	} volumetric_fog_shader;
 
+	// DLSS Ray Reconstruction's diffuse albedo where the camera rays missed, from the drawn background.
+	struct SkyGuideShader {
+		struct PushConstant {
+			int32_t size[2];
+			uint32_t pad[2];
+		};
+		RaytracingSkyGuideShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} sky_guide_shader;
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.
@@ -669,6 +682,7 @@ public:
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
 	void apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending);
+	void dlss_rr_write_background_albedo(const RenderDataRD *p_render_data);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
 
 	// Raytracing output textures (stored on the render buffers via named scopes).

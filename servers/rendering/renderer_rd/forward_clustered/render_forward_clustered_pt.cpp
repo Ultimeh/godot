@@ -477,8 +477,10 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
 	}
 
-	// DLSS RR's color before transparency guide: what the transparent pass is about to draw over.
+	// DLSS RR's color before transparency guide: what the transparent pass is about to draw over. And its diffuse albedo
+	// where the camera rays missed: the background as drawn.
 	if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
+		raytracing->dlss_rr_write_background_albedo(p_render_data);
 		copy_effects->copy_to_rect(rb->get_internal_texture(), raytracing->dlss_rr_get_color_before_transparency(rb.ptr()), Rect2i(Point2i(), rb->get_internal_size()));
 	}
 
