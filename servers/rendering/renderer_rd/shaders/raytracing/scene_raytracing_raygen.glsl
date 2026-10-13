@@ -571,7 +571,8 @@ void main() {
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
-		vec3 normal_sample = triplanar ? sample_material_triplanar(mat.normal_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, 0u).rgb : sample_material_texture_grad(mat.normal_texture_idx, uv, uv_ddx, uv_ddy, 0u).rgb;
+		// With the material's filter, as raster samples every texture of a BaseMaterial3D.
+		vec3 normal_sample = triplanar ? sample_material_triplanar(mat.normal_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags).rgb : sample_material_texture_grad(mat.normal_texture_idx, uv, uv_ddx, uv_ddy, mat.flags).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
 		final_normal = apply_normal_map(nh, tangent_space_normal, mat.normal_map_depth);
