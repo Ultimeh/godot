@@ -117,6 +117,14 @@ Mutex &Streamline::get_swap_chain_mutex() {
 	return swap_chain_mutex;
 }
 
+void Streamline::set_latency_sleep_callback(LatencySleepCallback p_callback, void *p_userdata) {
+#ifdef STREAMLINE_ENABLED
+	// Set when the device is created and cleared before it is destroyed, outside the main loop that sleeps.
+	StreamlineContext::get().latency_sleep_callback = p_callback;
+	StreamlineContext::get().latency_sleep_userdata = p_userdata;
+#endif
+}
+
 void Streamline::emit_marker(StreamlineMarkerType marker) {
 #ifdef STREAMLINE_ENABLED
 	StreamlineContext &sl_context = StreamlineContext::get();

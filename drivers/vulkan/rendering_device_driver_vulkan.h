@@ -143,6 +143,10 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		PFN_vkCreateRayTracingPipelinesKHR CreateRaytracingPipelinesKHR = nullptr;
 		PFN_vkGetRayTracingShaderGroupHandlesKHR GetRayTracingShaderGroupHandlesKHR = nullptr;
 		PFN_vkCmdTraceRaysKHR CmdTraceRaysKHR = nullptr;
+
+		// Reflex sleep (VK_NV_low_latency2, enabled by Streamline).
+		PFN_vkLatencySleepNV LatencySleepNV = nullptr;
+		PFN_vkWaitSemaphores WaitSemaphores = nullptr;
 	};
 	// Debug marker extensions.
 	VkDebugReportObjectTypeEXT _convert_to_debug_report_objectType(VkObjectType p_object_type);
@@ -186,6 +190,18 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	uint8_t swappy_mode = 2; // See default value for display/window/frame_pacing/android/swappy_mode.
 #endif
 	DeviceFunctions device_functions;
+
+#ifdef STREAMLINE_ENABLED
+	// Reflex sleep issued by the driver instead of slReflexSleep(). See _latency_sleep().
+	VkSemaphore latency_sleep_semaphore = VK_NULL_HANDLE;
+	uint64_t latency_sleep_value = 0;
+	// The swap chain sl.reflex sleeps on: the last one created. Guarded by Streamline::get_swap_chain_mutex().
+	VkSwapchainKHR latency_swap_chain = VK_NULL_HANDLE;
+
+	void _initialize_latency_sleep();
+	void _finalize_latency_sleep();
+	static bool _latency_sleep(void *p_driver);
+#endif
 
 	struct PendingFlushes {
 		LocalVector<VmaAllocation> allocations;

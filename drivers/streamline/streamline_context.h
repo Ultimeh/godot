@@ -56,6 +56,9 @@ public:
 	PFun_slReflexGetState *slReflexGetState = nullptr;
 	PFun_slReflexSetOptions *slReflexSetOptions = nullptr;
 	PFun_slReflexSleep *slReflexSleep = nullptr;
+	// Vulkan: the driver's sleep, used instead of slReflexSleep(). See Streamline::set_latency_sleep_callback().
+	bool (*latency_sleep_callback)(void *) = nullptr;
+	void *latency_sleep_userdata = nullptr;
 
 	// PCL
 	sl::PCLOptions pcl_options;

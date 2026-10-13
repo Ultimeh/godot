@@ -71,6 +71,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "drivers/streamline/streamline.h"
 
 StreamlineContext &StreamlineContext::get() {
 	static StreamlineContext _context;
@@ -250,7 +251,15 @@ void StreamlineContext::reflex_set_options(const sl::ReflexOptions &opts) {
 
 	reflex_options = opts;
 	reflex_options_dirty = false;
-	sl::Result result = this->slReflexSetOptions ? this->slReflexSetOptions(opts) : sl::Result::eOk;
+	sl::Result result = sl::Result::eOk;
+	if (this->slReflexSetOptions) {
+		if (is_d3d12) {
+			result = this->slReflexSetOptions(opts);
+		} else {
+			MutexLock lock(Streamline::get_swap_chain_mutex()); // Sets the sleep mode on the swap chain.
+			result = this->slReflexSetOptions(opts);
+		}
+	}
 	ERR_FAIL_COND_MSG(result != sl::Result::eOk, StreamlineContext::result_to_string(result));
 }
 
@@ -277,6 +286,14 @@ void StreamlineContext::reflex_sleep(sl::FrameToken *frameToken) {
 		return;
 	}
 
+	if (latency_sleep_callback) {
+		if (!latency_sleep_callback(latency_sleep_userdata)) {
+			ERR_PRINT("Reflex: the Vulkan driver's sleep failed, slReflexSleep() is used from now on.");
+			latency_sleep_callback = nullptr;
+		}
+		return;
+	}
+
 	sl::Result result = this->slReflexSleep ? this->slReflexSleep(*frameToken) : sl::Result::eOk;
 	ERR_FAIL_COND_MSG(result != sl::Result::eOk, StreamlineContext::result_to_string(result));
 }
@@ -284,7 +301,15 @@ void StreamlineContext::reflex_sleep(sl::FrameToken *frameToken) {
 void StreamlineContext::reflex_get_state(sl::ReflexState &reflexState) {
 	STREAMLINE_GAME_ONLY; // Disable reflex for editor or project settings.
 
-	sl::Result result = this->slReflexGetState ? this->slReflexGetState(reflexState) : sl::Result::eOk;
+	sl::Result result = sl::Result::eOk;
+	if (this->slReflexGetState) {
+		if (is_d3d12) {
+			result = this->slReflexGetState(reflexState);
+		} else {
+			MutexLock lock(Streamline::get_swap_chain_mutex()); // Reads the swap chain's latency timings.
+			result = this->slReflexGetState(reflexState);
+		}
+	}
 	ERR_FAIL_COND_MSG(result != sl::Result::eOk, StreamlineContext::result_to_string(result));
 }
 
