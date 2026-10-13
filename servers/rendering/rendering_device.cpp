@@ -516,6 +516,18 @@ Error RenderingDevice::blas_build(RID p_blas) {
 
 	draw_graph->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
+	// The scratch memory of a build is about as large as the BLAS itself, and most BLASes are never built again: it
+	// goes once the GPU is done with this frame. blas_update() creates it again, and keeps it, for the ones refit.
+	// GODOT_RD_KEEP_BLAS_SCRATCH=1 keeps it.
+	static const bool keep_scratch = OS::get_singleton()->get_environment("GODOT_RD_KEEP_BLAS_SCRATCH") == "1";
+	if (!keep_scratch) {
+		Buffer to_dispose;
+		to_dispose.driver_id = blas->scratch_buffer;
+		to_dispose.size = driver->buffer_get_allocation_size(blas->scratch_buffer);
+		frames[frame].buffers_to_dispose_of.push_back(to_dispose);
+		blas->scratch_buffer = RDD::BufferID();
+	}
+
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
 
