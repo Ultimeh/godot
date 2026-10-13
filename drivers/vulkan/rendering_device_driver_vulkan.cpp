@@ -1990,12 +1990,88 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 
 #if defined(STREAMLINE_ENABLED)
 	if (Streamline::get_singleton()) {
+		_initialize_latency_sleep();
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_AFTER_DEVICE_CREATION);
 	}
 #endif
 
 	return OK;
 }
+
+#ifdef STREAMLINE_ENABLED
+void RenderingDeviceDriverVulkan::_initialize_latency_sleep() {
+	// sl.reflex sleeps through VK_NV_low_latency2 when Streamline enabled it on the device, NvLowLatencyVk otherwise.
+	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+	if (functions.GetDeviceProcAddr == nullptr) {
+		return;
+	}
+	device_functions.LatencySleepNV = PFN_vkLatencySleepNV(functions.GetDeviceProcAddr(vk_device, "vkLatencySleepNV"));
+	device_functions.WaitSemaphores = PFN_vkWaitSemaphores(functions.GetDeviceProcAddr(vk_device, "vkWaitSemaphores"));
+	if (device_functions.WaitSemaphores == nullptr) {
+		device_functions.WaitSemaphores = PFN_vkWaitSemaphores(functions.GetDeviceProcAddr(vk_device, "vkWaitSemaphoresKHR"));
+	}
+	if (device_functions.LatencySleepNV == nullptr || device_functions.WaitSemaphores == nullptr) {
+		return;
+	}
+
+	VkSemaphoreTypeCreateInfo type_info = {};
+	type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+	type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	type_info.initialValue = 0;
+
+	VkSemaphoreCreateInfo create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	create_info.pNext = &type_info;
+
+	VkResult err = vkCreateSemaphore(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &latency_sleep_semaphore);
+	ERR_FAIL_COND_MSG(err != VK_SUCCESS, vformat("Couldn't create the Reflex sleep semaphore (VkResult error %d).", err));
+
+	Streamline::get_singleton()->set_latency_sleep_callback(&_latency_sleep, this);
+}
+
+void RenderingDeviceDriverVulkan::_finalize_latency_sleep() {
+	if (latency_sleep_semaphore == VK_NULL_HANDLE) {
+		return;
+	}
+	Streamline::get_singleton()->set_latency_sleep_callback(nullptr, nullptr);
+	vkDestroySemaphore(vk_device, latency_sleep_semaphore, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE));
+	latency_sleep_semaphore = VK_NULL_HANDLE;
+}
+
+bool RenderingDeviceDriverVulkan::_latency_sleep(void *p_driver) {
+	RenderingDeviceDriverVulkan *driver = (RenderingDeviceDriverVulkan *)p_driver;
+
+	// slReflexSleep() calls vkLatencySleepNV and waits inside the same call, so its use of the swap chain cannot be
+	// serialized with the present without blocking the present for the whole sleep. vkLatencySleepNV returns at once:
+	// only it takes the lock, and the sleep is the wait on the semaphore it signals.
+	{
+		MutexLock lock(Streamline::get_swap_chain_mutex());
+		if (driver->latency_swap_chain == VK_NULL_HANDLE) {
+			return true;
+		}
+		driver->latency_sleep_value++;
+
+		VkLatencySleepInfoNV sleep_info = {};
+		sleep_info.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV;
+		sleep_info.signalSemaphore = driver->latency_sleep_semaphore;
+		sleep_info.value = driver->latency_sleep_value;
+
+		VkResult err = driver->device_functions.LatencySleepNV(driver->vk_device, driver->latency_swap_chain, &sleep_info);
+		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, false, vformat("vkLatencySleepNV failed (VkResult error %d).", err));
+	}
+
+	VkSemaphoreWaitInfo wait_info = {};
+	wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores = &driver->latency_sleep_semaphore;
+	wait_info.pValues = &driver->latency_sleep_value;
+
+	// 500 ms, the bound sl.reflex uses.
+	VkResult err = driver->device_functions.WaitSemaphores(driver->vk_device, &wait_info, 500000000);
+	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, false, vformat("Waiting for the Reflex sleep failed (VkResult %d).", err));
+	return true;
+}
+#endif
 
 /****************/
 /**** MEMORY ****/
@@ -3762,6 +3838,14 @@ void RenderingDeviceDriverVulkan::_swap_chain_release(SwapChain *swap_chain) {
 			SwappyVk_destroySwapchain(vk_device, swap_chain->vk_swapchain);
 		}
 #endif
+#ifdef STREAMLINE_ENABLED
+		{
+			MutexLock lock(Streamline::get_swap_chain_mutex());
+			if (latency_swap_chain == swap_chain->vk_swapchain) {
+				latency_swap_chain = VK_NULL_HANDLE;
+			}
+		}
+#endif
 		device_functions.DestroySwapchainKHR(vk_device, swap_chain->vk_swapchain, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR));
 		swap_chain->vk_swapchain = VK_NULL_HANDLE;
 	}
@@ -3976,6 +4060,14 @@ Error RenderingDeviceDriverVulkan::swap_chain_resize(CommandQueueID p_cmd_queue,
 	swap_create_info.clipped = true;
 	err = device_functions.CreateSwapchainKHR(vk_device, &swap_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SWAPCHAIN_KHR), &swap_chain->vk_swapchain);
 	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan swapchain (VkResult error %d).", err));
+
+#ifdef STREAMLINE_ENABLED
+	if (latency_sleep_semaphore != VK_NULL_HANDLE) {
+		// sl.reflex sets its sleep mode on the last swap chain created.
+		MutexLock lock(Streamline::get_swap_chain_mutex());
+		latency_swap_chain = swap_chain->vk_swapchain;
+	}
+#endif
 
 #if defined(SWAPPY_FRAME_PACING_ENABLED)
 	if (swappy_frame_pacer_enable) {
@@ -7765,6 +7857,7 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
 RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
 #if defined(STREAMLINE_ENABLED)
 	if (Streamline::get_singleton()) {
+		_finalize_latency_sleep();
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY);
 	}
 #endif

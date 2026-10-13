@@ -74,6 +74,11 @@ public:
 	// which requires external synchronization.
 	static Mutex &get_swap_chain_mutex();
 
+	// Vulkan with VK_NV_low_latency2: the driver issues the Reflex sleep instead of slReflexSleep(), so that only
+	// vkLatencySleepNV holds the swap chain mutex, not the wait. Returns false if it could not sleep.
+	typedef bool (*LatencySleepCallback)(void *p_userdata);
+	void set_latency_sleep_callback(LatencySleepCallback p_callback, void *p_userdata);
+
 	Streamline();
 	virtual ~Streamline();
 };
