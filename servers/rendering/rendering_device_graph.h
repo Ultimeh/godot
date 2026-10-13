@@ -923,6 +923,7 @@ private:
 	int32_t command_timestamp_index = -1;
 	int32_t command_synchronization_index = -1;
 	bool command_synchronization_pending = false;
+	int32_t command_tlas_build_index = -1;
 	BarrierGroup barrier_group;
 	bool driver_honors_barriers : 1;
 	bool driver_clears_with_copy_engine : 1;

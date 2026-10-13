@@ -407,6 +407,17 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		_add_adjacent_command(command_synchronization_index, p_command_index, r_command);
 	}
 
+	if (command_tlas_build_index >= 0) {
+		// Nothing recorded after a TLAS build starts before the build is done, as with the barrier NVIDIA's and Khronos's
+		// samples put right after it. Independent work overlapping the build left a faulty TLAS on NVIDIA.
+		_add_adjacent_command(command_tlas_build_index, p_command_index, r_command);
+		r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT;
+	}
+
+	if (r_command->type == RecordedCommand::TYPE_TOP_LEVEL_ACCELERATION_STRUCTURE_BUILD) {
+		command_tlas_build_index = p_command_index;
+	}
+
 	for (uint32_t i = 0; i < p_resource_count; i++) {
 		ResourceTracker *resource_tracker = p_resource_trackers[i];
 		DEV_ASSERT(resource_tracker != nullptr);
@@ -2375,6 +2386,7 @@ void RenderingDeviceGraph::begin() {
 	command_timestamp_index = -1;
 	command_synchronization_index = -1;
 	command_synchronization_pending = false;
+	command_tlas_build_index = -1;
 	command_label_index = -1;
 	frames[frame].secondary_command_buffers_used = 0;
 	draw_instruction_list.index = 0;
