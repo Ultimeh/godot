@@ -144,6 +144,9 @@ vec3 displace_vertex(DisplaceJob p_job, vec3 p_rest_position, TBNResult p_tbn, u
 	vec3 displaced = (inv_model * (inv_view_matrix * vec4(vertex, 1.0))).xyz;
 #elif defined(VERTEX_WORLD_COORDS_USED)
 	vec3 displaced = (inv_model * vec4(vertex, 1.0)).xyz;
+#elif defined(RT_MODELVIEW_WRITTEN)
+	// Through the MODELVIEW_MATRIX vertex() wrote (a billboard), as raster draws it, then back from view space.
+	vec3 displaced = (inv_model * (inv_view_matrix * (rt_modelview_matrix * vec4(vertex, 1.0)))).xyz;
 #else
 	vec3 displaced = vertex;
 #endif

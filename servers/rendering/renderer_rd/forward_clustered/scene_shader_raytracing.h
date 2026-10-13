@@ -367,7 +367,8 @@ public:
 		HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniforms;
 		Vector<TextureUniformInfo> texture_uniforms; // Sampler2D packed as bindless indices after UBO
 		bool uses_alpha_clip = false; // Writes ALPHA_SCISSOR_THRESHOLD; needs per-HG any-hit
-		bool writes_vertex = false; // vertex() moves VERTEX: the BLAS needs the displaced positions.
+		bool writes_vertex = false; // vertex() moves VERTEX or writes MODELVIEW_MATRIX: the BLAS needs the displaced positions.
+		bool writes_modelview = false; // vertex() writes MODELVIEW_MATRIX (billboards): raster draws VERTEX through it.
 		bool uses_vertex_time = false;
 		bool vertex_reads_camera = false; // vertex() reads the view or projection.
 		Vector<ShaderCompiler::GeneratedCode::Varying> varyings; // Interpolated by the hit shaders on displaced geometry.

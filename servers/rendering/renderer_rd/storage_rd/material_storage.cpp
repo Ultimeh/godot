@@ -2607,6 +2607,14 @@ String MaterialStorage::material_get_shader_code_rt(RID p_material) const {
 	return String();
 }
 
+String MaterialStorage::material_get_shader_path_hint(RID p_material) const {
+	const Material *material = material_owner.get_or_null(p_material);
+	if (material && material->shader) {
+		return material->shader->path_hint;
+	}
+	return String();
+}
+
 uint64_t MaterialStorage::material_get_shader_code_rt_hash(RID p_material) const {
 	const Material *material = material_owner.get_or_null(p_material);
 	if (material && material->shader) {

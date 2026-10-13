@@ -516,6 +516,8 @@ public:
 	String material_get_shader_code(RID p_material) const;
 	// Falls back to raster code when no RT variant is set.
 	String material_get_shader_code_rt(RID p_material) const;
+	// The resource path of the material's Shader: empty for the shaders BaseMaterial3D generates.
+	String material_get_shader_path_hint(RID p_material) const;
 	uint64_t material_get_shader_code_rt_hash(RID p_material) const;
 	uint64_t material_get_shader_code_rt_hash_b(RID p_material) const;
 

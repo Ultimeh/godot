@@ -1885,9 +1885,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// Colors declared with source_color in Godot shaders are stored in sRGB;
 	// material_get_param returns the raw sRGB value, so we convert to linear here.
 	// BaseMaterial3D's shaders are evaluated from their parameters (hit group 0); any other shader runs its own code, even
-	// when it names its uniforms as BaseMaterial3D does.
+	// when it names its uniforms as BaseMaterial3D does. A Shader resource converted from a StandardMaterial3D keeps the
+	// generated header, often with an edited vertex(): only the generated shaders have no resource path.
 	Variant albedo_var = material_storage->material_get_param(p_material_rid, "albedo");
-	if (albedo_var.get_type() == Variant::COLOR && material_storage->material_get_shader_code_rt(p_material_rid).begins_with("// NOTE: Shader automatically converted from ")) {
+	if (albedo_var.get_type() == Variant::COLOR && material_storage->material_get_shader_path_hint(p_material_rid).is_empty() &&
+			material_storage->material_get_shader_code_rt(p_material_rid).begins_with("// NOTE: Shader automatically converted from ")) {
 		Color c = ((Color)albedo_var).srgb_to_linear();
 		mat.albedo_color[0] = c.r;
 		mat.albedo_color[1] = c.g;

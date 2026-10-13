@@ -782,6 +782,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	actions.usage_flag_pointers["ALPHA_HASH_SCALE"] = &detected_alpha_clip;
 	bool writes_vertex = false;
 	actions.write_flag_pointers["VERTEX"] = &writes_vertex;
+	bool writes_modelview = false;
+	actions.write_flag_pointers["MODELVIEW_MATRIX"] = &writes_modelview;
 
 	HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniform_sink;
 	actions.uniforms = &uniform_sink;
@@ -796,7 +798,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 
 	r_entry.is_procedural = p_is_procedural;
 	r_entry.uses_alpha_clip = detected_alpha_clip;
-	r_entry.writes_vertex = writes_vertex && !p_is_procedural;
+	r_entry.writes_vertex = (writes_vertex || writes_modelview) && !p_is_procedural;
+	r_entry.writes_modelview = writes_modelview && !p_is_procedural;
 	r_entry.uses_vertex_time = gen_code.uses_vertex_time;
 	r_entry.varyings = gen_code.varyings;
 	for (const String &define : gen_code.defines) {
@@ -886,7 +889,7 @@ RID SceneShaderRaytracing::get_displace_pipeline(uint32_t p_slot_index, RID &r_s
 	}
 
 	String source = displace_template;
-	source = source.replace("/* RT_CUSTOM_DEFINES */", entry->defines);
+	source = source.replace("/* RT_CUSTOM_DEFINES */", entry->defines + (entry->writes_modelview ? "\n#define RT_MODELVIEW_WRITTEN\n" : ""));
 	source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry->fragment_globals);
 	source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", entry->uniform_members.is_empty() ? String("float _rt_pad;") : entry->uniform_members);
 	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
