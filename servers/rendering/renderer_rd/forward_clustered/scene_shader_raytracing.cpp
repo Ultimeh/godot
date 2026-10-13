@@ -802,8 +802,11 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.writes_modelview = writes_modelview && !p_is_procedural;
 	r_entry.uses_vertex_time = gen_code.uses_vertex_time;
 	r_entry.varyings = gen_code.varyings;
+	// The render modes the hit group and displacement templates test. Without DO_SIDE_CHECK a double-sided material's
+	// back face kept its normal, without SPECULAR_DISABLED and MODE_UNSHADED those render modes did nothing.
 	for (const String &define : gen_code.defines) {
-		if (define.contains("SKIP_TRANSFORM_USED") || define.contains("VERTEX_WORLD_COORDS_USED")) {
+		if (define.contains("SKIP_TRANSFORM_USED") || define.contains("VERTEX_WORLD_COORDS_USED") || define.contains("DO_SIDE_CHECK") ||
+				define.contains("SPECULAR_DISABLED") || define.contains("MODE_UNSHADED")) {
 			r_entry.defines += define;
 		}
 	}

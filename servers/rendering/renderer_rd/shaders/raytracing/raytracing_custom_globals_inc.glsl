@@ -150,6 +150,13 @@ void rt_set_fragment_inputs(vec3 p_bary) {
 	tangent = normalize(mat3(rt_modelview_matrix) * tangent);
 	binormal = normalize(mat3(rt_modelview_matrix) * binormal);
 #endif
+#if defined(DO_SIDE_CHECK)
+	// A back face's normal turned toward the ray, as raster turns it toward the camera: a double-sided grass blade seen
+	// from behind was shaded as if seen at a grazing angle, its Fresnel reflection white.
+	if (!rt_front_facing) {
+		normal = -normal;
+	}
+#endif
 }
 
 vec3 rt_saved_vertex;
