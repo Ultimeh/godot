@@ -1820,6 +1820,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_blend_sharpness = 1.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.backlight[0] = 0.0f;
+	mat.backlight[1] = 0.0f;
+	mat.backlight[2] = 0.0f;
+	mat.backlight_texture_idx = 0;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -2124,6 +2128,24 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_ALBEDO;
 			if (code.contains("// Vertex Color is sRGB: Enabled")) {
 				mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_SRGB;
+			}
+		}
+		if (code.contains(", specular_disabled")) {
+			mat.flags |= RT_MAT_FLAG_SPECULAR_DISABLED;
+		}
+		if (code.contains("BACKLIGHT = (backlight.rgb")) {
+			mat.flags |= RT_MAT_FLAG_BACKLIGHT;
+			Variant backlight_var = material_storage->material_get_param(p_material_rid, "backlight");
+			if (backlight_var.get_type() == Variant::COLOR) {
+				const Color c = ((Color)backlight_var).srgb_to_linear();
+				mat.backlight[0] = c.r;
+				mat.backlight[1] = c.g;
+				mat.backlight[2] = c.b;
+			}
+			const RID backlight_rd = get_material_texture("texture_backlight", true);
+			if (backlight_rd.is_valid()) {
+				mat.backlight_texture_idx = bindless_block->add_texture(backlight_rd);
+				mat.flags |= RT_MAT_FLAG_HAS_BACKLIGHT_TEX;
 			}
 		}
 		if (code.contains("// Emission: Enabled")) {

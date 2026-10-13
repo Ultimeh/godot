@@ -107,7 +107,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 112 bytes).
+// Must match GLSL MaterialData (std430, 128 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -129,8 +129,10 @@ struct alignas(16) RT_MaterialData {
 	float uv1_offset_z;
 	float uv1_blend_sharpness;
 	uint32_t instance_uniforms_ofs; // The instance's `instance uniform` values in the global shader uniform buffer.
+	float backlight[3]; // BaseMaterial3D's backlight color, linear (RT_MAT_FLAG_BACKLIGHT).
+	uint32_t backlight_texture_idx; // Added to it (RT_MAT_FLAG_HAS_BACKLIGHT_TEX).
 };
-static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 128, "RT_MaterialData must be 128 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -191,6 +193,9 @@ enum {
 	RT_MAT_FLAG_UNSHADED = 128u,
 	RT_MAT_FLAG_VERTEX_COLOR_ALBEDO = 256u,
 	RT_MAT_FLAG_VERTEX_COLOR_SRGB = 512u,
+	RT_MAT_FLAG_SPECULAR_DISABLED = 1024u, // No specular from the lights (render_mode specular_disabled).
+	RT_MAT_FLAG_BACKLIGHT = 2048u,
+	RT_MAT_FLAG_HAS_BACKLIGHT_TEX = 4096u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

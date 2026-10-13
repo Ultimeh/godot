@@ -264,17 +264,31 @@ float lights_shadow_visibility(RTLightData p_light, vec3 p_origin, vec3 p_direct
 	return lights_trace_shadow_ray(p_origin, p_direction, p_max_dist, rng_state) ? 1.0 : 1.0 - p_light.shadow_opacity;
 }
 
+// BACKLIGHT as raster's light_compute() adds it: light_color * (1 / PI - diffuse_brdf_NL) * backlight, times the
+// diffuse albedo raster multiplies all its diffuse light by.
+vec3 lights_backlight_term(vec3 p_brdf_diffuse, MaterialProperties p_material, vec3 p_backlight) {
+	vec3 diffuse_reflectance = baseColorToDiffuseReflectance(p_material.baseColor, p_material.metalness);
+	return max(diffuse_reflectance * ONE_OVER_PI - p_brdf_diffuse, vec3(0.0)) * p_backlight;
+}
+
 // Evaluate direct lighting using NEE with stochastic light selection.
 // Uses mini-batch reservoir sampling for importance-weighted light selection.
+// A light behind the surface reaches it only through BACKLIGHT, and its shadow ray then leaves from hit_pos_back, on
+// that side of the surface.
 vec3 lights_evaluate_direct_lighting(
 		vec3 hit_pos,
+		vec3 hit_pos_back,
+		vec3 geometry_normal,
 		vec3 N,
 		vec3 V,
 		MaterialProperties material,
+		vec3 backlight,
+		bool specular_disabled,
 		inout uint rng_state,
 		bool is_indirect_bounce,
 		uint light_count,
 		uint layer_mask) {
+	bool has_backlight = any(greaterThan(backlight, vec3(0.0)));
 	if (light_count == 0u) {
 		return vec3(0.0);
 	}
@@ -360,7 +374,8 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		float visibility = lights_shadow_visibility(light, hit_pos, L, shadow_dist, rng_state);
+		bool through = has_backlight && dot(geometry_normal, L) < 0.0;
+		float visibility = lights_shadow_visibility(light, through ? hit_pos_back : hit_pos, L, shadow_dist, rng_state);
 		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
@@ -374,8 +389,11 @@ vec3 lights_evaluate_direct_lighting(
 		ls_atten.distance_sq = dist_sq;
 		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation) * spot_atten;
 
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+		float spec_mul = specular_disabled ? 0.0 : lights_get_specular_multiplier(light.specular_amount, material.roughness);
 		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+		if (has_backlight) {
+			brdf_value += lights_backlight_term(brdf_diffuse, material, backlight);
+		}
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
@@ -389,12 +407,12 @@ vec3 lights_evaluate_direct_lighting(
 		float light_pdf;
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
 
-		float NdotL = dot(N, L);
-		if (NdotL <= 0.0) {
+		if (!has_backlight && dot(N, L) <= 0.0) {
 			return vec3(0.0);
 		}
 
-		float visibility = lights_shadow_visibility(light, hit_pos, L, ls.max_distance, rng_state);
+		bool through = has_backlight && dot(geometry_normal, L) < 0.0;
+		float visibility = lights_shadow_visibility(light, through ? hit_pos_back : hit_pos, L, ls.max_distance, rng_state);
 		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
@@ -402,8 +420,11 @@ vec3 lights_evaluate_direct_lighting(
 		vec3 brdf_diffuse, brdf_specular;
 		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
 
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+		float spec_mul = specular_disabled ? 0.0 : lights_get_specular_multiplier(light.specular_amount, material.roughness);
 		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+		if (has_backlight) {
+			brdf_value += lights_backlight_term(brdf_diffuse, material, backlight);
+		}
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 

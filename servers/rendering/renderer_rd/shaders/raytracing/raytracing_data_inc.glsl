@@ -114,6 +114,8 @@ struct MaterialData {
 	float uv1_offset_z;
 	float uv1_blend_sharpness;
 	uint instance_uniforms_ofs; // The instance's `instance uniform` values in the global shader uniform buffer.
+	vec3 backlight; // BaseMaterial3D's backlight color (MAT_FLAG_BACKLIGHT).
+	uint backlight_texture_idx; // Added to it (MAT_FLAG_HAS_BACKLIGHT_TEX).
 };
 
 #define MAT_FLAG_UV1_TRIPLANAR 8u
@@ -123,6 +125,9 @@ struct MaterialData {
 #define MAT_FLAG_UNSHADED 128u
 #define MAT_FLAG_VERTEX_COLOR_ALBEDO 256u
 #define MAT_FLAG_VERTEX_COLOR_SRGB 512u
+#define MAT_FLAG_SPECULAR_DISABLED 1024u
+#define MAT_FLAG_BACKLIGHT 2048u
+#define MAT_FLAG_HAS_BACKLIGHT_TEX 4096u
 
 /// BaseMaterial3D's vertex color, as its albedo_tex *= COLOR reads it.
 vec4 material_vertex_color(vec4 p_color, uint p_flags) {

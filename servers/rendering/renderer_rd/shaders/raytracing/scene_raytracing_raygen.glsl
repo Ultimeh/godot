@@ -451,6 +451,14 @@ void main() {
 #else
 	m.unshaded = false;
 #endif
+	m.ao = clamp(ao, 0.0, 1.0);
+	m.ao_light_affect = clamp(ao_light_affect, 0.0, 1.0);
+	m.backlight = max(backlight, vec3(0.0));
+#ifdef SPECULAR_DISABLED
+	m.specular_disabled = true;
+#else
+	m.specular_disabled = false;
+#endif
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 	if (any(isnan(m.normal))) {
 		m.normal = h.geometry_normal; // Material code can leave NaN normals (screen derivatives are zero here).
@@ -589,6 +597,16 @@ void main() {
 	m.emissive = emissive;
 	m.normal = final_normal;
 	m.unshaded = (mat.flags & MAT_FLAG_UNSHADED) != 0u;
+	m.ao = 1.0;
+	m.ao_light_affect = 0.0;
+	m.backlight = vec3(0.0);
+	if ((mat.flags & MAT_FLAG_BACKLIGHT) != 0u) {
+		m.backlight = mat.backlight;
+		if ((mat.flags & MAT_FLAG_HAS_BACKLIGHT_TEX) != 0u) {
+			m.backlight += (triplanar ? sample_material_triplanar(mat.backlight_texture_idx, triplanar_weights, triplanar_pos, triplanar_ddx, triplanar_ddy, mat.flags) : sample_material_texture_grad(mat.backlight_texture_idx, uv, uv_ddx, uv_ddy, mat.flags)).rgb;
+		}
+	}
+	m.specular_disabled = (mat.flags & MAT_FLAG_SPECULAR_DISABLED) != 0u;
 
 #ifdef RT_DEBUG_ENABLED
 	{
