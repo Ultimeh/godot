@@ -137,7 +137,15 @@ void main() {
 			uint front_layer_bounces = min(max_bounces, 1u);
 			[[dont_unroll]] for (uint bounce = 0u; bounce <= front_layer_bounces; bounce++) {
 				path_pack(payload, rs);
+#ifdef USE_SER
+				// Reflections off a window diverge as much as camera bounces: regrouped by what they hit, as above.
+				hitObjectEXT hitObject;
+				hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+				reorderThreadEXT(hitObject, hitObjectIsHitEXT(hitObject) ? hitObjectGetInstanceIdEXT(hitObject) : 0u, 8);
+				hitObjectExecuteShaderEXT(hitObject, 0);
+#else
 				traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+#endif
 				rs = path_unpack(payload);
 				if (is_path_terminated(rs.packed_bounces_flags)) {
 					break;
