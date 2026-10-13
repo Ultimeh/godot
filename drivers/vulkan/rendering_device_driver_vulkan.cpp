@@ -6663,10 +6663,20 @@ void RenderingDeviceDriverVulkan::_acceleration_structure_create(VkAccelerationS
 #endif
 }
 
+// GODOT_RT_LOG_AS=1 prints each acceleration structure's device address when it is named, built, refit and freed, to
+// match an address the ray tracing validation reports (FAULTY_AS) with its object.
+static bool _log_acceleration_structures() {
+	static const bool log = OS::get_singleton()->get_environment("GODOT_RT_LOG_AS") == "1";
+	return log;
+}
+
 void RenderingDeviceDriverVulkan::acceleration_structure_free(AccelerationStructureID p_acceleration_structure) {
 #if VULKAN_RAYTRACING_ENABLED
 	AccelerationStructureInfo *accel_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 	ERR_FAIL_NULL_MSG(accel_info, "Vulkan raytracing acceleration structure input parameter is not valid.");
+	if (_log_acceleration_structures()) {
+		print_line("RT AS free 0x" + String::num_uint64(accel_info->cached_device_address, 16));
+	}
 	if (accel_info->buffer) {
 		buffer_free(accel_info->buffer);
 	}
@@ -6711,6 +6721,9 @@ void RenderingDeviceDriverVulkan::command_build_blas(CommandBufferID p_cmd_buffe
 	build_info->scratchData.deviceAddress = _align_up_address(scratch_address, accel_info->scratch_alignment);
 
 	const VkAccelerationStructureBuildRangeInfoKHR *range_infos = accel_info->range_infos.ptr();
+	if (_log_acceleration_structures()) {
+		print_line("RT AS build 0x" + String::num_uint64(accel_info->cached_device_address, 16));
+	}
 
 	vkCmdBuildAccelerationStructuresKHR(command_buffer->vk_command_buffer, 1, build_info, &range_infos);
 #endif
@@ -6723,6 +6736,9 @@ void RenderingDeviceDriverVulkan::command_update_blas(CommandBufferID p_cmd_buff
 
 	VkAccelerationStructureBuildGeometryInfoKHR *build_info = &accel_info->build_info;
 	build_info->mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+	if (_log_acceleration_structures()) {
+		print_line("RT AS refit 0x" + String::num_uint64(accel_info->cached_device_address, 16));
+	}
 	build_info->srcAccelerationStructure = accel_info->vk_acceleration_structure;
 	build_info->dstAccelerationStructure = accel_info->vk_acceleration_structure;
 	VkDeviceAddress scratch_address = buffer_get_device_address(p_scratch_buffer);
@@ -7446,6 +7462,9 @@ void RenderingDeviceDriverVulkan::set_object_name(ObjectType p_type, ID p_driver
 		case OBJECT_TYPE_ACCELERATION_STRUCTURE: {
 			const AccelerationStructureInfo *asi = (const AccelerationStructureInfo *)p_driver_id.id;
 			_set_object_name(VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, (uint64_t)asi->vk_acceleration_structure, p_name);
+			if (_log_acceleration_structures()) {
+				print_line("RT AS name 0x" + String::num_uint64(asi->cached_device_address, 16) + " " + p_name);
+			}
 		} break;
 		case OBJECT_TYPE_RAYTRACING_PIPELINE: {
 			_set_object_name(VK_OBJECT_TYPE_PIPELINE, (uint64_t)p_driver_id.id, p_name);
