@@ -1881,6 +1881,29 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 // Material processing
 // ---------------------------------------------------------------------------
 
+RTMaterialData *RenderRaytracing::_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out) {
+	// A neutral standard material, so the ground and the walls do not vanish for the seconds a new pipeline takes to
+	// compile (a pipeline cache miss: a new shader or engine version). Cut-out and billboard materials wait: their shape
+	// comes from their shader, a grey card would be worse than nothing.
+	if (p_cut_out) {
+		return nullptr;
+	}
+	const SceneShaderRaytracing::CustomShaderEntry *entry = SceneShaderRaytracing::get_singleton()->get_custom_shader_entry(p_mat_data->rt_sbt_offset);
+	if (!entry || entry->writes_modelview || entry->uses_alpha_clip || entry->alpha_texture_buffer_offset != UINT32_MAX) {
+		return nullptr;
+	}
+	static RTMaterialData s_compiling_mat;
+	static bool s_compiling_mat_initialized = false;
+	if (!s_compiling_mat_initialized) {
+		s_compiling_mat = *process_material(RID(), 0);
+		for (int i = 0; i < 3; i++) {
+			s_compiling_mat.data.albedo_color[i] = 0.3f;
+		}
+		s_compiling_mat_initialized = true;
+	}
+	return &s_compiling_mat;
+}
+
 RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t p_material_invalidation_counter) {
 	// Static default material for invalid/null materials
 	static RTMaterialData s_default_mat;
@@ -3269,8 +3292,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
-					mm_surf = mm_surf->next;
-					continue;
+					const SceneShaderForwardClustered::ShaderData *cut_shader = mm_surf->shader;
+					mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
+					if (!mat_data) {
+						mm_surf = mm_surf->next;
+						continue;
+					}
 				}
 
 				uint32_t inst_flags = 0;
@@ -3442,8 +3469,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
-				surf = surf->next;
-				continue;
+				const SceneShaderForwardClustered::ShaderData *cut_shader = surf->shader;
+				mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
+				if (!mat_data) {
+					surf = surf->next;
+					continue;
+				}
 			}
 
 			// Compute or reuse cached final transform (instance * aabb_transform for compressed meshes).
