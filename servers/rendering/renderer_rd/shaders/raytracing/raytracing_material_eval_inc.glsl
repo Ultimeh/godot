@@ -21,7 +21,7 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	MaterialResult r;
 	r.albedo = vec3(0.8);
 	r.alpha = 1.0;
-	r.roughness = 0.5;
+	r.roughness = 1.0; // BaseMaterial3D's default, as raster.
 	r.metalness = 0.0;
 	r.specular = 0.5;
 	r.emissive = vec3(0.0);

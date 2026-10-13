@@ -143,11 +143,11 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 #endif
 }
 
-// Fragment outputs with sensible defaults.
+// Fragment outputs with raster's defaults (scene_forward_clustered.glsl): a shader that leaves ROUGHNESS alone is rough.
 vec3 albedo = vec3(1.0);
 float alpha = 1.0;
 float metallic = 0.0;
-float roughness = 0.5;
+float roughness = 1.0;
 float specular = 0.5;
 vec3 emission = vec3(0.0);
 vec3 normal_map = vec3(0.5, 0.5, 1.0);
