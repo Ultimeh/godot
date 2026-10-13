@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
@@ -63,6 +64,18 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.version_shader[i] = mm_merge_shader.shader.version_get_shader(mm_merge_shader.version, i);
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
+
+	Vector<String> compact_modes;
+	compact_modes.push_back("\n#define MODE_MARK\n");
+	compact_modes.push_back("\n#define MODE_ASSIGN\n");
+	compact_modes.push_back("\n#define MODE_REMAP\n");
+	lod_compact_shader.shader.initialize(compact_modes);
+	lod_compact_shader.version = lod_compact_shader.shader.version_create();
+	for (int i = 0; i < LodCompactShader::MODE_MAX; i++) {
+		lod_compact_shader.version_shader[i] = lod_compact_shader.shader.version_get_shader(lod_compact_shader.version, i);
+		lod_compact_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(lod_compact_shader.version_shader[i]);
+	}
+	lod_view_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
 
 	Vector<String> fog_modes;
 	fog_modes.push_back("\n");
@@ -99,6 +112,10 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
+	lod_compact_shader.shader.version_free(lod_compact_shader.version);
+	if (lod_view_dummy_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(lod_view_dummy_buffer);
+	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 }
 
@@ -181,41 +198,41 @@ void RenderRaytracing::rt_ensure_textures(RenderSceneBuffersRD *p_render_buffers
 			RD::TEXTURE_USAGE_SAMPLING_BIT |
 			RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 
-	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING)) {
-		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING)) {
+		p_render_buffers->create_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
-	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH)) {
-		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH)) {
+		p_render_buffers->create_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
-	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER)) {
-		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER)) {
+		p_render_buffers->create_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
 }
 
 bool RenderRaytracing::rt_has_texture(RenderSceneBuffersRD *p_render_buffers) const {
-	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING);
+	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING);
 }
 
 RID RenderRaytracing::rt_get_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING);
+	return p_render_buffers->get_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING);
 }
 
 bool RenderRaytracing::rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const {
-	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH);
+	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH);
 }
 
 RID RenderRaytracing::rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH);
+	return p_render_buffers->get_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH);
 }
 
 RID RenderRaytracing::rt_get_front_layer_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER)) {
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER)) {
 		return RID();
 	}
-	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_FRONT_LAYER);
+	return p_render_buffers->get_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER);
 }
 
 void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -360,6 +377,10 @@ void RenderRaytracing::cleanup_caches() {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					// Unless the mesh was freed first, which frees the BLAS built from its buffers.
+					if (entry->ptr->blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+						RD::get_singleton()->free_rid(entry->ptr->blas);
+					}
 					memdelete(entry->ptr);
 					entry->ptr = nullptr;
 				}
@@ -439,6 +460,11 @@ void RenderRaytracing::cleanup_caches() {
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
 
+	for (KeyValue<RTLodViewKey, RTLodView> &kv : lod_views) {
+		_free_lod_view(kv.value);
+	}
+	lod_views.clear();
+
 	// Free all cached material data
 	for (uint32_t i = 0; i < material_chunks.size(); i++) {
 		if (material_chunks[i]) {
@@ -461,12 +487,37 @@ void RenderRaytracing::cleanup_caches() {
 	}
 	material_chunks.clear();
 
+	// Every slot is free again: the pool goes too, mat_ubo_pool_ensure_initialized() makes it again.
+	if (mat_ubo_pool_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
+		mat_ubo_pool_buffer = RID();
+	}
+	mat_ubo_pool_bda = 0;
+	mat_ubo_pool_free_slots.clear();
+	mat_ubo_pool_free_count = 0;
+	mat_ubo_pool_next_slot = 0;
+
 	// Reset counters
 	material_free_slots.clear();
 	next_material_slot = 0;
 	vram_used = 0;
+	last_trace_frame = 0;
 	cache_hits = 0;
 	cache_misses = 0;
+}
+
+void RenderRaytracing::free_caches_if_unused() {
+	// A few frames of margin: a view can skip frames (an UPDATE_WHEN_VISIBLE SubViewport), and rebuilding the caches
+	// is a hitch.
+	const uint32_t RT_UNUSED_FRAMES = 10;
+	if (last_trace_frame == 0 || RSG::rasterizer->get_frame_number() - last_trace_frame <= RT_UNUSED_FRAMES) {
+		return;
+	}
+	for (KeyValue<RenderSceneBuffersRD *, RTViewportState *> &kv : viewport_states) {
+		_free_viewport_state_internal(kv.value);
+	}
+	viewport_states.clear();
+	cleanup_caches();
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +692,17 @@ void RenderRaytracing::prepare_frame() {
 				e->replicated_idx_buffer = RID();
 			}
 			merged_mm_pool.free(live[i]);
+		}
+
+		LocalVector<RTLodViewKey> stale;
+		for (KeyValue<RTLodViewKey, RTLodView> &kv : lod_views) {
+			if (current_frame - kv.value.last_used_frame > MM_BLAS_CACHE_TTL) {
+				_free_lod_view(kv.value);
+				stale.push_back(kv.key);
+			}
+		}
+		for (const RTLodViewKey &key : stale) {
+			lod_views.erase(key);
 		}
 	}
 
@@ -2183,6 +2245,101 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 // Merged MultiMesh BLAS builder
 // ---------------------------------------------------------------------------
 
+void RenderRaytracing::_free_lod_view(RTLodView &p_view) {
+	RD *rd = RD::get_singleton();
+	if (p_view.vertex_remap_buffer.is_valid()) {
+		rd->free_rid(p_view.vertex_remap_buffer);
+		p_view.vertex_remap_buffer = RID();
+	}
+	if (p_view.index_buffer.is_valid()) {
+		rd->free_rid(p_view.index_buffer);
+		p_view.index_buffer = RID();
+	}
+}
+
+const RTLodView *RenderRaytracing::_get_lod_view(void *p_mesh_surface, uint32_t p_lod) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(p_mesh_surface);
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	RTLodViewKey key;
+	key.surface = p_mesh_surface;
+	key.lod = p_lod;
+
+	RTLodView *view = lod_views.getptr(key);
+	if (view && view->surface_counter != surface_counter) {
+		_free_lod_view(*view);
+		lod_views.erase(key);
+		view = nullptr;
+	}
+	if (view) {
+		view->last_used_frame = current_frame;
+		return view;
+	}
+
+	const RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, p_lod);
+	const uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, p_lod);
+	const uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	ERR_FAIL_COND_V(!index_buffer.is_valid() || index_count == 0 || vertex_count == 0, nullptr);
+
+	// Built on the GPU: reading the indices back would stall it in the middle of the frame.
+	RD *rd = RD::get_singleton();
+	const uint32_t kept_bound = MIN(vertex_count, index_count);
+	Vector<uint8_t> zeros;
+	zeros.resize(MAX(vertex_count * uint32_t(sizeof(uint32_t)), 16u));
+	memset(zeros.ptrw(), 0, zeros.size());
+
+	RTLodView new_view;
+	new_view.vertex_count = kept_bound;
+	new_view.index_count = index_count;
+	new_view.surface_counter = surface_counter;
+	new_view.last_used_frame = current_frame;
+	new_view.vertex_remap_buffer = rd->storage_buffer_create(kept_bound * sizeof(uint32_t), Span<uint8_t>(zeros.ptr(), kept_bound * sizeof(uint32_t)));
+	new_view.index_buffer = rd->storage_buffer_create(index_count * sizeof(uint32_t));
+	const RID kept_buffer = rd->storage_buffer_create(vertex_count * sizeof(uint32_t), Span<uint8_t>(zeros.ptr(), vertex_count * sizeof(uint32_t)));
+	const RID counter_buffer = rd->storage_buffer_create(16, Span<uint8_t>(zeros.ptr(), 16));
+	if (!new_view.vertex_remap_buffer.is_valid() || !new_view.index_buffer.is_valid() || !kept_buffer.is_valid() || !counter_buffer.is_valid()) {
+		_free_lod_view(new_view);
+		if (kept_buffer.is_valid()) {
+			rd->free_rid(kept_buffer);
+		}
+		if (counter_buffer.is_valid()) {
+			rd->free_rid(counter_buffer);
+		}
+		ERR_FAIL_V(nullptr);
+	}
+	rd->set_resource_name(new_view.vertex_remap_buffer, "RT LOD vertex remap");
+	rd->set_resource_name(new_view.index_buffer, "RT LOD indices");
+
+	Vector<RD::Uniform> uniforms;
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, kept_buffer));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, counter_buffer));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, new_view.vertex_remap_buffer));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, new_view.index_buffer));
+	const RID uniform_set = rd->uniform_set_create(uniforms, lod_compact_shader.version_shader[0], 0, /*p_linear_pool=*/true);
+
+	const uint64_t index_address = rd->buffer_get_device_address(index_buffer);
+	const uint32_t params[8] = { uint32_t(index_address), uint32_t(index_address >> 32), index_count, vertex_count <= 65536 ? 1u : 0u, vertex_count, 0, 0, 0 };
+	const uint32_t threads[LodCompactShader::MODE_MAX] = { index_count, vertex_count, index_count };
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	for (int mode = 0; mode < LodCompactShader::MODE_MAX; mode++) {
+		if (mode > 0) {
+			rd->compute_list_add_barrier(compute_list);
+		}
+		rd->compute_list_bind_compute_pipeline(compute_list, lod_compact_shader.pipeline[mode]);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+		rd->compute_list_set_push_constant(compute_list, params, sizeof(params));
+		rd->compute_list_dispatch_threads(compute_list, threads[mode], 1, 1);
+	}
+	rd->compute_list_end();
+
+	// Freed once the GPU is done with this frame.
+	rd->free_rid(uniform_set);
+	rd->free_rid(kept_buffer);
+	rd->free_rid(counter_buffer);
+	return &lod_views.insert(key, new_view)->value;
+}
+
 bool RenderRaytracing::_build_merged_mm_blas(
 		RID p_mm_rid,
 		RID p_mm_gpu_buffer,
@@ -2190,15 +2347,29 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		uint32_t p_mm_count,
 		uint32_t p_surface_index,
 		uint32_t p_surface_counter,
+		uint32_t p_lod,
 		RD::ComputeListID p_compute_list,
 		LocalVector<RID> &r_dirty_blas_list,
 		LocalVector<RID> &r_dirty_blas_update_list,
 		RTSurfaceData *r_surf_data) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
-	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	// Vertices of the source mesh, and of every instance in the merged buffers (fewer than the mesh's for a LOD).
+	const uint32_t src_vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	uint32_t vertex_count = src_vertex_count;
 	RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
 	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
+	const RTLodView *lod_view = nullptr;
+	if (p_lod > 0) {
+		// Looked up (and created) in phase 1; this only finds it.
+		lod_view = lod_views.getptr({ p_mesh_surface, p_lod });
+		if (lod_view) {
+			vertex_count = lod_view->vertex_count;
+			index_buffer = lod_view->index_buffer;
+			index_count = lod_view->index_count;
+		}
+	}
+	const uint32_t lod = lod_view ? p_lod : 0;
 	bool indexed = index_buffer.is_valid() && index_count > 0;
 	uint32_t prim_count = indexed ? (index_count / 3) : (vertex_count / 3);
 
@@ -2275,7 +2446,8 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	const bool transforms_changed = (entry.cached_mm_last_change != mm_last_change);
 
 	bool structure_changed = (entry.last_mm_count != p_mm_count ||
-			entry.last_surface_counter != p_surface_counter);
+			entry.last_surface_counter != p_surface_counter ||
+			entry.last_lod != lod);
 
 	entry.indexed = indexed;
 
@@ -2288,6 +2460,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		entry.blas_built_once = false;
 		entry.last_mm_count = p_mm_count;
 		entry.last_surface_counter = p_surface_counter;
+		entry.last_lod = lod;
 	}
 
 	bool has_normal = surface_format & RSE::ARRAY_FORMAT_NORMAL;
@@ -2303,7 +2476,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		tbn_stride = 4; // 1 × uint32 (normal oct only)
 	}
 	// Byte offset of the TBN block in the source vertex buffer.
-	uint32_t src_tbn_byte_offset = vertex_count * 12; // after all float3 positions
+	uint32_t src_tbn_byte_offset = src_vertex_count * 12; // after all float3 positions
 
 	// Merged vertex buffer: [float3 pos × N*V] + [packed TBN × N*V] (if TBN present).
 	uint32_t merged_vtx_bytes = p_mm_count * vertex_count * 12 + (has_tbn ? p_mm_count * vertex_count * tbn_stride : 0);
@@ -2322,8 +2495,8 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT |
 			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
 
-	// --- Grow / allocate merged vertex buffer ---
-	if (!entry.merged_vtx_buffer.is_valid() || entry.vtx_capacity_bytes < merged_vtx_bytes) {
+	// --- Allocate the merged vertex buffer; it shrinks too, as a distant MultiMesh switches to a lighter LOD ---
+	if (!entry.merged_vtx_buffer.is_valid() || entry.vtx_capacity_bytes < merged_vtx_bytes || entry.vtx_capacity_bytes / 2 > merged_vtx_bytes) {
 		if (entry.merged_vtx_buffer.is_valid()) {
 			rd->free_rid(entry.merged_vtx_buffer);
 			entry.merged_vtx_buffer = RID();
@@ -2335,8 +2508,8 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		entry.blas_built_once = false;
 	}
 
-	// --- Grow / allocate merged attribute buffer ---
-	if (!entry.merged_attr_buffer.is_valid() || entry.attr_capacity_bytes < merged_attr_bytes) {
+	// --- Allocate the merged attribute buffer ---
+	if (!entry.merged_attr_buffer.is_valid() || entry.attr_capacity_bytes < merged_attr_bytes || entry.attr_capacity_bytes / 2 > merged_attr_bytes) {
 		if (entry.merged_attr_buffer.is_valid()) {
 			rd->free_rid(entry.merged_attr_buffer);
 			entry.merged_attr_buffer = RID();
@@ -2347,10 +2520,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		rd->set_resource_name(entry.merged_attr_buffer, "RT MM merged attr [" + itos(cache_key) + "]");
 	}
 
-	// --- Grow / allocate replicated index buffer ---
+	// --- Allocate the replicated index buffer ---
 	if (indexed) {
 		uint32_t needed_idx = p_mm_count * index_count;
-		if (!entry.replicated_idx_buffer.is_valid() || entry.idx_capacity < needed_idx) {
+		if (!entry.replicated_idx_buffer.is_valid() || entry.idx_capacity < needed_idx || entry.idx_capacity / 2 > needed_idx) {
 			if (entry.replicated_idx_buffer.is_valid()) {
 				rd->free_rid(entry.replicated_idx_buffer);
 				entry.replicated_idx_buffer = RID();
@@ -2399,6 +2572,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			push_buf(3, src_attr_buf);
 			if (indexed) {
 				push_buf(4, entry.replicated_idx_buffer);
+				// Bound, not read through addresses: the graph orders the LOD view's compaction before this pass.
+				push_buf(5, lod_view ? lod_view->vertex_remap_buffer : lod_view_dummy_buffer);
+				push_buf(6, lod_view ? lod_view->index_buffer : lod_view_dummy_buffer);
 			}
 		}
 		RID merge_uniform_set = rd->uniform_set_create(uniforms, mm_merge_shader.version_shader[merge_mode], 0, /*p_linear_pool=*/true);
@@ -2414,6 +2590,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			// MODE_INDEXED only -- present in struct (uploaded only when indexed):
 			uint32_t src_idx_lo, src_idx_hi;
 			uint32_t index_count, src_is_16bit;
+			uint32_t use_lod_view, pad; // 1: vertices and indices come from the LOD view (bindings 5 and 6).
 			// Common tail:
 			uint32_t vertex_count, instance_count;
 			uint32_t pos_stride_words;
@@ -2429,11 +2606,13 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		pc.src_vtx_hi = uint32_t(vtx_bda >> 32);
 
 		if (indexed) {
-			uint64_t src_idx_bda = rd->buffer_get_device_address(index_buffer);
+			uint64_t src_idx_bda = lod_view ? 0 : rd->buffer_get_device_address(index_buffer);
 			pc.src_idx_lo = uint32_t(src_idx_bda);
 			pc.src_idx_hi = uint32_t(src_idx_bda >> 32);
 			pc.index_count = index_count;
-			pc.src_is_16bit = (vertex_count <= 65536) ? 1u : 0u;
+			pc.src_is_16bit = (!lod_view && src_vertex_count <= 65536) ? 1u : 0u;
+			pc.use_lod_view = lod_view ? 1u : 0u;
+			pc.pad = 0;
 		}
 
 		pc.vertex_count = vertex_count;
@@ -2615,6 +2794,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 
 	prepare_frame();
+	last_trace_frame = MAX(RSG::rasterizer->get_frame_number(), 1u);
 
 	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
@@ -2663,6 +2843,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_count;
 		uint32_t surface_index;
 		uint32_t surface_counter;
+		uint32_t lod;
+		const RTLodView *lod_view;
 		Transform3D instance_transform;
 		Transform3D prev_instance_transform;
 		bool transform_moved;
@@ -2781,6 +2963,16 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			bool transform_moved = (inst->transform_status ==
 					RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED);
 
+			// The LOD raster draws the MultiMesh with (RenderForwardClustered::_fill_render_list): a merged BLAS is built
+			// from it, so distant foliage costs the trace what it costs raster, not its full detail.
+			float lod_distance = 1.0;
+			if (!p_render_data->scene_data->cam_orthogonal) {
+				const Vector3 aabb_min = inst->transformed_aabb.position;
+				const Vector3 aabb_max = inst->transformed_aabb.position + inst->transformed_aabb.size;
+				const Vector3 camera_position = p_render_data->scene_data->main_cam_transform.origin;
+				lod_distance = Vector3().max(aabb_min - camera_position).max(camera_position - aabb_max).length();
+			}
+
 			const RenderForwardClustered::GeometryInstanceSurfaceDataCache *mm_surf = inst->surface_caches;
 			while (mm_surf) {
 				if (mm_surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
@@ -2844,6 +3036,22 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					}
 				}
 
+				uint32_t lod = 0;
+				const RTLodView *lod_view = nullptr;
+				// GODOT_RT_MULTIMESH_LOD=0 merges every MultiMesh at its full detail.
+				static const bool multimesh_lod = OS::get_singleton()->get_environment("GODOT_RT_MULTIMESH_LOD") != "0";
+				if (multimesh_lod && p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(mesh_surface)) {
+					uint32_t lod_indices = 0;
+					lod = mesh_storage->mesh_surface_get_lod(mesh_surface, inst->lod_model_scale * inst->lod_bias, lod_distance * p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, lod_indices);
+					if (lod > 0) {
+						// Read here: fetching a new LOD's indices waits for the GPU, which cannot happen inside the compute list of phase 2.
+						lod_view = _get_lod_view(mesh_surface, lod);
+						if (!lod_view) {
+							lod = 0;
+						}
+					}
+				}
+
 				PendingMMSurface pending;
 				pending.mm_rid = mm_rid;
 				pending.mm_gpu_buffer = mm_gpu_buffer;
@@ -2852,6 +3060,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.mm_count = mm_count;
 				pending.surface_index = mm_surf->surface_index;
 				pending.surface_counter = surface_counter;
+				pending.lod = lod;
+				pending.lod_view = lod_view;
 				pending.instance_transform = instance_transform;
 				pending.prev_instance_transform = prev_instance_transform;
 				pending.transform_moved = transform_moved;
@@ -3085,7 +3295,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		RTSurfaceData merged_sd;
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
-						pending.mm_count, pending.surface_index, pending.surface_counter,
+						pending.mm_count, pending.surface_index, pending.surface_counter, pending.lod,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {

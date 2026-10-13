@@ -51,6 +51,17 @@ layout(set = 0, binding = 4) restrict writeonly buffer DstIdxBuf {
 	uint v[];
 }
 dst_idx;
+
+// A LOD reduced to the vertices it uses (RTLodView), when push.use_lod_view is set: per merged vertex its source
+// vertex, and the LOD's indices into the merged ones.
+layout(set = 0, binding = 5) restrict readonly buffer LodVertexRemap {
+	uint v[];
+}
+lod_vertex_remap;
+layout(set = 0, binding = 6) restrict readonly buffer LodIndices {
+	uint v[];
+}
+lod_indices;
 #endif
 
 layout(push_constant, std430) uniform PC {
@@ -61,8 +72,10 @@ layout(push_constant, std430) uniform PC {
 	uint src_idx_hi;
 	uint index_count; // indices per instance
 	uint src_is_16bit; // 1 if source is packed uint16
+	uint use_lod_view; // 1: the vertices and indices come from lod_vertex_remap and lod_indices.
+	uint pad;
 #endif
-	uint vertex_count; // V (per instance)
+	uint vertex_count; // V (per instance, in the merged buffers)
 	uint instance_count; // N
 	uint pos_stride_words; // position stride in float words (3 for uncompressed)
 	uint src_tbn_base_words; // word offset of TBN section in source vertex buffer
@@ -99,6 +112,11 @@ void main() {
 	if (idx < total_v) {
 		uint inst = idx / push.vertex_count;
 		uint vtx = idx % push.vertex_count;
+#ifdef MODE_INDEXED
+		if (push.use_lod_view != 0u) {
+			vtx = lod_vertex_remap.v[vtx];
+		}
+#endif
 
 		SrcFloatBuf src = SrcFloatBuf(packUint2x32(uvec2(push.src_vtx_lo, push.src_vtx_hi)));
 		vec3 p = vec3(
@@ -161,13 +179,16 @@ void main() {
 		uint inst_i = idx / push.index_count;
 		uint local_pos = idx % push.index_count;
 
-		SrcUintBuf src_i = SrcUintBuf(packUint2x32(uvec2(push.src_idx_lo, push.src_idx_hi)));
 		uint src_idx;
-		if (push.src_is_16bit != 0u) {
+		if (push.use_lod_view != 0u) {
+			src_idx = lod_indices.v[local_pos];
+		} else if (push.src_is_16bit != 0u) {
+			SrcUintBuf src_i = SrcUintBuf(packUint2x32(uvec2(push.src_idx_lo, push.src_idx_hi)));
 			uint byte_off = local_pos * 2u;
 			uint word = src_i.v[byte_off >> 2u];
 			src_idx = ((byte_off & 2u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
 		} else {
+			SrcUintBuf src_i = SrcUintBuf(packUint2x32(uvec2(push.src_idx_lo, push.src_idx_hi)));
 			src_idx = src_i.v[local_pos];
 		}
 

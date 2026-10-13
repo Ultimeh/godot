@@ -40,9 +40,12 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_lod_compact.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
+// The path tracer's own textures, in a scope of their own so a view that stops path tracing frees them.
+#define RB_SCOPE_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
 #define RB_TEX_RT_FRONT_LAYER SNAME("rt_front_layer")
@@ -345,10 +348,32 @@ struct RTMergedMMEntry {
 	RID blas;
 	uint32_t last_mm_count = 0;
 	uint32_t last_surface_counter = 0;
+	uint32_t last_lod = 0;
 	uint32_t last_used_frame = 0;
 	uint64_t cached_mm_last_change = 0;
 	bool blas_built_once = false;
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
+};
+
+/// A mesh LOD reduced to the vertices its indices use, for the merged MultiMesh BLASes: a LOD keeps the base
+/// vertex buffer, so replicating all of it would cost the merge as much memory as LOD 0. Built on the GPU, so the
+/// number of kept vertices is not known here: vertex_count is its bound, min(vertices, indices), and the slots past
+/// the kept ones map to vertex 0, which no index reaches.
+struct RTLodView {
+	RID vertex_remap_buffer; // uint32 per kept vertex: its index in the base vertex buffer.
+	RID index_buffer; // uint32 indices into the kept vertices.
+	uint32_t vertex_count = 0;
+	uint32_t index_count = 0;
+	uint32_t surface_counter = 0;
+	uint32_t last_used_frame = 0;
+};
+
+struct RTLodViewKey {
+	const void *surface = nullptr;
+	uint32_t lod = 0;
+
+	bool operator==(const RTLodViewKey &p_other) const { return surface == p_other.surface && lod == p_other.lod; }
+	uint32_t hash() const { return hash_murmur3_one_32(lod, hash_murmur3_one_64(uint64_t(surface))); }
 };
 
 struct RTMaterialCacheEntry {
@@ -418,6 +443,21 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
 
+	// Builds the RTLodViews (raytracing_lod_compact.glsl).
+	struct LodCompactShader {
+		enum Mode {
+			MODE_MARK,
+			MODE_ASSIGN,
+			MODE_REMAP,
+			MODE_MAX,
+		};
+		RaytracingLodCompactShaderRD shader;
+		RID version;
+		RID version_shader[MODE_MAX];
+		RID pipeline[MODE_MAX];
+	} lod_compact_shader;
+	RID lod_view_dummy_buffer; // Bound in the merge's LOD view slots when a MultiMesh keeps its full mesh.
+
 	// The volumetric fog applied over the traced color.
 	struct VolumetricFogShader {
 		struct PushConstant {
@@ -454,6 +494,10 @@ class RenderRaytracing {
 	RID_Owner<RTMergedMMEntry> merged_mm_pool;
 	LocalVector<RID> merged_mm_active_this_frame;
 
+	HashMap<RTLodViewKey, RTLodView> lod_views;
+	const RTLodView *_get_lod_view(void *p_mesh_surface, uint32_t p_lod);
+	void _free_lod_view(RTLodView &p_view);
+
 	RTDeformedCacheEntry *_access_deformed_slot(RID &r_handle);
 
 	// Material vertex() evaluated per vertex before the BLAS builds (raytracing_displace.glsl).
@@ -467,6 +511,7 @@ class RenderRaytracing {
 	LocalVector<uint32_t> material_free_slots;
 	uint32_t next_material_slot = 0;
 	uint64_t vram_used = 0;
+	uint32_t last_trace_frame = 0; // 0: nothing cached since the last cleanup_caches().
 	uint32_t cache_hits = 0;
 	uint32_t cache_misses = 0;
 
@@ -540,6 +585,7 @@ class RenderRaytracing {
 			uint32_t p_mm_count,
 			uint32_t p_surface_index,
 			uint32_t p_surface_counter,
+			uint32_t p_lod,
 			RD::ComputeListID p_compute_list,
 			LocalVector<RID> &r_dirty_blas_list,
 			LocalVector<RID> &r_dirty_blas_update_list,
@@ -553,6 +599,9 @@ public:
 	void initialize(RenderForwardClustered *p_owner);
 
 	void cleanup_caches();
+	// Frees every cache cleanup_caches() frees once no view has traced for a few frames: a game that turns path tracing
+	// off gets the memory back for raster's effects.
+	void free_caches_if_unused();
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);

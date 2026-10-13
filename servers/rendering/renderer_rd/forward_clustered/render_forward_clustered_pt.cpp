@@ -30,6 +30,7 @@
 
 #include "render_forward_clustered_pt.h"
 
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -58,12 +59,23 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	if (!use_rt) {
 		_age_out_motion_vectors(p_render_data);
 
-		// Path tracing is off for this view: drop any DLSS Ray Reconstruction state
+		// Path tracing is off for this view: drop its state, its textures and the DLSS Ray Reconstruction ones, then,
+		// once no view has traced for a while, every acceleration structure and cache, for the raster effects
+		// (SDFGI, SSIL...) that take their place.
+		// GODOT_RT_KEEP_CACHES=1 keeps everything but the DLSS Ray Reconstruction textures.
+		static const bool keep_caches = OS::get_singleton()->get_environment("GODOT_RT_KEEP_CACHES") == "1";
 		if (rb_data.is_valid()) {
-			if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
-				raytracing->dlss_rr_free_buffers(rb.ptr());
+			if (raytracing && keep_caches) {
+				if (raytracing->dlss_rr_has_buffers(rb.ptr())) {
+					raytracing->dlss_rr_free_buffers(rb.ptr());
+				}
+			} else if (raytracing) {
+				_free_rt_viewport_state(rb.ptr());
 			}
 			rb->set_depth_reconstruct_requested(false);
+		}
+		if (raytracing && !is_reflection_probe && !keep_caches) {
+			raytracing->free_caches_if_unused();
 		}
 		RenderForwardClustered::_render_scene(p_render_data, p_default_bg_color);
 		return;
@@ -600,7 +612,12 @@ void RenderForwardClusteredPT::_age_out_motion_vectors(const RenderDataRD *p_ren
 
 void RenderForwardClusteredPT::_free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) {
 	ERR_FAIL_NULL(p_render_buffers);
-	p_render_buffers->clear_context(RB_SCOPE_DLSS_RR);
+	if (p_render_buffers->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO)) {
+		p_render_buffers->clear_context(RB_SCOPE_DLSS_RR);
+	}
+	if (p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING)) {
+		p_render_buffers->clear_context(RB_SCOPE_RAYTRACING);
+	}
 	if (raytracing) {
 		raytracing->free_viewport_state(p_render_buffers);
 	}
