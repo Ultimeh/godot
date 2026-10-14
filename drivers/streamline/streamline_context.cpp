@@ -107,6 +107,7 @@ void StreamlineContext::load_functions(bool d3d12) {
 		this->func_CreateDXGIFactory2 = (void *)GetProcAddress(streamline, "CreateDXGIFactory2");
 		this->func_D3D12CreateDevice = (void *)GetProcAddress(streamline, "D3D12CreateDevice");
 		this->func_D3D12GetInterface = (void *)GetProcAddress(streamline, "D3D12GetInterface");
+		this->func_slUpgradeInterface = (void *)GetProcAddress(streamline, "slUpgradeInterface");
 		this->func_DXGIGetDebugInterface1 = (void *)GetProcAddress(streamline, "DXGIGetDebugInterface1");
 	}
 #endif

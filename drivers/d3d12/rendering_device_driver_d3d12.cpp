@@ -6919,6 +6919,16 @@ Error RenderingDeviceDriverD3D12::_initialize_device() {
 	ID3D12DeviceFactory *device_factory = context_driver->device_factory_get();
 	if (device_factory != nullptr) {
 		res = device_factory->CreateDevice(adapter.Get(), requested_feature_level, IID_PPV_ARGS(device.GetAddressOf()));
+
+		// Streamline did not create this device: replace it with Streamline's proxy, which takes over its reference.
+		typedef int (*SLUpgradeInterface)(void **r_interface);
+		SLUpgradeInterface sl_upgrade_interface = (SLUpgradeInterface)Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_slUpgradeInterface);
+		if (SUCCEEDED(res) && sl_upgrade_interface) {
+			void *device_interface = device.Detach();
+			const int sl_result = sl_upgrade_interface(&device_interface);
+			device.Attach((ID3D12Device *)device_interface);
+			ERR_FAIL_COND_V_MSG(sl_result != 0, ERR_CANT_CREATE, vformat("slUpgradeInterface failed with error %d.", sl_result));
+		}
 	} else {
 		PFN_D3D12_CREATE_DEVICE d3d_D3D12CreateDevice = (PFN_D3D12_CREATE_DEVICE)(void *)GetProcAddress(context_driver->lib_d3d12, "D3D12CreateDevice");
 		ERR_FAIL_NULL_V(d3d_D3D12CreateDevice, ERR_CANT_CREATE);
