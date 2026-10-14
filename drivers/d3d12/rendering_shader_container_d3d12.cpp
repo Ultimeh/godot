@@ -839,14 +839,15 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 		nir_to_dxil_options.validator_version_max = NO_DXIL_VALIDATION;
 		nir_to_dxil_options.godot_nir_callbacks = &godot_nir_callbacks;
 
-		// Minimum 6.3 is required for raytracing stages.
+		// Ray tracing stages: 6.3 for the libraries, 6.5 for ray queries, 6.6 for GPU pointers (descriptor heap indexing).
+		// The driver only reports ray tracing on devices with Shader Model 6.6.
 		switch (stage) {
 			case RDC::SHADER_STAGE_RAYGEN:
 			case RDC::SHADER_STAGE_ANY_HIT:
 			case RDC::SHADER_STAGE_CLOSEST_HIT:
 			case RDC::SHADER_STAGE_MISS:
 			case RDC::SHADER_STAGE_INTERSECTION: {
-				nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_3);
+				nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_6);
 			} break;
 			default: {
 			}
@@ -872,7 +873,11 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 
 		_declare_resources_as_arrays(it.value);
 		_move_constant_arrays_to_globals(it.value);
-		uses_descriptor_heap_indexing = uses_descriptor_heap_indexing || _uses_descriptor_heap_indexing(it.value);
+		if (_uses_descriptor_heap_indexing(it.value)) {
+			// Other stages stay at the required shader model: their DXIL does not change.
+			uses_descriptor_heap_indexing = true;
+			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_6);
+		}
 
 		blob dxil_blob = {};
 		bool ok = nir_to_dxil(it.value, &nir_to_dxil_options, &logger, &dxil_blob);

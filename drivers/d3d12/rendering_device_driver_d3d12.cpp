@@ -7108,7 +7108,10 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5 = {};
 	res = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
-	if (SUCCEEDED(res)) {
+	// Ray tracing shaders are translated for Shader Model 6.6 and read GPU pointers through the descriptor heap, which
+	// needs resource binding tier 3 (see RenderingShaderContainerD3D12::_convert_nir_to_dxil()).
+	const bool heap_indexing = options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 && shader_capabilities.shader_model >= D3D_SHADER_MODEL_6_6;
+	if (SUCCEEDED(res) && heap_indexing) {
 		raytracing_capabilities.ray_query_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1;
 		raytracing_capabilities.raytracing_pipeline_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
 	}
