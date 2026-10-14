@@ -1771,7 +1771,8 @@ void SceneShaderRaytracing::init(const String p_defines) {
 	raygen_shader_version = raygen_shader.version_create();
 	if (raygen_shader_version.is_valid()) {
 		const PipelineBundle &b = ensure_pipeline_bundle(RT_FLAG_NONE);
-		if (!b.pipeline.is_valid()) {
+		usable = b.pipeline.is_valid();
+		if (!usable) {
 			WARN_PRINT("Failed to create default raytracing pipeline bundle");
 		}
 	} else {
