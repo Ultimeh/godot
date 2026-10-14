@@ -438,6 +438,8 @@ class RenderRaytracing {
 			RTSurfaceData *r_surf_data,
 			LocalVector<RID> &r_dirty_blas_list);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
+	// Whether a MultiMesh surface goes into a merged BLAS (_build_merged_mm_blas()), or one TLAS instance per instance.
+	bool _mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count) const;
 	bool _build_merged_mm_blas(
 			RID p_mm_rid,
 			RID p_mm_gpu_buffer,
