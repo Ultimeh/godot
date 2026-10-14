@@ -452,7 +452,17 @@ static bool _declare_resources_as_arrays(nir_shader *p_shader) {
 					if (!(glsl_type_is_texture(type) || glsl_type_is_sampler(type)) || !glsl_sampler_type_is_array(type)) {
 						continue;
 					}
+					const unsigned old_dest_size = nir_tex_instr_dest_size(tex);
 					tex->is_array = true;
+
+					// A size query of an array also returns the layer count: the users keep reading what they did.
+					const unsigned dest_size = nir_tex_instr_dest_size(tex);
+					if (dest_size != old_dest_size) {
+						tex->def.num_components = dest_size;
+						b.cursor = nir_after_instr(instr);
+						nir_def *trimmed = nir_trim_vector(&b, &tex->def, old_dest_size);
+						nir_def_rewrite_uses_after(&tex->def, trimmed);
+					}
 
 					// Queries take no coordinate, and a LOD query's coordinate has no layer.
 					const int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
