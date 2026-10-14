@@ -676,6 +676,7 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 				p_compiler_options);
 
 		ERR_FAIL_NULL_V_MSG(shader, false, "Shader translation (step 1) at stage " + String(RenderingDeviceCommons::SHADER_STAGE_NAMES[stage]) + " failed.");
+		_place_unbounded_arrays(shader);
 		translated.push_back({ stage, shader });
 	}
 
@@ -922,7 +923,9 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_dxil(Span<ReflectShaderSta
 void RenderingShaderContainerD3D12::_assign_dxil_slots() {
 	const uint32_t uniform_count = reflection_binding_set_uniforms_data.size();
 	dxil_binding_slots.resize(uniform_count);
+	dxil_binding_spaces.resize(uniform_count);
 	uint32_t next_slot = 0;
+	uint32_t next_unbounded_space = UNBOUNDED_ARRAY_SPACE_BASE;
 	// First the dynamic buffers (root descriptors: GPU-based validation's cost grows with their register), then the rest.
 	for (uint32_t pass = 0; pass < 2; pass++) {
 		for (uint32_t i = 0; i < uniform_count; i++) {
@@ -933,9 +936,11 @@ void RenderingShaderContainerD3D12::_assign_dxil_slots() {
 			}
 
 			dxil_binding_slots[i] = next_slot;
+			dxil_binding_spaces[i] = 0;
 			uint32_t slots = 1;
 			if (uniform.unbounded) {
-				slots = UNBOUNDED_ARRAY_SLOTS;
+				ERR_FAIL_COND_MSG(next_unbounded_space > UNBOUNDED_ARRAY_SPACE_MAX, "Too many unbounded arrays in one shader for D3D12.");
+				dxil_binding_spaces[i] = next_unbounded_space++;
 			} else if (uniform.type == RDC::UNIFORM_TYPE_SAMPLER || uniform.type == RDC::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE || uniform.type == RDC::UNIFORM_TYPE_TEXTURE || uniform.type == RDC::UNIFORM_TYPE_IMAGE || uniform.type == RDC::UNIFORM_TYPE_INPUT_ATTACHMENT) {
 				// Arrays take one register per element.
 				slots = (MAX(1u, uniform.length) + GODOT_NIR_BINDING_MULTIPLIER - 1) / GODOT_NIR_BINDING_MULTIPLIER;
@@ -944,6 +949,31 @@ void RenderingShaderContainerD3D12::_assign_dxil_slots() {
 		}
 	}
 	dxil_binding_slots_end = next_slot;
+}
+
+void RenderingShaderContainerD3D12::_place_unbounded_arrays(nir_shader *p_shader) const {
+	// nir_to_dxil declares no resource for a runtime-sized array. Each one goes to the register space _assign_dxil_slots()
+	// gave it, at register 0, sized so that its range covers every index a shader can reach; the root signature range of
+	// that space has no bound.
+	bool changed = false;
+	nir_foreach_variable_with_modes(var, p_shader, nir_var_uniform | nir_var_image) {
+		if (!glsl_type_is_unsized_array(var->type)) {
+			continue;
+		}
+		const uint32_t slot = var->data.binding / GODOT_NIR_BINDING_MULTIPLIER;
+		for (uint32_t i = 0; i < dxil_binding_slots.size(); i++) {
+			if (dxil_binding_slots[i] == slot && dxil_binding_spaces[i] != 0) {
+				var->data.descriptor_set = dxil_binding_spaces[i];
+				var->data.binding = 0;
+				var->type = glsl_array_type(glsl_get_array_element(var->type), UNBOUNDED_ARRAY_DECLARED_LENGTH, glsl_get_explicit_stride(var->type));
+				changed = true;
+				break;
+			}
+		}
+	}
+	if (changed) {
+		nir_fixup_deref_types(p_shader);
+	}
 }
 
 uint32_t RenderingShaderContainerD3D12::_find_binding(uint32_t p_set, uint32_t p_binding) const {
@@ -1074,6 +1104,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 			auto insert_range = [i](D3D12_DESCRIPTOR_RANGE_TYPE p_range_type,
 										uint32_t p_num_descriptors,
 										uint32_t p_dxil_register,
+										uint32_t p_dxil_space,
 										uint32_t p_dxil_stages_mask,
 										uint32_t &r_descriptor_offset,
 										uint32_t &r_descriptor_count,
@@ -1103,8 +1134,14 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 					flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
 				}
 
-				range.Init(p_range_type, p_num_descriptors, p_dxil_register, 0, flags, r_descriptor_offset);
-				r_descriptor_count += p_num_descriptors;
+				if (p_num_descriptors == UINT_MAX) {
+					// An unbounded array: as many descriptors as the uniform set gives it, not all of them initialized.
+					flags |= D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+				}
+				range.Init(p_range_type, p_num_descriptors, p_dxil_register, p_dxil_space, flags, r_descriptor_offset);
+				if (p_num_descriptors != UINT_MAX) {
+					r_descriptor_count += p_num_descriptors;
+				}
 				table.ranges.push_back(range);
 			};
 
@@ -1163,6 +1200,11 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 			}
 
 			uint32_t dxil_register = dxil_binding_slots[binding_start + j] * GODOT_NIR_BINDING_MULTIPLIER;
+			const uint32_t dxil_space = dxil_binding_spaces[binding_start + j];
+			if (uniform.unbounded) {
+				dxil_register = 0;
+				num_descriptors = UINT_MAX;
+			}
 			if (range_type != (D3D12_DESCRIPTOR_RANGE_TYPE)UINT_MAX) {
 				// Dynamic buffers are converted to root descriptors to prevent copying descriptors during command recording.
 				// Out of bounds accesses are not a concern because that's already undefined behavior on Vulkan.
@@ -1192,6 +1234,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 							range_type,
 							num_descriptors,
 							dxil_register,
+							dxil_space,
 							uniform.stages,
 							uniform_d3d12.resource_descriptor_offset,
 							reflection_binding_set_data_d3d12.ptrw()[i].resource_descriptor_count,
@@ -1205,6 +1248,7 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 						D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
 						num_descriptors,
 						dxil_register,
+						dxil_space,
 						uniform.stages,
 						uniform_d3d12.sampler_descriptor_offset,
 						reflection_binding_set_data_d3d12.ptrw()[i].sampler_descriptor_count,
@@ -1217,6 +1261,10 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 	}
 
 	for (const TraceableDescriptorTable &table : resource_tables_maps) {
+		for (uint32_t r = 0; r + 1 < (uint32_t)table.ranges.size(); r++) {
+			// The uniform set appends its elements after the other descriptors of the set.
+			ERR_FAIL_COND_V_MSG(table.ranges[r].NumDescriptors == UINT_MAX, false, "D3D12: an unbounded array must be the last uniform of its set.");
+		}
 		CD3DX12_ROOT_PARAMETER1 root_table = {};
 		root_table.InitAsDescriptorTable(table.ranges.size(), table.ranges.ptr(), stages_to_d3d12_visibility(table.stages_mask));
 		reflection_binding_set_data_d3d12.ptrw()[table.set].resource_root_param_idx = root_params.size();
@@ -1307,15 +1355,14 @@ void RenderingShaderContainerD3D12::_nir_report_resource(uint32_t p_register, ui
 		DEV_ASSERT(resource_class == RES_CLASS_CBV);
 		user_data.container->reflection_data_d3d12.nir_runtime_data_root_param_idx = 1; // Temporary, to be determined later.
 	} else {
-		ERR_FAIL_COND_MSG(p_space != 0, vformat("Unexpected DXIL register space %d for register %d.", p_space, p_register));
-
-		const uint32_t slot = p_register / GODOT_NIR_BINDING_MULTIPLIER;
+		const uint32_t slot = p_space == 0 ? p_register / GODOT_NIR_BINDING_MULTIPLIER : 0;
 		const LocalVector<uint32_t> &slots = user_data.container->dxil_binding_slots;
+		const LocalVector<uint32_t> &spaces = user_data.container->dxil_binding_spaces;
 
 		[[maybe_unused]] bool found = false;
 		for (uint32_t i = 0; i < slots.size(); i++) {
 			ReflectionBindingDataD3D12 &uniform_d3d12 = user_data.container->reflection_binding_set_uniforms_data_d3d12.ptrw()[i];
-			if (slots[i] != slot) {
+			if (spaces[i] != p_space || (p_space == 0 && slots[i] != slot)) {
 				continue;
 			}
 

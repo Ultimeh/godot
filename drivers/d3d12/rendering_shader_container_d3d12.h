@@ -87,8 +87,12 @@ public:
 	static constexpr uint32_t ROOT_CONSTANT_SPACE = 1;
 	static constexpr uint32_t ROOT_CONSTANT_REGISTER = 0;
 	static constexpr uint32_t RUNTIME_DATA_REGISTER = 1;
-	// Register slots reserved for an unbounded (runtime-sized) array: room for 200000 descriptors.
-	static constexpr uint32_t UNBOUNDED_ARRAY_SLOTS = 2;
+	// An unbounded (runtime-sized) array has a register space of its own, from this one up (Mesa keeps 5 bits of space),
+	// at register 0, declared with this many elements; its root signature range has no bound. It keeps a slot in space 0
+	// only so that no other uniform shares its slot number.
+	static constexpr uint32_t UNBOUNDED_ARRAY_SPACE_BASE = 2;
+	static constexpr uint32_t UNBOUNDED_ARRAY_SPACE_MAX = 31;
+	static constexpr uint32_t UNBOUNDED_ARRAY_DECLARED_LENGTH = 1000000;
 	static constexpr uint32_t FORMAT_VERSION = 2;
 	static constexpr uint32_t SHADER_STAGES_BIT_OFFSET_INDICES[RenderingDeviceCommons::SHADER_STAGE_MAX] = {
 		0, // SHADER_STAGE_VERTEX
@@ -158,6 +162,8 @@ protected:
 	// The register slot of each binding (parallel to reflection_binding_set_uniforms_data), compilation only. Dynamic
 	// buffers, which become root descriptors, come first so their registers stay small.
 	LocalVector<uint32_t> dxil_binding_slots;
+	LocalVector<uint32_t> dxil_binding_spaces; // Register space of each uniform: 0, or its own for an unbounded array.
+	void _place_unbounded_arrays(nir_shader *p_shader) const;
 	uint32_t dxil_binding_slots_end = 0;
 	void _assign_dxil_slots();
 	uint32_t _find_binding(uint32_t p_set, uint32_t p_binding) const;

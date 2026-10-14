@@ -3572,6 +3572,7 @@ RDD::ShaderID RenderingDeviceDriverD3D12::shader_create_from_container(const Ref
 			binding.type = UniformType(uniform.type);
 			binding.length = uniform.length;
 			binding.writable = uniform.writable;
+			binding.unbounded = uniform.unbounded;
 			binding.resource_descriptor_offset = uniform_d3d12.resource_descriptor_offset;
 			binding.sampler_descriptor_offset = uniform_d3d12.sampler_descriptor_offset;
 			binding.root_param_idx = uniform_d3d12.root_param_idx;
@@ -3723,9 +3724,15 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 	UniformSetInfo::DynamicBuffer dynamic_buffers[MAX_DYNAMIC_BUFFERS];
 	uint32_t num_dynamic_buffers = 0u;
 
-	// Allocate range for resource descriptors.
-	if (uniform_set.resource_descriptor_count > 0) {
-		Error err = resource_descriptor_heap.allocate(uniform_set.resource_descriptor_count, uniform_set_info->resource_descriptor_heap_alloc);
+	// Allocate range for resource descriptors, an unbounded array's after the others.
+	uint32_t resource_descriptor_count = uniform_set.resource_descriptor_count;
+	for (uint32_t i = 0; i < p_uniforms.size(); i++) {
+		if (uniform_set.bindings[i].unbounded) {
+			resource_descriptor_count += p_uniforms[i].type == UNIFORM_TYPE_SAMPLER_WITH_TEXTURE ? p_uniforms[i].ids.size() / 2 : p_uniforms[i].ids.size();
+		}
+	}
+	if (resource_descriptor_count > 0) {
+		Error err = resource_descriptor_heap.allocate(resource_descriptor_count, uniform_set_info->resource_descriptor_heap_alloc);
 		if (unlikely(err != OK)) {
 			VersatileResource::free(resources_allocator, uniform_set_info);
 

@@ -647,6 +647,7 @@ private:
 			UniformType type = UNIFORM_TYPE_MAX;
 			uint32_t length = UINT32_MAX;
 			bool writable = false;
+			bool unbounded = false; // Runtime-sized array: last of its set, as many descriptors as the uniform set gives.
 			uint32_t resource_descriptor_offset = UINT32_MAX;
 			uint32_t sampler_descriptor_offset = UINT32_MAX;
 			uint32_t root_param_idx = UINT32_MAX;
