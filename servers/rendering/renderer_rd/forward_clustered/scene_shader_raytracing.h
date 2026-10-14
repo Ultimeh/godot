@@ -407,6 +407,7 @@ public:
 
 	LocalVector<HitGroupSlot> hit_group_slots;
 	uint32_t pipeline_swap_count = 0; // Pipelines rebuilt and swapped in (GODOT_RT_LOG_CACHES).
+	bool usable = false;
 	HashMap<SourceHash128, uint32_t, SourceHash128Hasher> source_hash_to_slot;
 
 	// One RD RT pipeline variant (rt_flags key). Owns base + per-slot HG shaders (RG+miss baked in per HG).
@@ -546,6 +547,9 @@ public:
 	~SceneShaderRaytracing();
 
 	void init(const String p_defines);
+	// False when the base ray tracing pipeline could not be built (shader translation or pipeline creation failed):
+	// the path tracer then stays off and the views are rasterized.
+	bool is_usable() const { return usable; }
 	void set_default_specialization(const ShaderSpecialization &p_specialization);
 	void enable_advanced_shader_group(bool p_needs_multiview = false);
 	bool is_multiview_shader_group_enabled() const;

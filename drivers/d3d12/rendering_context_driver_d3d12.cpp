@@ -106,8 +106,11 @@ Error RenderingContextDriverD3D12::_init_device_factory() {
 	ERR_FAIL_NULL_V(lib_dcomp, ERR_CANT_CREATE);
 #endif
 
-	// Streamline doesn't currently support device factories, so fall back to default D3D12CreateDevice
-	if (Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12GetInterface)) {
+	// Streamline only sees the devices it creates. A device from the Agility SDK's factory is handed to it with
+	// slUpgradeInterface() (RenderingDeviceDriverD3D12::_initialize_device()); without that function, Streamline must
+	// create the device, with the system's D3D12 runtime.
+	if (Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12GetInterface) &&
+			!Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_slUpgradeInterface)) {
 		return OK;
 	}
 

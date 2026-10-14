@@ -602,9 +602,14 @@ bool RenderForwardClusteredPT::_setup_rt() {
 			rt_defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
 		raytracing->shader->init(rt_defines);
+		if (!raytracing->shader->is_usable()) {
+			// Nothing else of the path tracer is compiled or run: a driver whose shader translation cannot handle its
+			// shaders (missing ray tracing features) rasterizes instead of rendering nothing or failing further on.
+			ERR_PRINT("Path tracing is unavailable on this device: its base ray tracing pipeline could not be built. Rendering with rasterization instead.");
+		}
 	}
 
-	return true;
+	return raytracing->get_shader()->is_usable();
 }
 
 void RenderForwardClusteredPT::_age_out_motion_vectors(const RenderDataRD *p_render_data) {
