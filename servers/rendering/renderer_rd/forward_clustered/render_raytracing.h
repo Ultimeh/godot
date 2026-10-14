@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_lod_compact.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_background_output.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_sky_guide.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -57,6 +58,7 @@
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
 #define RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY SNAME("color_before_transparency")
+#define RB_TEX_DLSS_RR_BACKGROUND SNAME("background")
 
 class RenderDataRD;
 class RenderSceneBuffersRD;
@@ -546,6 +548,17 @@ class RenderRaytracing {
 		RID pipeline;
 	} sky_guide_shader;
 
+	struct BackgroundOutputShader {
+		struct PushConstant {
+			int32_t output_size[2];
+			int32_t internal_size[2];
+		};
+		RaytracingBackgroundOutputShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} background_output_shader;
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.
@@ -695,6 +708,10 @@ public:
 	void copy_output_texture(const RenderDataRD *p_render_data);
 	void apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending);
 	void dlss_rr_write_background_albedo(const RenderDataRD *p_render_data);
+	// The background at the output resolution, for the sky shader to draw into (null when it cannot be composited), and
+	// its composition over Ray Reconstruction's output where the camera rays missed (raytracing_background_output.glsl).
+	RID dlss_rr_get_background_output(RenderSceneBuffersRD *p_render_buffers);
+	void dlss_rr_composite_background(const RenderDataRD *p_render_data);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
 
 	// Raytracing output textures (stored on the render buffers via named scopes).
