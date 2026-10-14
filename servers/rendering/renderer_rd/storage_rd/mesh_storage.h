@@ -249,6 +249,8 @@ private:
 		uint32_t custom_data_offset_cache = 0;
 
 		Vector<float> data_cache; //used if individual setting is used
+		uint64_t gpu_data_version = 0; // Bumped when the buffer changes while there is no data_cache.
+		bool local_data_requested = false; // An asynchronous copy of the buffer into data_cache is on its way.
 		bool *data_cache_dirty_regions = nullptr;
 		uint32_t data_cache_dirty_region_count = 0;
 		bool *previous_data_cache_dirty_regions = nullptr;
@@ -272,6 +274,8 @@ private:
 	MultiMesh *multimesh_dirty_list = nullptr;
 
 	void _multimesh_make_local(MultiMesh *multimesh) const;
+	void _multimesh_make_local_from(MultiMesh *multimesh, const uint8_t *p_data, uint64_t p_size) const;
+	static void _multimesh_local_data_arrived(const Vector<uint8_t> &p_data, RID p_multimesh, RID p_buffer, uint64_t p_version);
 	void _multimesh_enable_motion_vectors(MultiMesh *multimesh);
 	void _multimesh_update_motion_vectors_data_cache(MultiMesh *multimesh);
 	bool _multimesh_uses_motion_vectors(MultiMesh *multimesh);
@@ -819,17 +823,9 @@ public:
 		return multimesh->instances;
 	}
 
-	// Returns a pointer to the CPU-side transform buffer, syncing from GPU once if needed.
-	// Safe to call every frame; the readback only happens on the first call when data_cache is empty.
-	// Note: for MultiMeshes updated every frame via set_buffer(), data_cache may be stale after init.
-	_FORCE_INLINE_ const float *multimesh_get_local_data_ptr(RID p_multimesh) const {
-		MultiMesh *mm = multimesh_owner.get_or_null(p_multimesh);
-		if (!mm) {
-			return nullptr;
-		}
-		_multimesh_make_local(mm);
-		return mm->data_cache.is_empty() ? nullptr : mm->data_cache.ptr();
-	}
+	// The CPU-side copy of the instance buffer (kept up to date by set_buffer() once it exists), or nullptr while an
+	// asynchronous copy of the GPU buffer is on its way: a copy that waited for the GPU stalled the frame.
+	const float *multimesh_get_local_data_ptr_async(RID p_multimesh);
 
 	_FORCE_INLINE_ uint32_t multimesh_get_stride(RID p_multimesh) const {
 		MultiMesh *mm = multimesh_owner.get_or_null(p_multimesh);

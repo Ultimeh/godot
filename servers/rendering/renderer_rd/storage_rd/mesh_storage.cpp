@@ -31,6 +31,7 @@
 #include "mesh_storage.h"
 
 #include "core/config/project_settings.h"
+#include "core/object/callable_mp.h"
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -1784,6 +1785,15 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 
 	// this means that the user wants to load/save individual elements,
 	// for this, the data must reside on CPU, so just copy it there.
+	if (multimesh->buffer_set) {
+		Vector<uint8_t> buffer = RD::get_singleton()->buffer_get_data(multimesh->buffer);
+		_multimesh_make_local_from(multimesh, buffer.ptr(), buffer.size());
+	} else {
+		_multimesh_make_local_from(multimesh, nullptr, 0);
+	}
+}
+
+void MeshStorage::_multimesh_make_local_from(MultiMesh *multimesh, const uint8_t *p_data, uint64_t p_size) const {
 	uint32_t buffer_size = multimesh->instances * multimesh->stride_cache;
 	if (multimesh->motion_vectors_enabled) {
 		buffer_size *= 2;
@@ -1792,12 +1802,8 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	{
 		float *w = multimesh->data_cache.ptrw();
 
-		if (multimesh->buffer_set) {
-			Vector<uint8_t> buffer = RD::get_singleton()->buffer_get_data(multimesh->buffer);
-			{
-				const uint8_t *r = buffer.ptr();
-				memcpy(w, r, buffer.size());
-			}
+		if (p_data) {
+			memcpy(w, p_data, MIN(p_size, uint64_t(buffer_size) * sizeof(float)));
 		} else {
 			memset(w, 0, buffer_size * sizeof(float));
 		}
@@ -1810,6 +1816,44 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	multimesh->previous_data_cache_dirty_regions = memnew_arr(bool, data_cache_dirty_region_count);
 	memset(multimesh->previous_data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
 	multimesh->previous_data_cache_dirty_region_count = 0;
+}
+
+const float *MeshStorage::multimesh_get_local_data_ptr_async(RID p_multimesh) {
+	MultiMesh *multimesh = multimesh_owner.get_or_null(p_multimesh);
+	ERR_FAIL_NULL_V(multimesh, nullptr);
+	if (!multimesh->data_cache.is_empty()) {
+		return multimesh->data_cache.ptr();
+	}
+	if (multimesh->instances == 0) {
+		return nullptr;
+	}
+	if (!multimesh->buffer_set) {
+		// Nothing on the GPU yet: zeros, as _multimesh_make_local() makes them.
+		_multimesh_make_local(multimesh);
+		return multimesh->data_cache.ptr();
+	}
+	if (!multimesh->local_data_requested) {
+		multimesh->local_data_requested = true;
+		RD::get_singleton()->buffer_get_data_async(multimesh->buffer, callable_mp_static(&MeshStorage::_multimesh_local_data_arrived).bind(p_multimesh, multimesh->buffer, multimesh->gpu_data_version));
+	}
+	return nullptr;
+}
+
+void MeshStorage::_multimesh_local_data_arrived(const Vector<uint8_t> &p_data, RID p_multimesh, RID p_buffer, uint64_t p_version) {
+	MultiMesh *multimesh = get_singleton()->multimesh_owner.get_or_null(p_multimesh);
+	if (!multimesh) {
+		return;
+	}
+	multimesh->local_data_requested = false;
+	uint64_t size = uint64_t(multimesh->instances) * multimesh->stride_cache * sizeof(float);
+	if (multimesh->motion_vectors_enabled) {
+		size *= 2;
+	}
+	// Changed while the copy was on its way (new buffer, new data, or made local meanwhile): asked again next time.
+	if (!multimesh->data_cache.is_empty() || multimesh->buffer != p_buffer || multimesh->gpu_data_version != p_version || uint64_t(p_data.size()) < size) {
+		return;
+	}
+	get_singleton()->_multimesh_make_local_from(multimesh, p_data.ptr(), p_data.size());
 }
 
 void MeshStorage::_multimesh_update_motion_vectors_data_cache(MultiMesh *multimesh) {
@@ -2216,6 +2260,9 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 		multimesh->previous_data_cache_dirty_region_count = 0;
 	}
 
+	if (multimesh->data_cache.is_empty()) {
+		multimesh->gpu_data_version++; // A copy of the buffer on its way (multimesh_get_local_data_ptr_async()) is stale.
+	}
 	if (multimesh->data_cache.size()) {
 		float *cache_data = multimesh->data_cache.ptrw();
 		memcpy(cache_data + (multimesh->motion_vectors_current_offset * multimesh->stride_cache), p_buffer.ptr(), p_buffer.size() * sizeof(float));

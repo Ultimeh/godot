@@ -3271,9 +3271,9 @@
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_cache_cpu_transforms" type="bool" setter="" getter="" default="false">
-			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. This allows the path tracer to read per-instance transforms without performing a GPU-to-CPU readback on first access, eliminating the one-time stall that occurs otherwise.
+			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. This lets the path tracer read the per-instance transforms of a MultiMesh it cannot merge into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]; meshes with compressed attributes are never merged) without copying the GPU buffer back: that copy is asynchronous, and the MultiMesh is traced from the next frame on.
 			[b]Warning:[/b] Enabling this setting increases CPU memory usage. Every [MultiMesh] that assigns [member MultiMesh.buffer] will maintain a full duplicate of its transform data in RAM.
-			Enable this only when [MultiMesh] nodes with frequently updated transforms are present in path-traced scenes and the GPU readback stall is measurable.
+			Enable this only when such a [MultiMesh] must be traced on the very frame it appears.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_displacement_distance" type="float" setter="" getter="" default="30.0">

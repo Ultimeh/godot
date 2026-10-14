@@ -2634,6 +2634,29 @@ const RTLodView *RenderRaytracing::_get_lod_view(void *p_mesh_surface, uint32_t 
 	return &lod_views.insert(key, new_view)->value;
 }
 
+bool RenderRaytracing::_mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count, const RTLodView *p_lod_view) const {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	// Compressed meshes are skipped: their positions are UNORM16x4, not float3.
+	if (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+		return false;
+	}
+	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
+	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
+	if (p_lod_view) {
+		vertex_count = p_lod_view->vertex_count;
+		index_buffer = p_lod_view->index_buffer;
+		index_count = p_lod_view->index_count;
+	}
+	const uint32_t prim_count = (index_buffer.is_valid() && index_count > 0) ? (index_count / 3) : (vertex_count / 3);
+	if (prim_count == 0 || vertex_count == 0) {
+		return false;
+	}
+	// Too large: one TLAS instance per instance instead.
+	static const uint32_t MM_MERGED_BLAS_MAX_TRIANGLES = (uint32_t)GLOBAL_GET("rendering/pathtracing/multimesh_merged_blas_max_triangles");
+	return (uint64_t)p_mm_count * prim_count <= MM_MERGED_BLAS_MAX_TRIANGLES;
+}
+
 bool RenderRaytracing::_build_merged_mm_blas(
 		RID p_mm_rid,
 		RID p_mm_gpu_buffer,
@@ -2673,19 +2696,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	bool indexed = index_buffer.is_valid() && index_count > 0;
 	uint32_t prim_count = indexed ? (index_count / 3) : (vertex_count / 3);
 
-	// Skip compressed meshes: their positions are UNORM16x4, not float3.
-	uint64_t surface_format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
-	if (surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+	if (!_mm_fits_merged_blas(p_mesh_surface, p_mm_count, lod_view)) {
 		return false;
 	}
-
-	if (prim_count == 0 || vertex_count == 0) {
-		return false;
-	}
-	static const uint32_t MM_MERGED_BLAS_MAX_TRIANGLES = (uint32_t)GLOBAL_GET("rendering/pathtracing/multimesh_merged_blas_max_triangles");
-	if ((uint64_t)p_mm_count * prim_count > MM_MERGED_BLAS_MAX_TRIANGLES) {
-		return false; // Too large; fall back to expanded TLAS.
-	}
+	const uint64_t surface_format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
 
 	// Side table -> pool: dense direct index keyed by RID local_index, with a
 	// validator stamp to detect RID local-index recycling for a different MM.
@@ -3312,8 +3326,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 
 			RID mm_gpu_buffer = mesh_storage->multimesh_get_gpu_buffer(mm_rid);
-			// Populate data cache now — first access triggers GPU readback, safe here.
-			mesh_storage->multimesh_get_local_data_ptr(mm_rid);
 
 			bool transform_moved = (inst->transform_status ==
 					RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED);
@@ -3408,6 +3420,16 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						if (!lod_view) {
 							lod = 0;
 						}
+					}
+				}
+
+				if (!mm_gpu_buffer.is_valid() || !_mm_fits_merged_blas(mesh_surface, mm_count, lod_view)) {
+					// One TLAS instance per instance needs the instances on the CPU; the merged BLAS reads them from the GPU
+					// buffer. A copy of the buffer that waited for the GPU stalled the frame for every new MultiMesh (foliage
+					// streamed in as the camera moves): the copy is asynchronous, and the MultiMesh traced once it is there.
+					if (!mesh_storage->multimesh_get_local_data_ptr_async(mm_rid)) {
+						mm_surf = mm_surf->next;
+						continue;
 					}
 				}
 
@@ -3701,7 +3723,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 #endif
 		} else {
 			// Fallback: expanded TLAS — one entry per instance, shared BLAS.
-			const float *mm_data = mesh_storage->multimesh_get_local_data_ptr(pending.mm_rid);
+			const float *mm_data = mesh_storage->multimesh_get_local_data_ptr_async(pending.mm_rid);
 			if (!mm_data) {
 				continue;
 			}
