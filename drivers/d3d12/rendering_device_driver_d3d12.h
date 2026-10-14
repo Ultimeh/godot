@@ -114,6 +114,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	struct RaytracingCapabilities {
 		bool ray_query_supported = false;
 		bool raytracing_pipeline_supported = false;
+		bool shader_execution_reordering_supported = false;
 	};
 
 	RenderingContextDriverD3D12 *context_driver = nullptr;

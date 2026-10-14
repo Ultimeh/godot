@@ -364,7 +364,8 @@ uint32_t RenderingShaderContainerD3D12::_to_bytes_footer_extra_data(uint8_t *p_b
 
 #if NIR_ENABLED
 // Mesa's SPIR-V options for DXIL, plus the layer written by a vertex shader (gl_Layer), which they leave out although
-// nir_to_dxil writes it as SV_RenderTargetArrayIndex. Allowing a capability changes no other shader's DXIL.
+// nir_to_dxil writes it as SV_RenderTargetArrayIndex, and hit objects (shader execution reordering). Allowing a
+// capability changes no other shader's DXIL.
 static const spirv_to_nir_options *_dxil_spirv_options() {
 	struct Options {
 		spirv_capabilities capabilities;
@@ -375,7 +376,14 @@ static const spirv_to_nir_options *_dxil_spirv_options() {
 			capabilities = *options.capabilities;
 			capabilities.ShaderLayer = true;
 			capabilities.ShaderViewportIndexLayerEXT = true;
+			capabilities.ShaderInvocationReorderEXT = true;
 			options.capabilities = &capabilities;
+			// A release build of Mesa says nothing about why it refuses a SPIR-V module.
+			options.debug.func = [](void *p_private_data, enum nir_spirv_debug_level p_level, size_t p_spirv_offset, const char *p_message) {
+				if (p_level >= NIR_SPIRV_DEBUG_LEVEL_ERROR) {
+					ERR_PRINT(vformat("SPIR-V to NIR, at byte offset %d: %s", (uint64_t)p_spirv_offset, p_message));
+				}
+			};
 		}
 	};
 	static const Options options;
@@ -878,6 +886,10 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 			uses_descriptor_heap_indexing = true;
 			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_6);
 		}
+		if (_uses_hit_objects(it.value)) {
+			// Shader execution reordering: only compiled when the device has Shader Model 6.9.
+			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_9);
+		}
 
 		blob dxil_blob = {};
 		bool ok = nir_to_dxil(it.value, &nir_to_dxil_options, &logger, &dxil_blob);
@@ -974,6 +986,17 @@ bool RenderingShaderContainerD3D12::_uses_descriptor_heap_indexing(nir_shader *p
 				if (source->type != nir_instr_type_intrinsic || nir_instr_as_intrinsic(source)->intrinsic != nir_intrinsic_vulkan_resource_index) {
 					return true;
 				}
+			}
+		}
+	}
+	return false;
+}
+
+bool RenderingShaderContainerD3D12::_uses_hit_objects(nir_shader *p_shader) {
+	nir_foreach_function_impl(impl, p_shader) {
+		nir_foreach_function_temp_variable(var, impl) {
+			if (var->data.hit_object) {
+				return true;
 			}
 		}
 	}

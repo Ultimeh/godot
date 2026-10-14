@@ -6790,7 +6790,7 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 		case SUPPORTS_RAYTRACING_PIPELINE:
 			return raytracing_capabilities.raytracing_pipeline_supported;
 		case SUPPORTS_SHADER_EXECUTION_REORDERING:
-			return false; // Hit objects need Shader Model 6.9, which the shader translation does not emit yet.
+			return raytracing_capabilities.shader_execution_reordering_supported;
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
 		case SUPPORTS_SHADER_OUTPUT_LAYER:
@@ -7043,6 +7043,9 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 
 	{
 		static const D3D_SHADER_MODEL SMS_TO_CHECK[] = {
+			D3D_SHADER_MODEL_6_9,
+			D3D_SHADER_MODEL_6_8,
+			D3D_SHADER_MODEL_6_7,
 			D3D_SHADER_MODEL_6_6,
 			D3D_SHADER_MODEL_6_5,
 			D3D_SHADER_MODEL_6_4,
@@ -7124,6 +7127,8 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 	if (SUCCEEDED(res) && heap_indexing) {
 		raytracing_capabilities.ray_query_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1;
 		raytracing_capabilities.raytracing_pipeline_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
+		// Every device with ray tracing and Shader Model 6.9 accepts hit objects; reordering itself may do nothing.
+		raytracing_capabilities.shader_execution_reordering_supported = raytracing_capabilities.raytracing_pipeline_supported && shader_capabilities.shader_model >= D3D_SHADER_MODEL_6_9;
 	}
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6 = {};

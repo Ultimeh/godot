@@ -168,6 +168,8 @@ protected:
 	// must allow. Only such shaders get the flag, which needs dynamic resources on the device.
 	bool uses_descriptor_heap_indexing = false;
 	static bool _uses_descriptor_heap_indexing(nir_shader *p_shader);
+	// Hit objects (shader execution reordering) need Shader Model 6.9.
+	static bool _uses_hit_objects(nir_shader *p_shader);
 	uint32_t dxil_binding_slots_end = 0;
 	void _assign_dxil_slots();
 	uint32_t _find_binding(uint32_t p_set, uint32_t p_binding) const;
