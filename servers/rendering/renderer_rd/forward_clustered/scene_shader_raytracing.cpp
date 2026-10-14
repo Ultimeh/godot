@@ -973,7 +973,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		flags |= RT_FLAG_FOG_ENABLED;
 	}
 
-	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
+	// Only where the shaders can be translated with it: a driver without it (D3D12 for now) fails the whole pipeline.
+	static const bool use_ser = GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering") && RD::get_singleton()->has_feature(RD::SUPPORTS_SHADER_EXECUTION_REORDERING);
+	if (use_ser) {
 		flags |= RT_FLAG_SER_ENABLED;
 	}
 

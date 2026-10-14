@@ -7784,6 +7784,8 @@ bool RenderingDeviceDriverVulkan::has_feature(Features p_feature) {
 			return acceleration_structure_capabilities.acceleration_structure_support && ray_query_support;
 		case SUPPORTS_RAYTRACING_PIPELINE:
 			return acceleration_structure_capabilities.acceleration_structure_support && raytracing_capabilities.raytracing_pipeline_support;
+		case SUPPORTS_SHADER_EXECUTION_REORDERING:
+			return raytracing_capabilities.raytracing_pipeline_support && enabled_device_extension_names.has(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
 		case SUPPORTS_HDR_OUTPUT:
 #if defined(WINDOWS_ENABLED)
 			// When using a Vulkan swapchain on Windows, some configurations
