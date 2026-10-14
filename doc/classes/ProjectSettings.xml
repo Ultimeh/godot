@@ -3280,6 +3280,10 @@
 			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. When the combined triangle count exceeds this value, the path tracer falls back to one TLAS entry per instance sharing a common BLAS instead. Lower this value to reduce peak GPU memory for large MultiMeshes; raise it to prefer the merged path (which avoids per-instance TLAS overhead).
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/static_cache_ttl_frames" type="int" setter="" getter="" default="3600">
+			Number of frames the path tracer keeps the BLAS of a static mesh surface, and the data of a material, after the last frame it traced them. At 60 fps, the default of 3600 corresponds to approximately one minute. A level left behind, or meshes and materials a game rebuilds, are freed after that instead of staying until no view path traces anymore. Decrease this value to reclaim GPU memory sooner; increase it to avoid rebuilding acceleration structures when returning to a place.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
 		</member>

@@ -730,6 +730,48 @@ void RenderRaytracing::prepare_frame() {
 		}
 	}
 
+	// Surfaces and materials no view traced for a while (a dungeon left, a map whose meshes a game rebuilds): a few chunks
+	// of each per frame. Their BLAS and buffers otherwise stayed until no view traced at all, growing with every trip.
+	static const uint32_t STATIC_CACHE_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/static_cache_ttl_frames");
+	const uint32_t SWEEP_CHUNKS_PER_FRAME = 16;
+	for (uint32_t sweep = 0; sweep < SWEEP_CHUNKS_PER_FRAME; sweep++) {
+		if (!surface_chunks.is_empty()) {
+			surface_sweep_chunk = (surface_sweep_chunk + 1) % surface_chunks.size();
+			RTCacheEntry *chunk = surface_chunks[surface_sweep_chunk];
+			for (uint32_t j = 0; chunk && j < RT_CACHE_CHUNK_SIZE; j++) {
+				RTCacheEntry &entry = chunk[j];
+				if (!entry.ptr || entry.last_used_frame == 0 || current_frame - entry.last_used_frame <= STATIC_CACHE_TTL) {
+					continue;
+				}
+				// Unless the mesh was freed first, which freed the BLAS built from its buffers.
+				if (entry.ptr->blas.is_valid() && rd->acceleration_structure_is_valid(entry.ptr->blas)) {
+					rd->free_rid(entry.ptr->blas);
+				}
+				memdelete(entry.ptr);
+				entry = RTCacheEntry();
+			}
+		}
+		if (!material_chunks.is_empty()) {
+			material_sweep_chunk = (material_sweep_chunk + 1) % material_chunks.size();
+			RTMaterialCacheEntry *chunk = material_chunks[material_sweep_chunk];
+			for (uint32_t j = 0; chunk && j < RT_CACHE_CHUNK_SIZE; j++) {
+				RTMaterialCacheEntry &entry = chunk[j];
+				if (!entry.ptr || entry.last_used_frame == 0 || current_frame - entry.last_used_frame <= STATIC_CACHE_TTL) {
+					continue;
+				}
+				if (entry.ptr->uniform_buffer.is_valid()) {
+					mat_ubo_dedicated_buffers.erase(entry.ptr->uniform_buffer);
+					rd->free_rid(entry.ptr->uniform_buffer);
+				}
+				if (entry.ptr->uniform_pool_slot != UINT32_MAX) {
+					mat_ubo_pool_release(entry.ptr->uniform_pool_slot);
+				}
+				memdelete(entry.ptr);
+				entry = RTMaterialCacheEntry();
+			}
+		}
+	}
+
 	// Finish async HG compiles so live_ready_mask matches this frame (sync path fills at build_tlas end).
 	SceneShaderRaytracing::get_singleton()->drain_completed_compiles();
 

@@ -620,6 +620,9 @@ class RenderRaytracing {
 	static uint32_t get_rid_version(RID p_rid);
 	RTCacheEntry *get_surface_cache_entry(uint32_t p_index);
 	RTMaterialCacheEntry *get_material_cache_entry(uint32_t p_index);
+	// The chunks of the surface and material caches the age sweep looks at next (prepare_frame()).
+	uint32_t surface_sweep_chunk = 0;
+	uint32_t material_sweep_chunk = 0;
 	uint32_t allocate_material_slot();
 
 	// Internal methods.
