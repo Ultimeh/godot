@@ -3843,8 +3843,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 #endif
 
+#ifdef TOOLS_ENABLED
 	// GODOT_RT_LOG_CACHES=1: the size of every cache and of the frame's work every 600 frames, to see what grows over a
-	// session (dungeon trips, streaming).
+	// session (dungeon trips, streaming). Editor builds only, like the frame's counters it prints.
 	static const bool log_caches = OS::get_singleton()->get_environment("GODOT_RT_LOG_CACHES") == "1";
 	if (log_caches && RSG::rasterizer->get_frame_number() % 600 == 0) {
 		uint32_t live_surfaces = 0;
@@ -3871,6 +3872,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				rt_shader->get_hit_group_slot_count(), rt_shader->get_pipeline_swap_count(),
 				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TOTAL) / (1024 * 1024))));
 	}
+#endif
 
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 
