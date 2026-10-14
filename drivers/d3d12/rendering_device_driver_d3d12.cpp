@@ -908,7 +908,9 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 	}
 
 	CD3DX12_RESOURCE_DESC1 resource_desc = CD3DX12_RESOURCE_DESC1::Buffer(p_size);
-	if (p_usage.has_flag(RDD::BUFFER_USAGE_STORAGE_BIT)) {
+	// A buffer read through a GPU pointer is reached through a raw UAV (see buffer_get_device_address()).
+	const bool device_address_view = p_usage.has_flag(BUFFER_USAGE_DEVICE_ADDRESS_BIT) && p_allocation_type == MEMORY_ALLOCATION_TYPE_GPU && !p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
+	if (p_usage.has_flag(RDD::BUFFER_USAGE_STORAGE_BIT) || device_address_view) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	} else if (!p_usage.has_flag(BUFFER_USAGE_SHADER_BINDING_TABLE_BIT) && !p_usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT)) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
@@ -1018,6 +1020,9 @@ bool RenderingDeviceDriverD3D12::buffer_set_texel_format(BufferID p_buffer, Data
 
 void RenderingDeviceDriverD3D12::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
+	if (buf_info->has_device_address_descriptor) {
+		resource_descriptor_heap.free(buf_info->device_address_descriptor);
+	}
 	if (buf_info->is_dynamic()) {
 		buf_info->resource->Unmap(0, &VOID_RANGE);
 		VersatileResource::free(resources_allocator, (BufferDynamicInfo *)buf_info);
@@ -1074,8 +1079,25 @@ uint64_t RenderingDeviceDriverD3D12::buffer_get_dynamic_offsets(Span<BufferID> p
 }
 
 uint64_t RenderingDeviceDriverD3D12::buffer_get_device_address(BufferID p_buffer) {
-	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
-	return buf_info->gpu_virtual_address;
+	// Shaders cannot dereference a D3D12 GPU virtual address. A GPU pointer is the index of a raw UAV of the buffer in the
+	// shader-visible heap, shifted by 32 bits, plus an offset in the low bits, as Mesa's DXIL lowering of
+	// SPV_KHR_physical_storage_buffer reads it (createHandleFromHeap, SM 6.6).
+	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
+	if (!buf_info->has_device_address_descriptor) {
+		ERR_FAIL_COND_V_MSG(!(buf_info->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), 0, "D3D12: the device address of a buffer in CPU or upload memory cannot be read by shaders.");
+		ERR_FAIL_COND_V(resource_descriptor_heap.allocate(1, buf_info->device_address_descriptor) != OK, 0);
+
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+		uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+		uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+		uav_desc.Buffer.FirstElement = 0;
+		uav_desc.Buffer.NumElements = (UINT)(buf_info->resource->GetDesc().Width / 4);
+		uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+		device->CreateUnorderedAccessView(buf_info->resource, nullptr, &uav_desc, buf_info->device_address_descriptor.cpu_handle);
+		buf_info->has_device_address_descriptor = true;
+	}
+	const uint64_t heap_index = (buf_info->device_address_descriptor.gpu_handle.ptr - resource_descriptor_heap.gpu_handle.ptr) / resource_descriptor_heap.increment_size;
+	return heap_index << 32;
 }
 
 /*****************/
@@ -6767,6 +6789,8 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 			return raytracing_capabilities.ray_query_supported;
 		case SUPPORTS_RAYTRACING_PIPELINE:
 			return raytracing_capabilities.raytracing_pipeline_supported;
+		case SUPPORTS_SHADER_EXECUTION_REORDERING:
+			return false; // Hit objects need Shader Model 6.9, which the shader translation does not emit yet.
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
 		case SUPPORTS_SHADER_OUTPUT_LAYER:

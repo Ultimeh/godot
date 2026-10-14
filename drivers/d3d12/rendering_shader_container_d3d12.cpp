@@ -872,6 +872,7 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 
 		_declare_resources_as_arrays(it.value);
 		_move_constant_arrays_to_globals(it.value);
+		uses_descriptor_heap_indexing = uses_descriptor_heap_indexing || _uses_descriptor_heap_indexing(it.value);
 
 		blob dxil_blob = {};
 		bool ok = nir_to_dxil(it.value, &nir_to_dxil_options, &logger, &dxil_blob);
@@ -949,6 +950,29 @@ void RenderingShaderContainerD3D12::_assign_dxil_slots() {
 		}
 	}
 	dxil_binding_slots_end = next_slot;
+}
+
+bool RenderingShaderContainerD3D12::_uses_descriptor_heap_indexing(nir_shader *p_shader) {
+	// A descriptor not loaded from a binding (vulkan_resource_index) comes from a GPU pointer's heap index
+	// (dxil_spirv_nir_lower_buffer_device_address).
+	nir_foreach_function_impl(impl, p_shader) {
+		nir_foreach_block(block, impl) {
+			nir_foreach_instr(instr, block) {
+				if (instr->type != nir_instr_type_intrinsic) {
+					continue;
+				}
+				nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+				if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor) {
+					continue;
+				}
+				nir_instr *source = intr->src[0].ssa->parent_instr;
+				if (source->type != nir_instr_type_intrinsic || nir_instr_as_intrinsic(source)->intrinsic != nir_intrinsic_vulkan_resource_index) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 void RenderingShaderContainerD3D12::_place_unbounded_arrays(nir_shader *p_shader) const {
@@ -1294,6 +1318,10 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 
 	if (reflection_data.vertex_input_mask) {
 		root_sig_flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+	}
+
+	if (uses_descriptor_heap_indexing) {
+		root_sig_flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 	}
 
 	root_sig_desc.Init_1_1(root_params.size(), root_params.ptr(), 0, nullptr, root_sig_flags);

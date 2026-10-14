@@ -263,6 +263,10 @@ private:
 
 	struct BufferInfo : public ResourceInfo {
 		D3D12_GPU_VIRTUAL_ADDRESS gpu_virtual_address = {};
+		// A raw UAV of the whole buffer in the shader-visible heap, made the first time its device address is asked for:
+		// a shader reads a GPU pointer (heap index << 32 | offset) through the heap (dxil_spirv_nir_lower_buffer_device_address).
+		DescriptorHeap::Allocation device_address_descriptor;
+		bool has_device_address_descriptor = false;
 		DataFormat texel_format = DATA_FORMAT_MAX;
 		uint64_t size = 0;
 		struct {
