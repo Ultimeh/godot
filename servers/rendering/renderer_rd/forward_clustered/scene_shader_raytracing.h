@@ -406,6 +406,7 @@ public:
 	};
 
 	LocalVector<HitGroupSlot> hit_group_slots;
+	uint32_t pipeline_swap_count = 0; // Pipelines rebuilt and swapped in (GODOT_RT_LOG_CACHES).
 	HashMap<SourceHash128, uint32_t, SourceHash128Hasher> source_hash_to_slot;
 
 	// One RD RT pipeline variant (rt_flags key). Owns base + per-slot HG shaders (RG+miss baked in per HG).
@@ -441,6 +442,7 @@ public:
 
 	const CustomShaderEntry *get_custom_shader_entry(uint32_t p_slot_index) const;
 	uint32_t get_hit_group_slot_count() const { return hit_group_slots.size(); }
+	uint32_t get_pipeline_swap_count() const { return pipeline_swap_count; }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
 

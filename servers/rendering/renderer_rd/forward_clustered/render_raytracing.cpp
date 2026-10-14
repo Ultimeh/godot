@@ -1257,7 +1257,13 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 
 	const bool camera_moved = p_render_data->scene_data->cam_transform != displace_camera_transform || p_render_data->scene_data->cam_projection != displace_camera_projection;
+	displaced_evaluated = 0;
+	displaced_deferred = 0;
+	displaced_vertices = 0;
 	displace_camera_moved = camera_moved;
+	static const float update_distance = GLOBAL_GET("rendering/pathtracing/displacement_update_distance");
+	const uint32_t MAX_UPDATE_PERIOD = 8;
+	const Vector3 camera_origin = p_render_data->scene_data->cam_transform.origin;
 	displace_camera_transform = p_render_data->scene_data->cam_transform;
 	displace_camera_projection = p_render_data->scene_data->cam_projection;
 
@@ -1330,9 +1336,22 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			const uint32_t size = vertex_count * (3 + tbn_words + 3 + 3) * sizeof(uint32_t);
 
 			RTDeformedCacheEntry *entry = _access_deformed_slot(surf->rt_deformed_handle);
-			bool evaluate = entry->displaced_frame == 0 || entry->displaced_slot != mat_data->rt_sbt_offset ||
-					entry->displaced_material_counter != material_counter || entry->displaced_transform != inst->transform ||
-					cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved);
+			bool evaluate = entry->displaced_frame == 0 || entry->displaced_slot != mat_data->rt_sbt_offset || entry->displaced_transform != inst->transform;
+			if (!evaluate && (entry->displaced_deferred || entry->displaced_material_counter != material_counter || cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved))) {
+				// What vertex() keeps moving (TIME, the camera, a parameter set every frame: Terrain3D's geomorphing) is
+				// evaluated, and its BLAS rebuilt, every frame near the camera and every N frames beyond, N growing with the
+				// distance. The surfaces take turns, and the motion between two updates is reported on the update frame.
+				uint32_t period = 1;
+				if (update_distance > 0.0f) {
+					const Vector3 lo = inst->transformed_aabb.position;
+					const Vector3 hi = lo + inst->transformed_aabb.size;
+					const float distance = Vector3().max(lo - camera_origin).max(camera_origin - hi).length();
+					period = CLAMP(uint32_t(distance / update_distance), 1u, MAX_UPDATE_PERIOD);
+				}
+				evaluate = (current_frame + uint32_t(surf->rt_deformed_handle.get_id())) % period == 0;
+				entry->displaced_deferred = !evaluate;
+				displaced_deferred += evaluate ? 0 : 1;
+			}
 			if (entry->displaced_vb_capacity < size) {
 				if (entry->displaced_vb.is_valid()) {
 					rd->free_rid(entry->displaced_vb);
@@ -1350,6 +1369,9 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 				continue;
 			}
 			entry->displaced_stamp++;
+			entry->displaced_deferred = false;
+			displaced_evaluated++;
+			displaced_vertices += vertex_count;
 			entry->displaced_slot = mat_data->rt_sbt_offset;
 			entry->displaced_material_counter = material_counter;
 			entry->displaced_transform = inst->transform;
@@ -3790,6 +3812,35 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit;
 	}
 #endif
+
+	// GODOT_RT_LOG_CACHES=1: the size of every cache and of the frame's work every 600 frames, to see what grows over a
+	// session (dungeon trips, streaming).
+	static const bool log_caches = OS::get_singleton()->get_environment("GODOT_RT_LOG_CACHES") == "1";
+	if (log_caches && RSG::rasterizer->get_frame_number() % 600 == 0) {
+		uint32_t live_surfaces = 0;
+		for (uint32_t i = 0; i < surface_chunks.size(); i++) {
+			if (surface_chunks[i]) {
+				for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
+					live_surfaces += surface_chunks[i][j].ptr && surface_chunks[i][j].ptr->blas.is_valid() ? 1 : 0;
+				}
+			}
+		}
+		uint32_t live_materials = 0;
+		for (uint32_t i = 0; i < material_chunks.size(); i++) {
+			if (material_chunks[i]) {
+				for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
+					live_materials += material_chunks[i][j].ptr ? 1 : 0;
+				}
+			}
+		}
+		const SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+		print_line(vformat("RTCACHES frame %d: TLAS %d instances, %d BLAS builds, %d refits | displaced %d (%d vertices), %d deferred | surfaces %d, merged MultiMeshes %d, deformed %d, LOD views %d, materials %d, dedicated UBOs %d | hit groups %d, pipeline swaps %d | video %d MB",
+				RSG::rasterizer->get_frame_number(), tlas_instance_count, rt_blas_builds, rt_blas_refits,
+				displaced_evaluated, int64_t(displaced_vertices), displaced_deferred,
+				live_surfaces, merged_mm_pool.get_rid_count(), deformed_pool.get_rid_count(), lod_views.size(), live_materials, mat_ubo_dedicated_buffers.size(),
+				rt_shader->get_hit_group_slot_count(), rt_shader->get_pipeline_swap_count(),
+				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TOTAL) / (1024 * 1024))));
+	}
 
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 

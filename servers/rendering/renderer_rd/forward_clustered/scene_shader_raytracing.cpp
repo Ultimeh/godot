@@ -1617,6 +1617,7 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 	bundle.hit_sbt = new_sbt;
 	bundle.live_hg_count = n;
 	bundle.live_ready_mask = p_task->new_ready_mask;
+	pipeline_swap_count++;
 }
 
 // Single-lane rebuild dispatcher.

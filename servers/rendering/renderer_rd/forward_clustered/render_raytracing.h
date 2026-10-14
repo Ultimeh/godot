@@ -348,6 +348,7 @@ struct RTDeformedCacheEntry {
 	uint32_t displaced_slot = 0;
 	uint32_t displaced_prev_offset = 0; // Bytes to the previous frame's positions in displaced_vb.
 	uint16_t displaced_material_counter = 0;
+	bool displaced_deferred = false; // A change waits for the surface's next update frame (far from the camera).
 	Transform3D displaced_transform;
 };
 
@@ -510,6 +511,10 @@ class RenderRaytracing {
 	uint32_t mm_displace_job_capacity = 0;
 	RID displace_dummy_buffer; // Bound in the displacement's MultiMesh slots for the other jobs.
 	bool displace_camera_moved = false;
+	// The frame's displaced surfaces (GODOT_RT_LOG_CACHES): evaluated, waiting for their update frame, vertices evaluated.
+	uint32_t displaced_evaluated = 0;
+	uint32_t displaced_deferred = 0;
+	uint64_t displaced_vertices = 0;
 	LocalVector<RD::Uniform> _displace_frame_uniforms(RID p_job_buffer);
 	void _displace_merged_multimeshes();
 
