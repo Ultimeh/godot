@@ -643,6 +643,7 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 	dxil_runtime_conf.inferred_read_only_images_as_srvs = false;
 
 	// Translate SPIR-V to NIR.
+	LocalVector<KeyValue<RenderingDeviceCommons::ShaderStage, nir_shader *>> translated;
 	for (uint64_t i = 0; i < p_spirv.size(); i++) {
 		RenderingDeviceCommons::ShaderStage stage = p_spirv[i].shader_stage;
 		RenderingDeviceCommons::ShaderStage stage_flag = (RenderingDeviceCommons::ShaderStage)(1 << stage);
@@ -675,6 +676,42 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 				p_compiler_options);
 
 		ERR_FAIL_NULL_V_MSG(shader, false, "Shader translation (step 1) at stage " + String(RenderingDeviceCommons::SHADER_STAGE_NAMES[stage]) + " failed.");
+		translated.push_back({ stage, shader });
+	}
+
+	// spirv_to_nir drops the ray payload a stage declares without using it, and DXIL then has no type for the payload
+	// parameter that DXR requires of any-hit, closest-hit and miss shaders. They get back the type a sibling stage of
+	// this shader declares, the same type then for every stage of the pipeline. Likewise for the hit attributes.
+	const glsl_type *payload_type = nullptr;
+	const glsl_type *attribute_type = nullptr;
+	for (const KeyValue<RenderingDeviceCommons::ShaderStage, nir_shader *> &E : translated) {
+		nir_foreach_variable_with_modes(var, E.value, nir_var_shader_call_data) {
+			payload_type = payload_type ? payload_type : var->type;
+		}
+		nir_foreach_variable_with_modes(var, E.value, nir_var_ray_hit_attrib) {
+			attribute_type = attribute_type ? attribute_type : var->type;
+		}
+	}
+	auto has_variable = [](nir_shader *p_shader, nir_variable_mode p_mode) -> bool {
+		nir_foreach_variable_with_modes(var, p_shader, p_mode) {
+			return true;
+		}
+		return false;
+	};
+	for (const KeyValue<RenderingDeviceCommons::ShaderStage, nir_shader *> &E : translated) {
+		const bool needs_payload = E.key == RenderingDeviceCommons::SHADER_STAGE_ANY_HIT || E.key == RenderingDeviceCommons::SHADER_STAGE_CLOSEST_HIT || E.key == RenderingDeviceCommons::SHADER_STAGE_MISS;
+		const bool needs_attributes = E.key == RenderingDeviceCommons::SHADER_STAGE_ANY_HIT || E.key == RenderingDeviceCommons::SHADER_STAGE_CLOSEST_HIT;
+		if (needs_payload && payload_type && !has_variable(E.value, nir_var_shader_call_data)) {
+			nir_variable_create(E.value, nir_var_shader_call_data, payload_type, "payload");
+		}
+		if (needs_attributes && attribute_type && !has_variable(E.value, nir_var_ray_hit_attrib)) {
+			nir_variable_create(E.value, nir_var_ray_hit_attrib, attribute_type, "hit_attribs");
+		}
+	}
+
+	for (const KeyValue<RenderingDeviceCommons::ShaderStage, nir_shader *> &E : translated) {
+		const RenderingDeviceCommons::ShaderStage stage = E.key;
+		nir_shader *shader = E.value;
 
 		if (stage == RenderingDeviceCommons::SHADER_STAGE_VERTEX) {
 			dxil_runtime_conf.yz_flip.y_mask = 0xffff;
