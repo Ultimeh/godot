@@ -469,6 +469,9 @@ public:
 	virtual void global_shader_parameters_instance_update(RID p_instance, int p_index, const Variant &p_value, int p_flags_count = 0) override;
 
 	RID global_shader_uniforms_get_storage_buffer() const;
+	/// Hash of the values of the instance uniforms allocated at p_offset (0 if none): tells the path tracer when the
+	/// geometry an instance's vertex() moves must be evaluated again.
+	uint32_t global_shader_parameters_instance_hash(int32_t p_offset) const;
 	/// Returns the override (or value) RID for a global texture parameter, or RID() if not found.
 	RID global_shader_uniform_get_texture(const StringName &p_name) const;
 	/// Returns the buffer index for a scalar/vector global shader parameter, or -1 if not found.

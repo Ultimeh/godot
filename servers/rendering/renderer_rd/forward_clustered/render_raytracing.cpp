@@ -1344,11 +1344,14 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			const uint32_t size = vertex_count * (3 + tbn_words + 3 + 3) * sizeof(uint32_t);
 
 			RTDeformedCacheEntry *entry = _access_deformed_slot(surf->rt_deformed_handle);
+			// An instance uniform animated by a script (a wall growing out of the ground) moves the geometry too.
+			const uint32_t instance_uniforms_hash = material_storage->global_shader_parameters_instance_hash(inst->shader_uniforms_offset);
 			bool evaluate = entry->displaced_frame == 0 || entry->displaced_slot != mat_data->rt_sbt_offset || entry->displaced_transform != inst->transform;
-			if (!evaluate && (entry->displaced_deferred || entry->displaced_material_counter != material_counter || cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved))) {
-				// What vertex() keeps moving (TIME, the camera, a parameter set every frame: Terrain3D's geomorphing) is
-				// evaluated, and its BLAS rebuilt, every frame near the camera and every N frames beyond, N growing with the
-				// distance. The surfaces take turns, and the motion between two updates is reported on the update frame.
+			if (!evaluate && (entry->displaced_deferred || entry->displaced_material_counter != material_counter || entry->displaced_instance_uniforms_hash != instance_uniforms_hash || cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved))) {
+				// What vertex() keeps moving (TIME, the camera, a parameter set every frame: Terrain3D's geomorphing, an
+				// instance uniform) is evaluated, and its BLAS rebuilt, every frame near the camera and every N frames beyond,
+				// N growing with the distance. The surfaces take turns, and the motion between two updates is reported on the
+				// update frame.
 				uint32_t period = 1;
 				if (update_distance > 0.0f) {
 					const Vector3 lo = inst->transformed_aabb.position;
@@ -1382,6 +1385,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			displaced_vertices += vertex_count;
 			entry->displaced_slot = mat_data->rt_sbt_offset;
 			entry->displaced_material_counter = material_counter;
+			entry->displaced_instance_uniforms_hash = instance_uniforms_hash;
 			entry->displaced_transform = inst->transform;
 
 			RT_DisplaceJob data = {};

@@ -2014,6 +2014,14 @@ RID MaterialStorage::global_shader_uniforms_get_storage_buffer() const {
 	return global_shader_uniforms.buffer;
 }
 
+uint32_t MaterialStorage::global_shader_parameters_instance_hash(int32_t p_offset) const {
+	// Every instance gets MAX_INSTANCE_UNIFORM_INDICES values (global_shader_parameters_instance_allocate()).
+	if (p_offset < 0 || uint32_t(p_offset) + ShaderLanguage::MAX_INSTANCE_UNIFORM_INDICES > global_shader_uniforms.buffer_size) {
+		return 0;
+	}
+	return hash_murmur3_buffer(global_shader_uniforms.buffer_values + p_offset, ShaderLanguage::MAX_INSTANCE_UNIFORM_INDICES * sizeof(GlobalShaderUniforms::Value));
+}
+
 RID MaterialStorage::global_shader_uniform_get_texture(const StringName &p_name) const {
 	const GlobalShaderUniforms::Variable *v = global_shader_uniforms.variables.getptr(p_name);
 	if (!v || v->buffer_index >= 0) {

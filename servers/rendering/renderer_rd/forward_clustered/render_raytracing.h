@@ -350,6 +350,7 @@ struct RTDeformedCacheEntry {
 	uint32_t displaced_slot = 0;
 	uint32_t displaced_prev_offset = 0; // Bytes to the previous frame's positions in displaced_vb.
 	uint16_t displaced_material_counter = 0;
+	uint32_t displaced_instance_uniforms_hash = 0; // The instance uniforms vertex() was evaluated with.
 	bool displaced_deferred = false; // A change waits for the surface's next update frame (far from the camera).
 	Transform3D displaced_transform;
 };
