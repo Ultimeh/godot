@@ -1646,6 +1646,17 @@ static uint32_t _def_bool(const ShaderLanguage::ShaderNode::Uniform &u, int idx)
 	return (int)u.default_value.size() > idx ? (uint32_t)u.default_value[idx].boolean : 0u;
 }
 
+// Colors as the raster path fills them (MaterialStorage::fill_std140_uniform()): a Color value is made linear unless the
+// uniform disables color conversion, a default value only when the uniform is a source_color.
+static Color _uniform_color(const ShaderLanguage::ShaderNode::Uniform &u, const Color &p_color) {
+	return u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED ? p_color : p_color.srgb_to_linear();
+}
+
+static Color _default_color(const ShaderLanguage::ShaderNode::Uniform &u) {
+	const Color c(_def_real(u, 0), _def_real(u, 1), _def_real(u, 2), _def_real(u, 3));
+	return u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR ? c.srgb_to_linear() : c;
+}
+
 static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Variant &val, uint8_t *dst) {
 	using SL = ShaderLanguage;
 
@@ -1685,42 +1696,28 @@ static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Var
 				fv[0] = (float)v.x;
 				fv[1] = (float)v.y;
 				fv[2] = (float)v.z;
-			} else if (val.get_type() == Variant::COLOR) {
-				Color c = val;
-				if (u.hint == SL::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-					c = c.srgb_to_linear();
-				}
+			} else {
+				const Color c = val.get_type() == Variant::COLOR ? _uniform_color(u, val) : _default_color(u);
 				fv[0] = c.r;
 				fv[1] = c.g;
 				fv[2] = c.b;
-			} else {
-				fv[0] = _def_real(u, 0);
-				fv[1] = _def_real(u, 1);
-				fv[2] = _def_real(u, 2);
 			}
 			memcpy(dst, fv, 12);
 		} break;
 		case SL::TYPE_VEC4: {
 			float fv[4] = {};
-			if (val.get_type() == Variant::COLOR) {
-				Color c = val;
-				if (u.hint == SL::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-					c = c.srgb_to_linear();
-				}
-				fv[0] = c.r;
-				fv[1] = c.g;
-				fv[2] = c.b;
-				fv[3] = c.a;
-			} else if (val.get_type() == Variant::VECTOR4) {
+			if (val.get_type() == Variant::VECTOR4) {
 				Vector4 v = val;
 				fv[0] = (float)v.x;
 				fv[1] = (float)v.y;
 				fv[2] = (float)v.z;
 				fv[3] = (float)v.w;
 			} else {
-				for (int i = 0; i < 4; i++) {
-					fv[i] = _def_real(u, i);
-				}
+				const Color c = val.get_type() == Variant::COLOR ? _uniform_color(u, val) : _default_color(u);
+				fv[0] = c.r;
+				fv[1] = c.g;
+				fv[2] = c.b;
+				fv[3] = c.a;
 			}
 			memcpy(dst, fv, 16);
 		} break;
