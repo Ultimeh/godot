@@ -383,6 +383,7 @@ struct RTMergedMMEntry {
 	// frame's give the motion vectors.
 	bool displaced = false;
 	bool displaced_this_frame = false; // Its positions moved this frame: the previous ones are valid.
+	uint32_t displaced_inputs = 0; // Hash of the material's parameters and the instance uniforms vertex() was evaluated with.
 	RID merged_prev_buffer; // float3 per merged vertex, the previous frame's displaced positions.
 	uint32_t prev_capacity_bytes = 0;
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
@@ -682,6 +683,7 @@ class RenderRaytracing {
 			bool p_displace,
 			bool p_reevaluate,
 			RTMaterialData *p_mat_data,
+			uint16_t p_material_counter,
 			const Transform3D &p_transform,
 			const Transform3D &p_prev_transform,
 			uint32_t p_instance_uniforms_ofs,

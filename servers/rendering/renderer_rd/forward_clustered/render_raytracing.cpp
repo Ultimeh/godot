@@ -2677,6 +2677,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		bool p_displace,
 		bool p_reevaluate,
 		RTMaterialData *p_mat_data,
+		uint16_t p_material_counter,
 		const Transform3D &p_transform,
 		const Transform3D &p_prev_transform,
 		uint32_t p_instance_uniforms_ofs,
@@ -2894,8 +2895,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		rd->set_resource_name(entry.merged_prev_buffer, "RT MM displaced prev [" + itos(cache_key) + "]");
 		entry.displaced = false; // Its previous positions are not written yet.
 	}
-	// Evaluated after every merge, and every frame when vertex() reads the time or the camera.
-	const bool displace_now = p_displace && first_touch_this_frame && (needs_rebake || p_reevaluate || !entry.displaced);
+	// Evaluated after every merge, every frame when vertex() reads the time or the camera, and when the material's
+	// parameters or the instance uniforms change (godot3d's Rot Blossom grows its MultiMeshes with one).
+	const uint32_t displace_inputs = p_displace ? hash_murmur3_one_32(p_material_counter, RendererRD::MaterialStorage::get_singleton()->global_shader_parameters_instance_hash(int32_t(p_instance_uniforms_ofs))) : 0;
+	const bool displace_now = p_displace && first_touch_this_frame && (needs_rebake || p_reevaluate || !entry.displaced || entry.displaced_inputs != displace_inputs);
 
 	// --- Single merged dispatch: bake vertices + TBN + attributes + (optional) indices ---
 	if (needs_rebake) {
@@ -3073,6 +3076,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	if (first_touch_this_frame) {
 		entry.displaced = p_displace;
 		entry.displaced_this_frame = displace_now;
+		if (displace_now) {
+			entry.displaced_inputs = displace_inputs;
+		}
 	}
 
 	// --- Populate r_surf_data from the metadata already computed above, then override merged buffer addresses.
@@ -3223,6 +3229,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RTLodView *lod_view;
 		bool displace; // Its material's vertex() moves it and it is near enough.
 		bool reevaluate; // That vertex() reads the time or the camera.
+		uint16_t material_counter; // Its parameters' version: a change evaluates vertex() again.
 		Transform3D instance_transform;
 		Transform3D prev_instance_transform;
 		bool transform_moved;
@@ -3455,6 +3462,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				// Near the camera, a material whose vertex() moves the MultiMesh (wind) is evaluated on it, as raster draws it.
 				pending.displace = false;
 				pending.reevaluate = false;
+				pending.material_counter = material_counter;
 				static const float mm_displacement_distance = GLOBAL_GET("rendering/pathtracing/multimesh_displacement_distance");
 				if (mm_displacement_distance > 0.0f && lod_distance <= mm_displacement_distance && mat_data->rt_sbt_offset > 0) {
 					const SceneShaderRaytracing::CustomShaderEntry *displace_cse = rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -3702,7 +3710,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter, pending.lod,
-						pending.displace, pending.reevaluate, pending.mat_data, pending.instance_transform, pending.prev_instance_transform,
+						pending.displace, pending.reevaluate, pending.mat_data, pending.material_counter, pending.instance_transform, pending.prev_instance_transform,
 						uint32_t(pending.mm_surf->owner->shader_uniforms_offset),
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
