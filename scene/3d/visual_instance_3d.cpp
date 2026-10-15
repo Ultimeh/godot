@@ -32,6 +32,7 @@
 
 STATIC_ASSERT_INCOMPLETE_TYPE(class, RenderingServer);
 
+#include "core/config/engine.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "core/os/os.h"
@@ -351,6 +352,12 @@ bool GeometryInstance3D::_get(const StringName &p_name, Variant &r_ret) const {
 }
 
 void GeometryInstance3D::_get_property_list(List<PropertyInfo> *p_list) const {
+	// Each query below waits for the render thread. Outside the editor, an instance with no parameter set has nothing to
+	// store: only the inspector lists the others. PackedScene::pack() asked once per instance, plus once per parameter.
+	if (instance_shader_parameters.is_empty() && !Engine::get_singleton()->is_editor_hint()) {
+		return;
+	}
+
 	List<PropertyInfo> pinfo;
 	RS::get_singleton()->instance_geometry_get_shader_parameter_list(get_instance(), &pinfo);
 	for (PropertyInfo &pi : pinfo) {
