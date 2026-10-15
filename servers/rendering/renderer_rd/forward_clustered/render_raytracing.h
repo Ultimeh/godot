@@ -68,7 +68,7 @@ namespace RendererSceneRenderImplementation {
 class RenderForwardClustered;
 class SceneShaderRaytracing;
 
-// Must match GLSL GeometryData (std430, 128 bytes).
+// Must match GLSL GeometryData (std430, 176 bytes).
 struct alignas(16) RT_GeometryData {
 	uint64_t vertex_buffer_address;
 	uint64_t attribute_buffer_address;
@@ -101,8 +101,25 @@ struct alignas(16) RT_GeometryData {
 	uint32_t layer_mask; // The instance's VisualInstance3D layers, against each light's cull mask.
 	uint32_t uv2_byte_offset;
 	uint32_t uv2_scale_packed; // fp16 x, fp16 y
+	// CUSTOM0-3: byte offset in an attribute (8 bits each, CUSTOM0 lowest), and 4 bits each of RT_CUSTOM_FORMAT_PRESENT
+	// | RSE::ArrayCustomFormat. 0: none, the value of a zeroed RT_GeometryData.
+	uint32_t custom_byte_offsets;
+	uint32_t custom_formats;
+	// The MultiMesh buffer whose instances this geometry draws, for COLOR and INSTANCE_CUSTOM (0: not a MultiMesh).
+	uint32_t multimesh_address_lo;
+	uint32_t multimesh_address_hi;
+	uint32_t multimesh_stride; // In floats.
+	uint32_t multimesh_offset; // The geometry's first instance in the buffer.
+	uint32_t multimesh_vertex_count; // A merged BLAS's vertices per instance; UINT32_MAX: one instance, at multimesh_offset.
+	uint32_t multimesh_data_offsets; // In floats in an instance: the color (low 16 bits), the custom data (high), 0xFFFF: none.
+	// A merged BLAS's first instance in the buffer's previous transforms (motion vectors); multimesh_offset when its instances
+	// did not move, and for one instance, whose motion is the TLAS instance's.
+	uint32_t multimesh_previous_offset;
+	uint32_t multimesh_pad[3];
 };
-static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
+static_assert(sizeof(RT_GeometryData) == 176, "RT_GeometryData must be 176 bytes for std430");
+
+static constexpr uint32_t RT_CUSTOM_FORMAT_PRESENT = 8u;
 
 /// Per-instance motion data for velocity computation (matches GLSL InstanceMotionData, 48 bytes).
 struct RT_InstanceMotionData {
@@ -247,7 +264,7 @@ struct alignas(16) RT_DisplaceJob {
 	uint32_t mm_custom_offset; // Same for the custom data.
 	uint32_t mm_pad;
 };
-static_assert(sizeof(RT_DisplaceJob) == 432, "RT_DisplaceJob must be 432 bytes for std430");
+static_assert(sizeof(RT_DisplaceJob) == 480, "RT_DisplaceJob must be 480 bytes for std430");
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
@@ -581,6 +598,11 @@ class RenderRaytracing {
 
 	RID_Owner<RTMergedMMEntry> merged_mm_pool;
 	LocalVector<RID> merged_mm_active_this_frame;
+	// MultiMesh buffers the hit shaders read this frame for their instances' COLOR and INSTANCE_CUSTOM.
+	LocalVector<RID> multimesh_buffers_read_this_frame;
+	// Points r_geom at those of p_mm_rid (its current instances), when it has colors or custom data, or is merged
+	// (p_vertex_count: vertices per instance; UINT32_MAX for one instance); false otherwise.
+	bool _set_multimesh_instance_data(RT_GeometryData &r_geom, RID p_mm_rid, RID p_mm_gpu_buffer, uint32_t p_vertex_count);
 
 	HashMap<RTLodViewKey, RTLodView> lod_views;
 	const RTLodView *_get_lod_view(void *p_mesh_surface, uint32_t p_lod);

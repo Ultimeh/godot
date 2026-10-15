@@ -219,11 +219,71 @@ vec2 fetch_uv2(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 }
 
 // ============================================================================
-// VERTEX COLOR FETCHING (RGBA8 packed in uint32)
+// MULTIMESH INSTANCE DATA (COLOR and INSTANCE_CUSTOM, as raster reads them)
+// ============================================================================
+// The 4 floats at p_float_offset in the instance drawing vertex p_index, or p_default without them.
+vec4 fetch_multimesh_data(in GeometryData geom, uint p_index, uint p_float_offset, vec4 p_default) {
+	if (geom.multimesh_address_lo == 0u && geom.multimesh_address_hi == 0u) {
+		return p_default;
+	}
+	if (p_float_offset == 0xFFFFu) {
+		return p_default;
+	}
+	// A merged BLAS's vertices are its instances' copies, one after the other. No branch around the division: DXIL's
+	// udiv by 0 gives 0xFFFFFFFF where NIR's gives 0, and the branch flattened into the previous instance on D3D12.
+	uint instance = geom.multimesh_offset + p_index / geom.multimesh_vertex_count;
+	FloatBuffer mm = FloatBuffer(packUint2x32(uvec2(geom.multimesh_address_lo, geom.multimesh_address_hi)));
+	uint o = instance * geom.multimesh_stride + p_float_offset;
+	return vec4(mm.v[o], mm.v[o + 1u], mm.v[o + 2u], mm.v[o + 3u]);
+}
+
+// An instance's transform, as raster reads it (three rows).
+mat4 fetch_multimesh_transform(in GeometryData geom, uint p_instance) {
+	FloatBuffer mm = FloatBuffer(packUint2x32(uvec2(geom.multimesh_address_lo, geom.multimesh_address_hi)));
+	uint o = p_instance * geom.multimesh_stride;
+	return transpose(mat4(vec4(mm.v[o], mm.v[o + 1u], mm.v[o + 2u], mm.v[o + 3u]),
+			vec4(mm.v[o + 4u], mm.v[o + 5u], mm.v[o + 6u], mm.v[o + 7u]),
+			vec4(mm.v[o + 8u], mm.v[o + 9u], mm.v[o + 10u], mm.v[o + 11u]),
+			vec4(0.0, 0.0, 0.0, 1.0)));
+}
+
+// A merged MultiMesh: where p_position (in the MultiMesh's space, on vertex p_index's instance) was in the previous frame.
+vec3 multimesh_previous_position(in GeometryData geom, uint p_index, vec3 p_position) {
+	uint instance = p_index / geom.multimesh_vertex_count;
+	mat4 current = fetch_multimesh_transform(geom, geom.multimesh_offset + instance);
+	mat4 previous = fetch_multimesh_transform(geom, geom.multimesh_previous_offset + instance);
+	return (previous * (inverse(current) * vec4(p_position, 1.0))).xyz;
+}
+
+// A merged MultiMesh's BLAS holds its instances' vertices in the MultiMesh's space, where raster's object space (VERTEX,
+// MODEL_MATRIX, object triplanar mapping) is each instance's: the transform of vertex p_index's instance; identity otherwise.
+bool is_merged_multimesh(in GeometryData geom) {
+	return (geom.multimesh_address_lo | geom.multimesh_address_hi) != 0u && geom.multimesh_vertex_count != 0xFFFFFFFFu;
+}
+
+mat4 merged_multimesh_instance_transform(in GeometryData geom, uint p_index) {
+	if (!is_merged_multimesh(geom)) {
+		return mat4(1.0);
+	}
+	return fetch_multimesh_transform(geom, geom.multimesh_offset + p_index / max(geom.multimesh_vertex_count, 1u));
+}
+
+vec4 fetch_instance_color(in GeometryData geom, uint p_index) {
+	return fetch_multimesh_data(geom, p_index, geom.multimesh_data_offsets & 0xFFFFu, vec4(1.0));
+}
+
+vec4 fetch_instance_custom(in GeometryData geom, uint p_index) {
+	return fetch_multimesh_data(geom, p_index, geom.multimesh_data_offsets >> 16u, vec4(0.0));
+}
+
+// ============================================================================
+// VERTEX COLOR FETCHING (RGBA8 packed in uint32), times the MultiMesh instance's color
 // ============================================================================
 vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	// The three vertices belong to the same instance.
+	vec4 instance_color = fetch_instance_color(geom, i0);
 	if (geom.color_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
-		return vec4(1.0);
+		return instance_color;
 	}
 
 	Uint32Buffer attr = Uint32Buffer(geom.attribute_address);
@@ -234,7 +294,37 @@ vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 	vec4 col1 = unpackUnorm4x8(attr.v[i1 * stride_words + color_word_off]);
 	vec4 col2 = unpackUnorm4x8(attr.v[i2 * stride_words + color_word_off]);
 
-	return bary.x * col0 + bary.y * col1 + bary.z * col2;
+	return (bary.x * col0 + bary.y * col1 + bary.z * col2) * instance_color;
+}
+
+// ============================================================================
+// CUSTOM0-3 FETCHING, as the vertex input gives them to raster (missing components 0, alpha 1)
+// ============================================================================
+vec4 fetch_custom(in GeometryData geom, uint p_custom, uint p_index) {
+	uint format = (geom.custom_formats >> (p_custom * 4u)) & 0xFu;
+	if ((format & CUSTOM_FORMAT_PRESENT) == 0u || geom.attribute_address == 0ul) {
+		return vec4(0.0);
+	}
+	Uint32Buffer attr = Uint32Buffer(geom.attribute_address);
+	uint w = p_index * (geom.attribute_stride >> 2u) + (((geom.custom_byte_offsets >> (p_custom * 8u)) & 0xFFu) >> 2u);
+	switch (format & 7u) {
+		case 0u: // RGBA8 unorm.
+			return unpackUnorm4x8(attr.v[w]);
+		case 1u: // RGBA8 snorm.
+			return unpackSnorm4x8(attr.v[w]);
+		case 2u: // RG half.
+			return vec4(unpackHalf2x16(attr.v[w]), 0.0, 1.0);
+		case 3u: // RGBA half.
+			return vec4(unpackHalf2x16(attr.v[w]), unpackHalf2x16(attr.v[w + 1u]));
+		case 4u: // R float.
+			return vec4(uintBitsToFloat(attr.v[w]), 0.0, 0.0, 1.0);
+		case 5u: // RG float.
+			return vec4(uintBitsToFloat(attr.v[w]), uintBitsToFloat(attr.v[w + 1u]), 0.0, 1.0);
+		case 6u: // RGB float.
+			return vec4(uintBitsToFloat(attr.v[w]), uintBitsToFloat(attr.v[w + 1u]), uintBitsToFloat(attr.v[w + 2u]), 1.0);
+		default: // RGBA float.
+			return uintBitsToFloat(uvec4(attr.v[w], attr.v[w + 1u], attr.v[w + 2u], attr.v[w + 3u]));
+	}
 }
 
 // ============================================================================
@@ -363,7 +453,8 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, vec2 hit_attribs,
 		attrs.has_uv = true;
 	}
 
-	if ((fetch_flags & FETCH_COLOR) != 0u && geom.color_byte_offset != OFFSET_NONE) {
+	// A MultiMesh's instance colors count without vertex colors too, as raster's white default attribute.
+	if ((fetch_flags & FETCH_COLOR) != 0u && (geom.color_byte_offset != OFFSET_NONE || (geom.multimesh_address_lo | geom.multimesh_address_hi) != 0u)) {
 		attrs.color = fetch_color(geom, i0, i1, i2, bary);
 		attrs.has_color = true;
 	}

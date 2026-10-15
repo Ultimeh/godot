@@ -164,6 +164,18 @@ vec3 displace_vertex(DisplaceJob p_job, vec3 p_rest_position, TBNResult p_tbn, u
 	uv_interp = fetch_uv(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
 	uv2_interp = fetch_uv2(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0));
 	color_interp = fetch_color(p_job.geom, p_index, p_index, p_index, vec3(1.0, 0.0, 0.0)) * rt_displace_instance_color;
+#ifdef CUSTOM0_USED
+	custom0_attrib = fetch_custom(p_job.geom, 0u, p_index);
+#endif
+#ifdef CUSTOM1_USED
+	custom1_attrib = fetch_custom(p_job.geom, 1u, p_index);
+#endif
+#ifdef CUSTOM2_USED
+	custom2_attrib = fetch_custom(p_job.geom, 2u, p_index);
+#endif
+#ifdef CUSTOM3_USED
+	custom3_attrib = fetch_custom(p_job.geom, 3u, p_index);
+#endif
 	rt_vertex_id = int(p_index);
 
 	/* RT_CUSTOM_VERTEX_CALL */

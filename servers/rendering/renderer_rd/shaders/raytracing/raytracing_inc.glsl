@@ -148,6 +148,7 @@ bool is_path_terminated(uint packed) {
 // CONSTANTS
 // ============================================================================
 const uint OFFSET_NONE = 0xFFFFFFFFu;
+const uint CUSTOM_FORMAT_PRESENT = 8u; // In GeometryData.custom_formats, with the mesh's format.
 const uint FLAG_COMPRESSED = 1u;
 const uint FLAG_PROCEDURAL = 2u;
 // Set when the BLAS uses a per-frame-deformed vertex buffer.

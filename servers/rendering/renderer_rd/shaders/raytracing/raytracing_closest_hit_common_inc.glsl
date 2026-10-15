@@ -236,6 +236,11 @@ void write_primary_hit_velocity(vec3 hit_pos) {
 					prev_vb.v[i2 * stride_floats + 2u]);
 			prev_obj_pos = bary.x * p0 + bary.y * p1 + bary.z * p2;
 		}
+	} else if (geom.multimesh_previous_offset != geom.multimesh_offset) {
+		// A merged MultiMesh whose instances moved, as raster's motion vectors see them.
+		uint i0, i1, i2;
+		get_triangle_indices(geom, i0, i1, i2);
+		prev_obj_pos = multimesh_previous_position(geom, i0, obj_pos);
 	}
 #endif
 

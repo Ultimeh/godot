@@ -12,7 +12,7 @@ layout(buffer_reference, std430) readonly buffer Uint32Buffer {
 };
 
 // ============================================================================
-// GEOMETRY DATA (matches C++ RT_GeometryData, 128 bytes)
+// GEOMETRY DATA (matches C++ RT_GeometryData, 176 bytes)
 // ============================================================================
 struct GeometryData {
 	uint64_t vertex_address;
@@ -55,6 +55,25 @@ struct GeometryData {
 	uint layer_mask; // The instance's layers, against each light's cull mask.
 	uint uv2_byte_offset;
 	uint uv2_scale_packed; // fp16 x, fp16 y
+
+	// CUSTOM0-3: byte offset in an attribute (8 bits each, CUSTOM0 lowest), and 4 bits each of CUSTOM_FORMAT_PRESENT
+	// | the mesh's custom format. 0: none.
+	uint custom_byte_offsets;
+	uint custom_formats;
+
+	// The MultiMesh buffer whose instances this geometry draws, for COLOR and INSTANCE_CUSTOM (0: not a MultiMesh).
+	uint multimesh_address_lo;
+	uint multimesh_address_hi;
+	uint multimesh_stride; // In floats.
+	uint multimesh_offset; // The geometry's first instance in the buffer.
+	uint multimesh_vertex_count; // A merged BLAS's vertices per instance; 0xFFFFFFFF: one instance, at multimesh_offset.
+	uint multimesh_data_offsets; // In floats in an instance: the color (low 16 bits), the custom data (high), 0xFFFF: none.
+	// A merged BLAS's first instance in the buffer's previous transforms (motion vectors); multimesh_offset when its instances
+	// did not move, and for one instance, whose motion is the TLAS instance's.
+	uint multimesh_previous_offset;
+	uint multimesh_pad0;
+	uint multimesh_pad1;
+	uint multimesh_pad2;
 };
 
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {

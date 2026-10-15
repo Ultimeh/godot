@@ -486,6 +486,7 @@ void RenderRaytracing::cleanup_caches() {
 	mm_handles.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
+	multimesh_buffers_read_this_frame.clear();
 
 	for (KeyValue<RTLodViewKey, RTLodView> &kv : lod_views) {
 		_free_lod_view(kv.value);
@@ -650,6 +651,7 @@ void RenderRaytracing::prepare_frame() {
 	motion_transforms.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
+	multimesh_buffers_read_this_frame.clear();
 
 	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 	RD *rd = RD::get_singleton();
@@ -1152,6 +1154,9 @@ static void _fill_surface_geometry_data(
 		if (surface_format & (1ULL << (RSE::ARRAY_CUSTOM0 + ci))) {
 			uint32_t fmt = (surface_format >> fmt_shift[ci]) & RSE::ARRAY_FORMAT_CUSTOM_MASK;
 			const uint32_t fmtsize[RSE::ARRAY_CUSTOM_MAX] = { 4, 4, 4, 8, 4, 8, 12, 16 };
+			// Read by vertex() as CUSTOM0-3.
+			geom.custom_byte_offsets |= attrib_offset << (ci * 8);
+			geom.custom_formats |= (RT_CUSTOM_FORMAT_PRESENT | fmt) << (ci * 4);
 			attrib_offset += fmtsize[fmt];
 		}
 	}
@@ -2640,6 +2645,32 @@ const RTLodView *RenderRaytracing::_get_lod_view(void *p_mesh_surface, uint32_t 
 	return &lod_views.insert(key, new_view)->value;
 }
 
+bool RenderRaytracing::_set_multimesh_instance_data(RT_GeometryData &r_geom, RID p_mm_rid, RID p_mm_gpu_buffer, uint32_t p_vertex_count) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const bool uses_colors = mesh_storage->multimesh_uses_colors(p_mm_rid);
+	const bool uses_custom_data = mesh_storage->multimesh_uses_custom_data(p_mm_rid);
+	uint32_t current_offset = 0;
+	uint32_t previous_offset = 0;
+	// The previous transforms are kept while a viewport uses motion vectors (DLSS, TAA), as raster reads them.
+	const bool moved = p_vertex_count != UINT32_MAX && mesh_storage->_multimesh_get_motion_vectors_offsets(p_mm_rid, current_offset, previous_offset) && previous_offset != current_offset;
+	// A merged BLAS always: its hit shaders find each instance's transform there (its object space, as raster's).
+	if ((!uses_colors && !uses_custom_data && p_vertex_count == UINT32_MAX) || !p_mm_gpu_buffer.is_valid()) {
+		return false;
+	}
+	// The 3D layout, as raster reads it: 12 floats of transform, then 4 of color and 4 of custom data when used.
+	const uint32_t color_offset = uses_colors ? 12 : 0xFFFF;
+	const uint32_t custom_offset = uses_custom_data ? (uses_colors ? 16 : 12) : 0xFFFF;
+	const uint64_t address = RD::get_singleton()->buffer_get_device_address(p_mm_gpu_buffer);
+	r_geom.multimesh_address_lo = uint32_t(address);
+	r_geom.multimesh_address_hi = uint32_t(address >> 32);
+	r_geom.multimesh_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
+	r_geom.multimesh_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
+	r_geom.multimesh_previous_offset = moved ? previous_offset : r_geom.multimesh_offset;
+	r_geom.multimesh_vertex_count = p_vertex_count;
+	r_geom.multimesh_data_offsets = color_offset | (custom_offset << 16);
+	return true;
+}
+
 bool RenderRaytracing::_mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count, const RTLodView *p_lod_view) const {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	// Compressed meshes are skipped: their positions are UNORM16x4, not float3.
@@ -3116,6 +3147,11 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	// Point attribute address at fully replicated attribute buffer.
 	if (has_attr && entry.merged_attr_buffer.is_valid()) {
 		geom.attribute_buffer_address = rd->buffer_get_device_address(entry.merged_attr_buffer);
+	}
+
+	// Its instances' COLOR, INSTANCE_CUSTOM and motion, read from the MultiMesh buffer: instance = merged vertex / vertex_count.
+	if (_set_multimesh_instance_data(geom, p_mm_rid, p_mm_gpu_buffer, vertex_count)) {
+		multimesh_buffers_read_this_frame.push_back(p_mm_gpu_buffer);
 	}
 
 	// Point index address at the replicated (uint32) index buffer.
@@ -3719,7 +3755,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
 			material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
-			motion_indices.push_back(-1);
+			// The node's motion; its instances' own is the hit shader's (multimesh_previous_position()).
+			if (pending.transform_moved) {
+				motion_indices.push_back((int32_t)motion_transforms.size());
+				RT_InstanceMotionData motion = {};
+				RendererRD::MaterialStorage::store_transform_transposed_3x4(pending.prev_instance_transform, motion.prev_object_to_world);
+				motion_transforms.push_back(motion);
+			} else {
+				motion_indices.push_back(-1);
+			}
 			instance_flags.push_back(pending.inst_flags);
 			instance_masks.push_back(instance_mask(pending.mm_surf->owner));
 #ifdef TOOLS_ENABLED
@@ -3751,21 +3795,35 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
+			RT_GeometryData mm_geometry = surf_data->geometry;
+			const bool reads_multimesh = _set_multimesh_instance_data(mm_geometry, pending.mm_rid, pending.mm_gpu_buffer, UINT32_MAX);
+			if (reads_multimesh) {
+				multimesh_buffers_read_this_frame.push_back(pending.mm_gpu_buffer);
+			}
+			// The instances' previous transforms, as raster's motion vectors read them (while a viewport uses them).
+			uint32_t mm_motion_current_offset = 0;
+			uint32_t mm_prev_offset = 0;
+			const bool mm_moved = mesh_storage->_multimesh_get_motion_vectors_offsets(pending.mm_rid, mm_motion_current_offset, mm_prev_offset) && mm_prev_offset != mm_cur_offset;
+			auto read_mm_xform = [](const float *d) {
+				Transform3D xform;
+				xform.basis.rows[0][0] = d[0];
+				xform.basis.rows[0][1] = d[1];
+				xform.basis.rows[0][2] = d[2];
+				xform.origin.x = d[3];
+				xform.basis.rows[1][0] = d[4];
+				xform.basis.rows[1][1] = d[5];
+				xform.basis.rows[1][2] = d[6];
+				xform.origin.y = d[7];
+				xform.basis.rows[2][0] = d[8];
+				xform.basis.rows[2][1] = d[9];
+				xform.basis.rows[2][2] = d[10];
+				xform.origin.z = d[11];
+				return xform;
+			};
+
 			for (uint32_t mi = 0; mi < pending.mm_count; mi++) {
-				const float *d = mm_data + (mm_cur_offset + mi) * mm_stride;
-				Transform3D mm_xform;
-				mm_xform.basis.rows[0][0] = d[0];
-				mm_xform.basis.rows[0][1] = d[1];
-				mm_xform.basis.rows[0][2] = d[2];
-				mm_xform.origin.x = d[3];
-				mm_xform.basis.rows[1][0] = d[4];
-				mm_xform.basis.rows[1][1] = d[5];
-				mm_xform.basis.rows[1][2] = d[6];
-				mm_xform.origin.y = d[7];
-				mm_xform.basis.rows[2][0] = d[8];
-				mm_xform.basis.rows[2][1] = d[9];
-				mm_xform.basis.rows[2][2] = d[10];
-				mm_xform.origin.z = d[11];
+				const Transform3D mm_xform = read_mm_xform(mm_data + (mm_cur_offset + mi) * mm_stride);
+				const Transform3D prev_mm_xform = mm_moved ? read_mm_xform(mm_data + (mm_prev_offset + mi) * mm_stride) : mm_xform;
 
 				Transform3D final_transform = pending.instance_transform * mm_xform;
 				if (surf_data->is_compressed) {
@@ -3774,14 +3832,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				blass.push_back(surf_data->blas);
 				blas_transforms.push_back(final_transform);
-				geometry_data.push_back(surf_data->geometry);
+				geometry_data.push_back(mm_geometry);
 				geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
+				geometry_data[geometry_data.size() - 1].multimesh_offset = mm_cur_offset + mi;
+				geometry_data[geometry_data.size() - 1].multimesh_previous_offset = mm_cur_offset + mi;
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 				material_data.push_back(pending.mat_data->data);
 				material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
 
-				if (pending.transform_moved) {
-					Transform3D prev_final = pending.prev_instance_transform * mm_xform;
+				// Each instance's own motion too: a moving unit of a MultiMesh had none, and DLSS kept its texture where it
+				// was on screen.
+				if (pending.transform_moved || prev_mm_xform != mm_xform) {
+					Transform3D prev_final = (pending.transform_moved ? pending.prev_instance_transform : pending.instance_transform) * prev_mm_xform;
 					if (surf_data->is_compressed) {
 						prev_final = prev_final * surf_data->aabb_transform;
 					}
@@ -4490,6 +4552,10 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 		if (e->displaced && e->merged_prev_buffer.is_valid()) {
 			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_prev_buffer, /*p_writable=*/false);
 		}
+	}
+	// MultiMesh buffers, written by every change of their instances.
+	for (const RID &buffer : multimesh_buffers_read_this_frame) {
+		rd->raytracing_list_add_buffer_dependency(p_list, buffer, /*p_writable=*/false);
 	}
 }
 

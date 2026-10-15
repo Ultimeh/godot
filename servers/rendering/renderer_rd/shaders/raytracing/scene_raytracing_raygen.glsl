@@ -530,15 +530,19 @@ void main() {
 	HitData nh = h;
 	if (triplanar) {
 		bool world = (mat.flags & MAT_FLAG_UV1_WORLD_TRIPLANAR) != 0u;
-		vec3 n = world ? h.geometry_normal : h.mesh_normal;
-		vec3 pos = world ? h.hit_pos : h.mesh_pos;
+		// A merged MultiMesh: object space is the instance's, as raster's, not the MultiMesh's of its BLAS.
+		bool mm_merged = !world && is_merged_multimesh(geom);
+		mat4 mm_instance = mm_merged ? merged_multimesh_instance_transform(geom, i0) : mat4(1.0);
+		mat4 inv_mm_instance = mm_merged ? inverse(mm_instance) : mat4(1.0);
+		vec3 n = world ? h.geometry_normal : normalize(transpose(mat3(mm_instance)) * h.mesh_normal);
+		vec3 pos = world ? h.hit_pos : (inv_mm_instance * vec4(h.mesh_pos, 1.0)).xyz;
 		triplanar_weights = pow(abs(n), vec3(mat.uv1_blend_sharpness));
 		triplanar_weights /= dot(triplanar_weights, vec3(1.0));
 		triplanar_pos = pos * vec3(mat.uv1_scale, mat.uv1_scale_z) + vec3(mat.uv1_offset, mat.uv1_offset_z);
 		triplanar_pos *= vec3(1.0, -1.0, 1.0);
-		vec3 p0 = fetch_mesh_position(geom, i0);
-		vec3 p1 = fetch_mesh_position(geom, i1);
-		vec3 p2 = fetch_mesh_position(geom, i2);
+		vec3 p0 = (inv_mm_instance * vec4(fetch_mesh_position(geom, i0), 1.0)).xyz;
+		vec3 p1 = (inv_mm_instance * vec4(fetch_mesh_position(geom, i1), 1.0)).xyz;
+		vec3 p2 = (inv_mm_instance * vec4(fetch_mesh_position(geom, i2), 1.0)).xyz;
 		if (world) {
 			mat4 mesh_to_world = mat4(gl_ObjectToWorldEXT);
 			if ((geom.flags & FLAG_COMPRESSED) != 0u) {
@@ -558,8 +562,8 @@ void main() {
 		vec3 tangent = normalize(vec3(0.0, 0.0, -1.0) * an.x + vec3(1.0, 0.0, 0.0) * (an.y + an.z));
 		vec3 binormal = normalize(vec3(0.0, 1.0, 0.0) * (an.x + an.z) + vec3(0.0, 0.0, -1.0) * an.y);
 		if (!world) {
-			// Same rotation compute_hit_data() applies to the mesh's tangents.
-			mat3 model_rotation = mat3(gl_ObjectToWorldEXT);
+			// Same rotation compute_hit_data() applies to the mesh's tangents, from the instance's space.
+			mat3 model_rotation = mat3(gl_ObjectToWorldEXT) * mat3(mm_instance);
 			mat3 normal_matrix = mat3(normalize(model_rotation[0]), normalize(model_rotation[1]), normalize(model_rotation[2]));
 			tangent = normal_matrix * tangent;
 			binormal = normal_matrix * binormal;

@@ -37,7 +37,11 @@ mat4 rt_aabb_xform;
 mat4 rt_inv_aabb_xform;
 get_aabb_compression_xforms(rt_geom, rt_aabb_xform, rt_inv_aabb_xform);
 
-read_model_matrix = mat4(gl_ObjectToWorldEXT) * rt_inv_aabb_xform;
+// A merged MultiMesh: object space is the instance's, as raster's (VERTEX, MODEL_MATRIX), not the MultiMesh's of its BLAS.
+bool rt_mm_merged = (rt_geom.flags & FLAG_PROCEDURAL) == 0u && is_merged_multimesh(rt_geom);
+mat4 rt_mm_instance = rt_mm_merged ? merged_multimesh_instance_transform(rt_geom, rt_i0) : mat4(1.0);
+mat4 rt_inv_mm_instance = rt_mm_merged ? inverse(rt_mm_instance) : mat4(1.0);
+read_model_matrix = mat4(gl_ObjectToWorldEXT) * rt_inv_aabb_xform * rt_mm_instance;
 model_normal_matrix = transpose(inverse(mat3(read_model_matrix)));
 read_view_matrix = rt_view_matrix;
 inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
@@ -49,7 +53,7 @@ inv_projection_matrix = scene_data_block.data.inv_projection_matrix;
 read_viewport_size = scene_data_block.data.viewport_size;
 global_time = scene_data_block.data.time;
 
-mat4 rt_world_to_object_decomp = rt_aabb_xform * mat4(gl_WorldToObjectEXT);
+mat4 rt_world_to_object_decomp = rt_inv_mm_instance * rt_aabb_xform * mat4(gl_WorldToObjectEXT);
 
 #ifdef VERTEX_WORLD_COORDS_USED
 vertex = rt_hit_pos;
@@ -78,6 +82,9 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 	// holds vertex()'s output already) and interpolate what it writes: run once at the hit, a texelFetch() in vertex()
 	// would snap to one texel. The vertex values also give the screen derivatives.
 	uint rt_corner_index[3] = uint[3](rt_i0, rt_i1, rt_i2);
+#ifdef ENABLE_INSTANCE_CUSTOM
+	instance_custom = fetch_instance_custom(rt_geom, rt_i0);
+#endif
 	for (int rt_corner = 0; rt_corner < 3; rt_corner++) {
 		uint rt_index = rt_corner_index[rt_corner];
 		vec3 rt_rest = (rt_geom.flags & FLAG_DISPLACED) != 0u ? fetch_rest_vertex(rt_geom, rt_index) : fetch_mesh_position(rt_geom, rt_index);
@@ -87,6 +94,12 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 		rt_tbn.binormal = vec3(0.0, 0.0, 1.0);
 		if (rt_geom.normal_byte_offset != OFFSET_NONE) {
 			rt_tbn = (rt_geom.flags & FLAG_COMPRESSED) != 0u ? fetch_tbn_compressed_vertex(rt_geom, rt_index) : fetch_tbn_uncompressed_vertex(rt_geom, rt_index);
+		}
+		if (rt_mm_merged) {
+			rt_rest = (rt_inv_mm_instance * vec4(rt_rest, 1.0)).xyz;
+			rt_tbn.normal = normalize(transpose(mat3(rt_mm_instance)) * rt_tbn.normal);
+			rt_tbn.tangent = normalize(mat3(rt_inv_mm_instance) * rt_tbn.tangent);
+			rt_tbn.binormal = normalize(mat3(rt_inv_mm_instance) * rt_tbn.binormal);
 		}
 #ifdef VERTEX_WORLD_COORDS_USED
 		vertex = (read_model_matrix * vec4(rt_rest, 1.0)).xyz;
@@ -102,6 +115,18 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 		uv_interp = fetch_uv(rt_geom, rt_index, rt_index, rt_index, vec3(1.0, 0.0, 0.0));
 		uv2_interp = fetch_uv2(rt_geom, rt_index, rt_index, rt_index, vec3(1.0, 0.0, 0.0));
 		color_interp = fetch_color(rt_geom, rt_index, rt_index, rt_index, vec3(1.0, 0.0, 0.0));
+#ifdef CUSTOM0_USED
+		custom0_attrib = fetch_custom(rt_geom, 0u, rt_index);
+#endif
+#ifdef CUSTOM1_USED
+		custom1_attrib = fetch_custom(rt_geom, 1u, rt_index);
+#endif
+#ifdef CUSTOM2_USED
+		custom2_attrib = fetch_custom(rt_geom, 2u, rt_index);
+#endif
+#ifdef CUSTOM3_USED
+		custom3_attrib = fetch_custom(rt_geom, 3u, rt_index);
+#endif
 		rt_vertex_id = int(rt_index);
 
 		/* RT_CUSTOM_VERTEX_CALL */
