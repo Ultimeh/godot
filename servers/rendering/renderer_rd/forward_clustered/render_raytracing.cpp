@@ -2286,31 +2286,28 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			}
 
 			if (!used_pool) {
-				// Oversized or pool exhausted: dedicated per-material buffer.
-				// This is the slow path: a per-material storage_buffer_create on
-				// every rebuild. Warn once so it's visible in the log; the fix is
-				// either to shrink the material's uniform footprint below
-				// MAT_UBO_POOL_SLOT_SIZE or to grow the pool slot/capacity.
-				const char *reason = (cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE)
-						? "uniform size exceeds slot"
-						: "pool exhausted";
-				WARN_PRINT_ONCE(vformat(
-						"RT Material UBO falling back to dedicated buffer (%s): "
-						"sbt_offset=%d, uniform_total_size=%d, slot_size=%d.",
-						String(reason), mat_data->rt_sbt_offset,
-						cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
-
+				// Oversized or pool exhausted: a buffer of the material's own, updated in place by the next rebuilds of the
+				// same size. Recreating it on every rebuild allocated a buffer (and on D3D12 a GPU pointer descriptor) every
+				// frame for a material changed every frame: Terrain3D's (36 KB of region maps) follows the camera.
 				if (mat_data->uniform_pool_slot != UINT32_MAX) {
 					mat_ubo_pool_release(mat_data->uniform_pool_slot);
 					mat_data->uniform_pool_slot = UINT32_MAX;
 				}
-				if (mat_data->uniform_buffer.is_valid()) {
-					mat_ubo_dedicated_buffers.erase(mat_data->uniform_buffer);
-					RD::get_singleton()->free_rid(mat_data->uniform_buffer);
+				if (mat_data->uniform_buffer.is_valid() && mat_data->uniform_buffer_size == cse->uniform_total_size) {
+					RD::get_singleton()->buffer_update(mat_data->uniform_buffer, 0, cse->uniform_total_size, ubo_data.ptr());
+				} else {
+					if (mat_data->uniform_buffer.is_valid()) {
+						mat_ubo_dedicated_buffers.erase(mat_data->uniform_buffer);
+						RD::get_singleton()->free_rid(mat_data->uniform_buffer);
+					}
+					print_verbose(vformat("RT: material uniforms in a buffer of their own (%s): sbt_offset=%d, %d bytes, pool slots %d bytes.",
+							cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE ? "larger than a pool slot" : "pool exhausted",
+							mat_data->rt_sbt_offset, cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
+					mat_data->uniform_buffer = RD::get_singleton()->storage_buffer_create(cse->uniform_total_size, ubo_data, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+					mat_data->uniform_buffer_size = cse->uniform_total_size;
+					mat_ubo_dedicated_buffers.insert(mat_data->uniform_buffer);
+					RD::get_singleton()->set_resource_name(mat_data->uniform_buffer, String("RT Material UBO [sbt=") + itos(mat_data->rt_sbt_offset) + "]");
 				}
-				mat_data->uniform_buffer = RD::get_singleton()->storage_buffer_create(cse->uniform_total_size, ubo_data, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
-				mat_ubo_dedicated_buffers.insert(mat_data->uniform_buffer);
-				RD::get_singleton()->set_resource_name(mat_data->uniform_buffer, String("RT Material UBO [sbt=") + itos(mat_data->rt_sbt_offset) + "]");
 				mat.uniform_address = RD::get_singleton()->buffer_get_device_address(mat_data->uniform_buffer);
 			}
 		}

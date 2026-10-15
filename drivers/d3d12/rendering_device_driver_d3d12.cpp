@@ -392,10 +392,19 @@ Error RenderingDeviceDriverD3D12::DescriptorHeap::_allocate(uint32_t p_descripto
 
 	// This error is expected, and needs to be handled by the caller.
 	if (hr == E_OUTOFMEMORY) {
+		D3D12MA::DetailedStatistics detailed = {};
+		virtual_block->CalculateStatistics(&detailed);
+		failed_allocations++;
+		last_failed_count = p_descriptor_count;
+		last_failed_largest_free = detailed.UnusedRangeSizeMax;
 		return ERR_OUT_OF_MEMORY;
 	}
 
 	ERR_FAIL_COND_V_MSG(FAILED(hr), ERR_CANT_CREATE, "Allocate failed with error " + vformat("0x%08ux", (uint64_t)hr) + ".");
+
+	D3D12MA::Statistics stats = {};
+	virtual_block->GetStatistics(&stats);
+	peak_used = MAX(peak_used, stats.AllocationBytes);
 
 	r_allocation.virtual_alloc_handle = virtual_alloc.AllocHandle;
 	r_allocation.cpu_handle = get_cpu_handle(cpu_handle, offset, increment_size);
@@ -1021,6 +1030,7 @@ bool RenderingDeviceDriverD3D12::buffer_set_texel_format(BufferID p_buffer, Data
 void RenderingDeviceDriverD3D12::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
 	if (buf_info->has_device_address_descriptor) {
+		device_address_descriptor_count--;
 		resource_descriptor_heap.free(buf_info->device_address_descriptor);
 	}
 	if (buf_info->is_dynamic()) {
@@ -1095,6 +1105,7 @@ uint64_t RenderingDeviceDriverD3D12::buffer_get_device_address(BufferID p_buffer
 		uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
 		device->CreateUnorderedAccessView(buf_info->resource, nullptr, &uav_desc, buf_info->device_address_descriptor.cpu_handle);
 		buf_info->has_device_address_descriptor = true;
+		device_address_descriptor_count++;
 	}
 	const uint64_t heap_index = (buf_info->device_address_descriptor.gpu_handle.ptr - resource_descriptor_heap.gpu_handle.ptr) / resource_descriptor_heap.increment_size;
 	return heap_index << 32;
@@ -3758,8 +3769,9 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		if (unlikely(err != OK)) {
 			VersatileResource::free(resources_allocator, uniform_set_info);
 
-			ERR_FAIL_COND_V_MSG(err == ERR_OUT_OF_MEMORY, UniformSetID(), "Cannot create uniform set because there's not enough room in the RESOURCES descriptor heap.\n"
-																		  "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.");
+			ERR_FAIL_COND_V_MSG(err == ERR_OUT_OF_MEMORY, UniformSetID(), vformat("Cannot create uniform set because there's not enough room in the RESOURCES descriptor heap (%d descriptors needed, largest free range %d).\n"
+																		  "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.",
+																		  resource_descriptor_count, resource_descriptor_heap.last_failed_largest_free));
 
 			ERR_FAIL_V_MSG(UniformSetID(), "Failed to allocate resource descriptors.");
 		}
@@ -6674,8 +6686,15 @@ String RenderingDeviceDriverD3D12::get_descriptor_report() {
 	const uint32_t capacity = resource_descriptor_heap_capacity;
 	const double percent = capacity > 0 ? (double)used * 100.0 / (double)capacity : 0.0;
 
-	return vformat("D3D12 RESOURCES heap: %d / %d descriptors (%.1f%%), %d allocations",
-			used, capacity, percent, stats.AllocationCount);
+	const uint64_t peak = resource_descriptor_heap.peak_used;
+	String report = vformat("D3D12 RESOURCES heap: %d / %d descriptors (%.1f%%), %d allocations, peak %d (%.1f%%), GPU pointers %d",
+			used, capacity, percent, stats.AllocationCount, peak, capacity > 0 ? (double)peak * 100.0 / (double)capacity : 0.0,
+			device_address_descriptor_count);
+	if (resource_descriptor_heap.failed_allocations > 0) {
+		report += vformat(", %d failed (last needed %d, largest free range %d)", resource_descriptor_heap.failed_allocations,
+				resource_descriptor_heap.last_failed_count, resource_descriptor_heap.last_failed_largest_free);
+	}
+	return report;
 }
 
 uint64_t RenderingDeviceDriverD3D12::limit_get(Limit p_limit) {

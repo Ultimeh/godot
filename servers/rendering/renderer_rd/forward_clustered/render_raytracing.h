@@ -297,6 +297,7 @@ struct RTMaterialData {
 	uint32_t rt_sbt_offset = 0;
 	bool is_custom_shader = false;
 	RID uniform_buffer; // Buffer pointer for mats > 512 bytes.
+	uint32_t uniform_buffer_size = 0; // Its size: a rebuild of the same size updates it in place.
 	uint32_t uniform_pool_slot = UINT32_MAX; // Index into the material UBO pool, or UINT32_MAX (unused)
 	RID albedo_texture_rd;
 	RID normal_texture_rd;

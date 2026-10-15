@@ -155,6 +155,13 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 		// thread (uniform sets) and by the graph replay (clears), which may run on another thread: they lock this.
 		Mutex *mutex = nullptr;
 
+		// For get_descriptor_report(): the most descriptors allocated at once, and the allocations that did not fit (a
+		// range must be contiguous, so one can fail with enough room in total).
+		uint64_t peak_used = 0;
+		uint32_t failed_allocations = 0;
+		uint32_t last_failed_count = 0;
+		uint64_t last_failed_largest_free = 0;
+
 		Error initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible);
 
 		Error allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
@@ -182,6 +189,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 
 	DescriptorHeap resource_descriptor_heap;
 	uint32_t resource_descriptor_heap_capacity = 0; // Its size, for get_descriptor_report().
+	uint32_t device_address_descriptor_count = 0; // Buffers with a GPU pointer descriptor, for get_descriptor_report().
 	DescriptorHeap sampler_descriptor_heap;
 	CPUDescriptorHeapPool resource_descriptor_heap_pool;
 	CPUDescriptorHeapPool rtv_descriptor_heap_pool;
