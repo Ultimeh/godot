@@ -100,7 +100,8 @@ public:
 	static constexpr int RT_PARAM_MAX_BOUNCES = 2;
 	static constexpr int RT_PARAM_DENOISER = 3;
 	static constexpr int RT_PARAM_FRONT_LAYER_COUNT = 4;
-	// Indices 5-13 reserved for future use.
+	static constexpr int RT_PARAM_DECAL_COUNT = 5;
+	// Indices 6-13 reserved for future use.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 

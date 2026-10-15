@@ -404,6 +404,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 // clang-format off
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_closest_hit_common_inc.glsl"
+#include "raytracing_decals_inc.glsl"
 // clang-format on
 
 // ============================================================================
@@ -475,6 +476,7 @@ void main() {
 	if (any(isnan(m.normal))) {
 		m.normal = h.geometry_normal; // Material code can leave NaN normals (screen derivatives are zero here).
 	}
+	vec3 rt_geo_normal = m.normal; // Raster's: the fragment's NORMAL, before NORMAL_MAP.
 
 	// NORMAL_MAP as raster applies it: in the fragment's own TANGENT, BINORMAL and NORMAL, which a material can compute
 	// itself (Terrain3D derives them from its heightmap; the mesh's tangent frame would turn its relief inside out).
@@ -488,6 +490,8 @@ void main() {
 			m.normal = h.geometry_normal;
 		}
 	}
+
+	rt_apply_decals(h, rt_geo_normal, m);
 
 #ifdef RT_DEBUG_ENABLED
 	{
@@ -633,14 +637,16 @@ void main() {
 	}
 	m.specular_disabled = (mat.flags & MAT_FLAG_SPECULAR_DISABLED) != 0u;
 
+	rt_apply_decals(h, h.geometry_normal, m);
+
 #ifdef RT_DEBUG_ENABLED
 	{
 		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
 		if (VIS_MODE != 0) {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
-			debug_visualize(VIS_MODE, h.geometry_normal, final_normal, tangent_space_normal,
-					h.tangent, h.bitangent, uv, albedo, orm, metalness, roughness, mat.specular, emissive, V, NdotV);
+			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, tangent_space_normal,
+					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive, V, NdotV);
 			return;
 		}
 	}

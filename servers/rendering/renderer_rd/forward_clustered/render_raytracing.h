@@ -184,6 +184,36 @@ struct alignas(16) RT_LightData {
 };
 static_assert(sizeof(RT_LightData) == 80, "RT_LightData must be 80 bytes for std430");
 
+// Must match GLSL RTDecalData (raytracing_decals_inc.glsl, std430, 224 bytes). What raster's DecalData holds in view space
+// (TextureStorage::update_decal_buffer()), in world space.
+struct alignas(16) RT_DecalData {
+	float xform[12]; // World to decal space, rows: x and z in [0, 1], y in [-1, 1] inside its box.
+	float albedo_rect[4]; // In the decal atlas; zero: no texture.
+	float normal_rect[4];
+	float orm_rect[4];
+	float emission_rect[4];
+	float modulate[4]; // Linear, its alpha times the distance fade.
+	float emission_energy; // Times the distance fade.
+	uint32_t mask; // Decal.cull_mask, against the instance's layers.
+	float upper_fade;
+	float lower_fade;
+	float normal_xform[12]; // The decal's orthonormalized basis, rows: its normal map to world space.
+	float normal[3]; // Its Y axis, world space, for the normal fade.
+	float normal_fade;
+	float albedo_mix;
+	uint32_t pad[3];
+};
+static_assert(sizeof(RT_DecalData) == 224, "RT_DecalData must be 224 bytes for std430");
+
+enum {
+	// Decals around the camera the hit shaders see, the nearest ones (raster's max_clustered_elements limits the frustum's).
+	RT_DECALS_MAX = 4096,
+	// A decal over more grid cells than this is tested at every hit instead (gather_decals()).
+	RT_DECAL_GRID_MAX_CELLS = 128,
+	RT_DECAL_GRID_MAX_BUCKETS = 1 << 16,
+	RT_DECAL_GRID_HEADER = 4,
+};
+
 enum {
 	RT_LIGHTS_MAX = 64,
 	RT_LIGHTS_FRUSTUM_BUDGET = 48,
@@ -461,6 +491,13 @@ struct RTViewportState {
 
 	RID light_buffer;
 	RID params_buffer;
+	// The decals (RT_DecalData) and their grid (gather_decals()), uploaded when they change.
+	RID decal_buffer;
+	uint32_t decal_buffer_capacity = 0;
+	RID decal_grid_buffer;
+	uint32_t decal_grid_buffer_capacity = 0;
+	LocalVector<RT_DecalData> uploaded_decals;
+	LocalVector<uint32_t> uploaded_decal_grid;
 	RID scene_uniform_set;
 
 	uint32_t frame_counter = 0;
@@ -634,6 +671,8 @@ class RenderRaytracing {
 	LocalVector<Transform3D> blas_transforms;
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // RT_INSTANCE_MASK_* bits.
+	LocalVector<RT_DecalData> decal_data;
+	LocalVector<uint32_t> decal_grid;
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 	uint32_t front_layer_instance_count = 0;
 
@@ -729,6 +768,9 @@ public:
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
+	// The decals around the camera, in world space, and a hashed grid of them for the hit shaders; uploads them to
+	// p_state's buffers. Returns their number.
+	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);

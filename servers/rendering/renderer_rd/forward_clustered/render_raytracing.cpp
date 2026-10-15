@@ -194,6 +194,12 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
 	}
+	if (p_state->decal_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->decal_buffer);
+	}
+	if (p_state->decal_grid_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->decal_grid_buffer);
+	}
 	if (p_state->scene_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(p_state->scene_uniform_set)) {
 		RD::get_singleton()->free_rid(p_state->scene_uniform_set);
 	}
@@ -4163,6 +4169,284 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 }
 
 // ---------------------------------------------------------------------------
+// Decals
+// ---------------------------------------------------------------------------
+
+// Same as rt_decal_grid_hash() in raytracing_decals_inc.glsl.
+static _FORCE_INLINE_ uint32_t _rt_decal_grid_hash(int32_t p_x, int32_t p_y, int32_t p_z) {
+	return (uint32_t(p_x) * 73856093u) ^ (uint32_t(p_y) * 19349663u) ^ (uint32_t(p_z) * 83492791u);
+}
+
+// A transform as three vec4 rows (dot products in GLSL).
+static void _rt_store_rows(const Transform3D &p_xform, float *r_rows) {
+	for (int i = 0; i < 3; i++) {
+		r_rows[i * 4 + 0] = p_xform.basis.rows[i][0];
+		r_rows[i * 4 + 1] = p_xform.basis.rows[i][1];
+		r_rows[i * 4 + 2] = p_xform.basis.rows[i][2];
+		r_rows[i * 4 + 3] = p_xform.origin[i];
+	}
+}
+
+static void _rt_store_rect(const Rect2 &p_rect, float *r_rect) {
+	r_rect[0] = p_rect.position.x;
+	r_rect[1] = p_rect.position.y;
+	r_rect[2] = p_rect.size.x;
+	r_rect[3] = p_rect.size.y;
+}
+
+// Uploads p_size bytes when they differ from what r_uploaded holds, growing the buffer as needed.
+template <typename T>
+static void _rt_upload_if_changed(RID &r_buffer, uint32_t &r_capacity, LocalVector<T> &r_uploaded, const LocalVector<T> &p_data, const char *p_name) {
+	const uint32_t size = p_data.size() * sizeof(T);
+	if (r_buffer.is_valid() && r_uploaded.size() == p_data.size() && memcmp(r_uploaded.ptr(), p_data.ptr(), size) == 0) {
+		return;
+	}
+	if (r_capacity < size) {
+		if (r_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(r_buffer);
+		}
+		r_capacity = Math::next_power_of_2(size);
+		r_buffer = RD::get_singleton()->storage_buffer_create(r_capacity);
+		RD::get_singleton()->set_resource_name(r_buffer, p_name);
+	}
+	RD::get_singleton()->buffer_update(r_buffer, 0, size, p_data.ptr());
+	r_uploaded = p_data;
+}
+
+uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data) {
+	decal_data.clear();
+	decal_grid.clear();
+	if (!p_render_data || !p_render_data->rt_decals) {
+		return 0;
+	}
+
+	RendererRD::TextureStorage *ts = RendererRD::TextureStorage::get_singleton();
+	const Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin;
+
+	// The decals raster would draw (TextureStorage::update_decal_buffer()), around the camera as well.
+	struct DecalSort {
+		RID instance;
+		RID decal;
+		float depth = 0.0;
+		float fade = 1.0;
+		bool operator<(const DecalSort &p_other) const { return depth < p_other.depth; }
+	};
+	LocalVector<DecalSort> sorted;
+	const PagedArray<RID> &decals = *p_render_data->rt_decals;
+	for (uint64_t i = 0; i < decals.size(); i++) {
+		DecalSort ds;
+		ds.instance = decals[i];
+		if (!ts->owns_decal_instance(ds.instance)) {
+			continue;
+		}
+		ds.decal = ts->decal_instance_get_base(ds.instance);
+		if (!ts->owns_decal(ds.decal)) {
+			continue;
+		}
+		if (!ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_ALBEDO).is_valid() && !ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_EMISSION).is_valid()) {
+			continue; // No albedo, no emission, no decal.
+		}
+		const float distance = cam_pos.distance_to(ts->decal_instance_get_transform(ds.instance).origin);
+		if (ts->decal_is_distance_fade_enabled(ds.decal)) {
+			const float fade_begin = ts->decal_get_distance_fade_begin(ds.decal);
+			const float fade_length = ts->decal_get_distance_fade_length(ds.decal);
+			if (distance > fade_begin) {
+				if (distance > fade_begin + fade_length) {
+					continue;
+				}
+				ds.fade = Math::smoothstep(0.0f, 1.0f, 1.0f - float(distance - fade_begin) / fade_length);
+			}
+		}
+		ds.depth = distance - ts->decal_instance_get_sorting_offset(ds.instance);
+		sorted.push_back(ds);
+	}
+	if (sorted.is_empty()) {
+		return 0;
+	}
+	// The nearest RT_DECALS_MAX.
+	sorted.sort();
+	if (sorted.size() > RT_DECALS_MAX) {
+		sorted.resize(RT_DECALS_MAX);
+	}
+
+	const uint32_t count = sorted.size();
+	decal_data.resize(count);
+	LocalVector<AABB> aabbs;
+	aabbs.resize(count);
+
+	Transform3D uv_xform;
+	uv_xform.basis.scale(Vector3(2.0, 1.0, 2.0));
+	uv_xform.origin = Vector3(-1.0, 0.0, -1.0);
+
+	// Farthest first: the hit shaders apply them in index order, and raster draws the nearest decal on top.
+	for (uint32_t i = 0; i < count; i++) {
+		const DecalSort &ds = sorted[count - 1 - i];
+		RT_DecalData &dd = decal_data[i];
+		memset(&dd, 0, sizeof(RT_DecalData));
+
+		const Transform3D xform = ts->decal_instance_get_transform(ds.instance);
+		const Vector3 extents = ts->decal_get_size(ds.decal) / 2;
+		Transform3D scale_xform;
+		scale_xform.basis.scale(extents);
+		_rt_store_rows((xform * scale_xform * uv_xform).affine_inverse(), dd.xform);
+		aabbs[i] = xform.xform(AABB(-extents, extents * 2.0));
+
+		const Vector3 normal = xform.basis.get_column(Vector3::AXIS_Y).normalized();
+		dd.normal[0] = normal.x;
+		dd.normal[1] = normal.y;
+		dd.normal[2] = normal.z;
+		dd.normal_fade = ts->decal_get_normal_fade(ds.decal);
+
+		const RID albedo_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_ALBEDO);
+		const RID normal_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_NORMAL);
+		const RID orm_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_ORM);
+		const RID emission_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_EMISSION);
+		if (albedo_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(albedo_tex), dd.albedo_rect);
+		}
+		if (normal_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(normal_tex), dd.normal_rect);
+			Transform3D normal_xform;
+			normal_xform.basis = xform.basis.orthonormalized();
+			_rt_store_rows(normal_xform, dd.normal_xform);
+		}
+		if (orm_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(orm_tex), dd.orm_rect);
+		}
+		if (emission_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(emission_tex), dd.emission_rect);
+		}
+
+		const Color modulate = ts->decal_get_modulate(ds.decal).srgb_to_linear();
+		dd.modulate[0] = modulate.r;
+		dd.modulate[1] = modulate.g;
+		dd.modulate[2] = modulate.b;
+		dd.modulate[3] = modulate.a * ds.fade;
+		dd.emission_energy = ts->decal_get_emission_energy(ds.decal) * ds.fade;
+		dd.albedo_mix = ts->decal_get_albedo_mix(ds.decal);
+		dd.mask = ts->decal_get_cull_mask(ds.decal);
+		dd.upper_fade = ts->decal_get_upper_fade(ds.decal);
+		dd.lower_fade = ts->decal_get_lower_fade(ds.decal);
+	}
+
+	// A hashed grid, raster's clusters in world space: every bucket lists the decals whose box touches one of its cells, and
+	// a hit tests those of its cell's bucket. The cells are as large as the median decal, which then spans 2x2x2 of them at
+	// most; a decal over too many cells is tested at every hit instead.
+	LocalVector<float> sizes;
+	sizes.resize(count);
+	for (uint32_t i = 0; i < count; i++) {
+		sizes[i] = aabbs[i].get_longest_axis_size();
+	}
+	sizes.sort();
+	const float cell_size = MAX(sizes[count / 2], 0.01f);
+	const float inv_cell_size = 1.0f / cell_size;
+
+	struct CellRange {
+		int32_t from[3];
+		int32_t to[3];
+		bool global = false;
+	};
+	LocalVector<CellRange> ranges;
+	ranges.resize(count);
+	LocalVector<uint32_t> global_decals;
+	uint64_t entry_bound = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		CellRange &range = ranges[i];
+		// The hit shader floors its position times inv_cell_size in float: the same here, with a margin for the difference
+		// between a hit point and the box.
+		const AABB box = aabbs[i].grow(cell_size * 0.01f);
+		uint64_t cells = 1;
+		for (int a = 0; a < 3; a++) {
+			const double from = Math::floor(float(box.position[a]) * inv_cell_size);
+			const double to = Math::floor(float(box.position[a] + box.size[a]) * inv_cell_size);
+			if (!(from >= double(INT32_MIN) && to <= double(INT32_MAX - 1)) || to - from + 1.0 > double(RT_DECAL_GRID_MAX_CELLS)) {
+				range.global = true;
+				break;
+			}
+			range.from[a] = int32_t(from);
+			range.to[a] = int32_t(to);
+			cells *= uint64_t(range.to[a] - range.from[a] + 1);
+		}
+		if (range.global || cells > RT_DECAL_GRID_MAX_CELLS) {
+			range.global = true;
+			global_decals.push_back(i);
+		} else {
+			entry_bound += cells;
+		}
+	}
+
+	const uint32_t bucket_count = CLAMP(Math::next_power_of_2(uint32_t(MAX<uint64_t>(entry_bound * 2, 64))), 64u, uint32_t(RT_DECAL_GRID_MAX_BUCKETS));
+	const uint32_t bucket_mask = bucket_count - 1;
+	const uint32_t offsets_base = RT_DECAL_GRID_HEADER + global_decals.size();
+	const uint32_t entries_base = offsets_base + bucket_count + 1;
+
+	LocalVector<uint32_t> last_decal; // Two cells of a decal can share a bucket: listed once.
+	last_decal.resize(bucket_count);
+	LocalVector<uint32_t> bucket_entries;
+	bucket_entries.resize(bucket_count);
+	auto visit_buckets = [&](uint32_t p_decal, bool p_fill) {
+		const CellRange &range = ranges[p_decal];
+		for (int32_t z = range.from[2]; z <= range.to[2]; z++) {
+			for (int32_t y = range.from[1]; y <= range.to[1]; y++) {
+				for (int32_t x = range.from[0]; x <= range.to[0]; x++) {
+					const uint32_t bucket = _rt_decal_grid_hash(x, y, z) & bucket_mask;
+					if (last_decal[bucket] == p_decal) {
+						continue;
+					}
+					last_decal[bucket] = p_decal;
+					if (p_fill) {
+						decal_grid[bucket_entries[bucket]++] = p_decal;
+					} else {
+						bucket_entries[bucket]++;
+					}
+				}
+			}
+		}
+	};
+
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		last_decal[b] = UINT32_MAX;
+		bucket_entries[b] = 0;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (!ranges[i].global) {
+			visit_buckets(i, false);
+		}
+	}
+
+	uint32_t entry_count = 0;
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		entry_count += bucket_entries[b];
+	}
+	decal_grid.resize(entries_base + entry_count);
+	memcpy(&decal_grid[0], &inv_cell_size, sizeof(float));
+	decal_grid[1] = bucket_mask;
+	decal_grid[2] = global_decals.size();
+	decal_grid[3] = 0;
+	for (uint32_t i = 0; i < global_decals.size(); i++) {
+		decal_grid[RT_DECAL_GRID_HEADER + i] = global_decals[i];
+	}
+	uint32_t entry = entries_base;
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		decal_grid[offsets_base + b] = entry;
+		const uint32_t entries = bucket_entries[b];
+		bucket_entries[b] = entry; // Now the next entry to fill.
+		last_decal[b] = UINT32_MAX;
+		entry += entries;
+	}
+	decal_grid[offsets_base + bucket_count] = entry;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!ranges[i].global) {
+			visit_buckets(i, true);
+		}
+	}
+
+	_rt_upload_if_changed(p_state->decal_buffer, p_state->decal_buffer_capacity, p_state->uploaded_decals, decal_data, "RT Decal Buffer");
+	_rt_upload_if_changed(p_state->decal_grid_buffer, p_state->decal_grid_buffer_capacity, p_state->uploaded_decal_grid, decal_grid, "RT Decal Grid Buffer");
+	return count;
+}
+
+// ---------------------------------------------------------------------------
 // Uniform set update
 // ---------------------------------------------------------------------------
 
@@ -4307,6 +4591,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DECAL_COUNT] = float(gather_decals(p_state, p_render_data));
 
 		// Upload light buffer.
 		{
@@ -4468,6 +4753,43 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb->get_velocity_buffer(false));
 		uniforms.push_back(u);
+	}
+
+	// Bindings 33-37: the decals, their grid, the decal atlas (linear and sRGB views) and raster's decal sampler.
+	{
+		RID default_buffer = RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer();
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 33, p_state->decal_buffer.is_valid() ? p_state->decal_buffer : default_buffer));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 34, p_state->decal_grid_buffer.is_valid() ? p_state->decal_grid_buffer : default_buffer));
+
+		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+		RID default_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		RID decal_atlas = texture_storage->decal_atlas_get_texture();
+		RID decal_atlas_srgb = texture_storage->decal_atlas_get_texture_srgb();
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 35, decal_atlas.is_valid() ? decal_atlas : default_texture));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 36, decal_atlas_srgb.is_valid() ? decal_atlas_srgb : default_texture));
+
+		RSE::CanvasItemTextureFilter decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS;
+		switch (owner->decals_get_filter()) {
+			case RSE::DECAL_FILTER_NEAREST: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST;
+			} break;
+			case RSE::DECAL_FILTER_LINEAR: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR;
+			} break;
+			case RSE::DECAL_FILTER_NEAREST_MIPMAPS: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS;
+			} break;
+			case RSE::DECAL_FILTER_LINEAR_MIPMAPS: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS;
+			} break;
+			case RSE::DECAL_FILTER_NEAREST_MIPMAPS_ANISOTROPIC: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC;
+			} break;
+			case RSE::DECAL_FILTER_LINEAR_MIPMAPS_ANISOTROPIC: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC;
+			} break;
+		}
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 37, rb->get_samplers().get_sampler(decal_filter, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED)));
 	}
 
 	RID shader_rd = shader ? shader->get_pipeline_shader_rd(p_rt_flags) : RID();
