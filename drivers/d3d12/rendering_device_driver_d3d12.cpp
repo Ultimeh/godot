@@ -2146,8 +2146,10 @@ static void _rd_access_to_d3d12_and_mask(BitField<RDD::BarrierAccessBits> p_acce
 
 	if (p_access.has_flag(RDD::BARRIER_ACCESS_UNIFORM_READ_BIT)) {
 		r_access |= D3D12_BARRIER_ACCESS_CONSTANT_BUFFER;
+		// Ray tracing shaders read uniforms too (the buffers a ray tracing list declares): without it, such a read before a
+		// copy fell back to the common access, an invalid global barrier.
 		r_sync_mask |= D3D12_BARRIER_SYNC_VERTEX_SHADING | D3D12_BARRIER_SYNC_PIXEL_SHADING | D3D12_BARRIER_SYNC_COMPUTE_SHADING |
-				D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_ALL_SHADING;
+				D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_ALL_SHADING | D3D12_BARRIER_SYNC_RAYTRACING;
 	}
 
 	if (p_access.has_flag(RDD::BARRIER_ACCESS_INPUT_ATTACHMENT_READ_BIT)) {
@@ -2291,6 +2293,89 @@ static void _rd_stages_to_d3d12(BitField<RDD::PipelineStageBits> p_stages, D3D12
 		if (p_stages.has_flag(RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT)) {
 			r_sync |= D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE;
 		}
+	}
+}
+
+// A global barrier from the common access must go to it (D3D12 removes the device otherwise): a source access without a
+// compatible stage falls back to it (_rd_stages_and_access_to_d3d12()). Toward no access, nothing after it waits: skipped.
+static void _push_global_barrier(LocalVector<D3D12_GLOBAL_BARRIER> &r_barriers, D3D12_GLOBAL_BARRIER p_barrier) {
+	if (p_barrier.AccessBefore == D3D12_BARRIER_ACCESS_COMMON && p_barrier.AccessAfter != D3D12_BARRIER_ACCESS_COMMON) {
+		if (p_barrier.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS) {
+			return;
+		}
+		p_barrier.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+	}
+	r_barriers.push_back(p_barrier);
+}
+
+// D3D12 requires every synchronization bit of a barrier to be compatible with every access bit, where Vulkan's stage and
+// access masks are independent: a RenderingDeviceGraph barrier gathers the stages and accesses of several commands (a copy
+// and a compute pass, or every command after a TLAS build: RenderingDeviceGraph), so its source side is split into one
+// global barrier per group of accesses sharing a compatible scope. An access without a compatible stage among the source
+// ones waits on its own stage instead, which only waits for more work.
+static void _push_split_global_barrier(LocalVector<D3D12_GLOBAL_BARRIER> &r_barriers, const D3D12_GLOBAL_BARRIER &p_barrier) {
+	if (p_barrier.SyncBefore == D3D12_BARRIER_SYNC_ALL || p_barrier.SyncBefore == D3D12_BARRIER_SYNC_NONE ||
+			p_barrier.AccessBefore == D3D12_BARRIER_ACCESS_COMMON || (p_barrier.AccessBefore & D3D12_BARRIER_ACCESS_NO_ACCESS)) {
+		_push_global_barrier(r_barriers, p_barrier);
+		return;
+	}
+
+	struct AccessSyncs {
+		D3D12_BARRIER_ACCESS access;
+		D3D12_BARRIER_SYNC compatible;
+		D3D12_BARRIER_SYNC own;
+	};
+	const D3D12_BARRIER_SYNC shading = D3D12_BARRIER_SYNC_VERTEX_SHADING | D3D12_BARRIER_SYNC_PIXEL_SHADING | D3D12_BARRIER_SYNC_COMPUTE_SHADING |
+			D3D12_BARRIER_SYNC_RAYTRACING | D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_ALL_SHADING | D3D12_BARRIER_SYNC_NON_PIXEL_SHADING;
+	const AccessSyncs table[] = {
+		{ D3D12_BARRIER_ACCESS_VERTEX_BUFFER, D3D12_BARRIER_SYNC_VERTEX_SHADING | D3D12_BARRIER_SYNC_DRAW | D3D12_BARRIER_SYNC_ALL_SHADING, D3D12_BARRIER_SYNC_VERTEX_SHADING },
+		{ D3D12_BARRIER_ACCESS_CONSTANT_BUFFER, shading, D3D12_BARRIER_SYNC_ALL_SHADING },
+		{ D3D12_BARRIER_ACCESS_INDEX_BUFFER, D3D12_BARRIER_SYNC_INDEX_INPUT | D3D12_BARRIER_SYNC_DRAW, D3D12_BARRIER_SYNC_INDEX_INPUT },
+		{ D3D12_BARRIER_ACCESS_RENDER_TARGET, D3D12_BARRIER_SYNC_RENDER_TARGET | D3D12_BARRIER_SYNC_DRAW, D3D12_BARRIER_SYNC_RENDER_TARGET },
+		{ D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, shading | D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO, D3D12_BARRIER_SYNC_ALL_SHADING },
+		{ D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE | D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ, D3D12_BARRIER_SYNC_DEPTH_STENCIL | D3D12_BARRIER_SYNC_DRAW, D3D12_BARRIER_SYNC_DEPTH_STENCIL },
+		{ D3D12_BARRIER_ACCESS_SHADER_RESOURCE, shading | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_BARRIER_SYNC_ALL_SHADING },
+		{ D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT, D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_SYNC_EXECUTE_INDIRECT },
+		{ D3D12_BARRIER_ACCESS_COPY_DEST | D3D12_BARRIER_ACCESS_COPY_SOURCE, D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_SYNC_COPY },
+		{ D3D12_BARRIER_ACCESS_RESOLVE_DEST | D3D12_BARRIER_ACCESS_RESOLVE_SOURCE, D3D12_BARRIER_SYNC_RESOLVE, D3D12_BARRIER_SYNC_RESOLVE },
+		{ D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ, D3D12_BARRIER_SYNC_COMPUTE_SHADING | D3D12_BARRIER_SYNC_RAYTRACING | D3D12_BARRIER_SYNC_ALL_SHADING | D3D12_BARRIER_SYNC_NON_PIXEL_SHADING | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO, D3D12_BARRIER_SYNC_ALL_SHADING },
+		{ D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE, D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE },
+		{ D3D12_BARRIER_ACCESS_SHADING_RATE_SOURCE, D3D12_BARRIER_SYNC_PIXEL_SHADING | D3D12_BARRIER_SYNC_ALL_SHADING, D3D12_BARRIER_SYNC_PIXEL_SHADING },
+	};
+
+	static_assert(sizeof(table) / sizeof(table[0]) < 16);
+	D3D12_BARRIER_SYNC group_syncs[16];
+	D3D12_BARRIER_ACCESS group_accesses[16];
+	uint32_t group_count = 0;
+	D3D12_BARRIER_ACCESS remaining = p_barrier.AccessBefore;
+	auto add = [&](D3D12_BARRIER_SYNC p_sync, D3D12_BARRIER_ACCESS p_access) {
+		for (uint32_t i = 0; i < group_count; i++) {
+			if (group_syncs[i] == p_sync) {
+				group_accesses[i] |= p_access;
+				return;
+			}
+		}
+		group_syncs[group_count] = p_sync;
+		group_accesses[group_count] = p_access;
+		group_count++;
+	};
+	for (const AccessSyncs &entry : table) {
+		const D3D12_BARRIER_ACCESS access = p_barrier.AccessBefore & entry.access;
+		if (access) {
+			const D3D12_BARRIER_SYNC sync = p_barrier.SyncBefore & entry.compatible;
+			add(sync ? sync : entry.own, access);
+			remaining &= ~entry.access;
+		}
+	}
+	if (remaining) {
+		add(p_barrier.SyncBefore, remaining); // Not in the table: as before.
+	}
+
+	for (uint32_t i = 0; i < group_count; i++) {
+		D3D12_GLOBAL_BARRIER barrier = p_barrier;
+		barrier.SyncBefore = group_syncs[i];
+		barrier.AccessBefore = group_accesses[i];
+		_push_global_barrier(r_barriers, barrier);
 	}
 }
 
@@ -2471,7 +2556,7 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 		const MemoryAccessBarrier &memory_barrier = p_memory_barriers[i];
 		_rd_stages_and_access_to_d3d12(p_src_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.src_access, global_barrier.SyncBefore, global_barrier.AccessBefore);
 		_rd_stages_and_access_to_d3d12(p_dst_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.dst_access, global_barrier.SyncAfter, global_barrier.AccessAfter);
-		global_barriers.push_back(global_barrier);
+		_push_split_global_barrier(global_barriers, global_barrier);
 	}
 
 	D3D12_BUFFER_BARRIER buffer_barrier_d3d12 = {};
@@ -5277,6 +5362,8 @@ void RenderingDeviceDriverD3D12::command_bind_render_pipeline(CommandBufferID p_
 	}
 
 	if (cmd_buf_info->graphics_root_signature_crc != shader_info_in->root_signature_crc) {
+		// The heaps first: D3D12 requires them before a root signature that indexes them directly (bindless).
+		_command_check_descriptor_sets(p_cmd_buffer);
 		cmd_buf_info->cmd_list->SetGraphicsRootSignature(shader_info_in->root_signature.Get());
 		cmd_buf_info->graphics_root_signature_crc = shader_info_in->root_signature_crc;
 	}
@@ -5873,6 +5960,8 @@ void RenderingDeviceDriverD3D12::command_bind_compute_pipeline(CommandBufferID p
 	}
 
 	if (cmd_buf_info->compute_root_signature_crc != shader_info_in->root_signature_crc) {
+		// The heaps first: D3D12 requires them before a root signature that indexes them directly (bindless).
+		_command_check_descriptor_sets(p_cmd_buffer);
 		cmd_buf_info->cmd_list->SetComputeRootSignature(shader_info_in->root_signature.Get());
 		cmd_buf_info->compute_root_signature_crc = shader_info_in->root_signature_crc;
 	}
@@ -6377,6 +6466,8 @@ void RenderingDeviceDriverD3D12::command_bind_raytracing_pipeline(CommandBufferI
 	}
 
 	if (cmd_buf_info->compute_root_signature_crc != shader_info_in->root_signature_crc) {
+		// The heaps first: D3D12 requires them before a root signature that indexes them directly (bindless).
+		_command_check_descriptor_sets(p_cmd_buffer);
 		cmd_buf_info->cmd_list->SetComputeRootSignature(shader_info_in->root_signature.Get());
 		cmd_buf_info->compute_root_signature_crc = shader_info_in->root_signature_crc;
 	}
