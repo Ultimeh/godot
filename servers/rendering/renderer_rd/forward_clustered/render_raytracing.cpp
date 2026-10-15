@@ -2673,10 +2673,6 @@ bool RenderRaytracing::_set_multimesh_instance_data(RT_GeometryData &r_geom, RID
 
 bool RenderRaytracing::_mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count, const RTLodView *p_lod_view) const {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
-	// Compressed meshes are skipped: their positions are UNORM16x4, not float3.
-	if (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
-		return false;
-	}
 	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
 	RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
 	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
@@ -2821,6 +2817,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	bool has_normal = surface_format & RSE::ARRAY_FORMAT_NORMAL;
 	bool has_tangent = surface_format & RSE::ARRAY_FORMAT_TANGENT;
 	bool has_tbn = has_normal;
+	// Compressed source: [UNORM16x4 positions × V] + [octahedral normal (UNORM16x2) × V], the tangent in each
+	// position's w. The merge shader decompresses it; the merged buffers below are always uncompressed.
+	const bool compressed = surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
 
 	// Layout of uncompressed vertex buffer: [float3 positions × V] + [packed TBN × V].
 	// normal_stride = 8 when both normal+tangent present (two uint16x2 packed), 4 with normal only.
@@ -2830,15 +2829,16 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	} else if (has_normal) {
 		tbn_stride = 4; // 1 × uint32 (normal oct only)
 	}
-	// Byte offset of the TBN block in the source vertex buffer.
-	uint32_t src_tbn_byte_offset = src_vertex_count * 12; // after all float3 positions
+	// Byte offset of the TBN block in the source vertex buffer, after all its positions.
+	uint32_t src_tbn_byte_offset = src_vertex_count * (compressed ? 8 : 12);
 
 	// Merged vertex buffer: [float3 pos × N*V] + [packed TBN × N*V] (if TBN present).
 	uint32_t merged_vtx_bytes = p_mm_count * vertex_count * 12 + (has_tbn ? p_mm_count * vertex_count * tbn_stride : 0);
 
 	// Attribute buffer: attribute_stride bytes × V, replicated N times.
+	// Described as an uncompressed surface: positions and TBN are, its attributes keep their compressed layout (flag).
 	RTSurfaceData meta_sd;
-	_fill_surface_geometry_data(p_mesh_surface, false, &meta_sd);
+	_fill_surface_geometry_data(p_mesh_surface, true, &meta_sd);
 	uint32_t attrib_stride = meta_sd.geometry.attribute_stride;
 	bool has_attr = attrib_stride > 0;
 	const uint32_t MIN_ATTR_BYTES = 16;
@@ -2968,11 +2968,14 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			uint32_t vertex_count, instance_count;
 			uint32_t pos_stride_words;
 			uint32_t src_tbn_base_words;
-			uint32_t src_tbn_stride_words;
+			uint32_t tbn_stride_words;
 			uint32_t dst_tbn_base_words;
 			uint32_t mm_stride, mm_offset;
 			uint32_t has_tbn;
 			uint32_t attr_stride_words;
+			uint32_t compressed;
+			float aabb_position[3];
+			float aabb_size[3];
 		} pc;
 
 		pc.src_vtx_lo = uint32_t(vtx_bda);
@@ -2990,14 +2993,21 @@ bool RenderRaytracing::_build_merged_mm_blas(
 
 		pc.vertex_count = vertex_count;
 		pc.instance_count = p_mm_count;
-		pc.pos_stride_words = 3; // always float3 (uncompressed check at top)
+		pc.pos_stride_words = compressed ? 2 : 3;
 		pc.src_tbn_base_words = src_tbn_byte_offset / 4;
-		pc.src_tbn_stride_words = tbn_stride_words;
+		pc.tbn_stride_words = tbn_stride_words;
 		pc.dst_tbn_base_words = dst_tbn_base_words;
 		pc.mm_stride = mm_stride;
 		pc.mm_offset = mm_cur_offset;
 		pc.has_tbn = has_tbn ? 1u : 0u;
 		pc.attr_stride_words = has_attr ? (attrib_stride / 4) : 0u;
+		pc.compressed = compressed ? 1u : 0u;
+		// The AABB raster decompresses the positions with (RTSurfaceData::aabb_transform for an unmerged surface).
+		const AABB surface_aabb = compressed ? mesh_storage->mesh_surface_get_aabb(p_mesh_surface) : AABB();
+		for (int axis = 0; axis < 3; axis++) {
+			pc.aabb_position[axis] = surface_aabb.position[axis];
+			pc.aabb_size[axis] = surface_aabb.size[axis];
+		}
 
 		MergeShader::Mode mode = indexed ? MergeShader::MODE_INDEXED : MergeShader::MODE_NON_INDEXED;
 		rd->compute_list_bind_compute_pipeline(p_compute_list, mm_merge_shader.pipeline[mode]);
@@ -3012,11 +3022,14 @@ bool RenderRaytracing::_build_merged_mm_blas(
 				uint32_t vertex_count, instance_count;
 				uint32_t pos_stride_words;
 				uint32_t src_tbn_base_words;
-				uint32_t src_tbn_stride_words;
+				uint32_t tbn_stride_words;
 				uint32_t dst_tbn_base_words;
 				uint32_t mm_stride, mm_offset;
 				uint32_t has_tbn;
 				uint32_t attr_stride_words;
+				uint32_t compressed;
+				float aabb_position[3];
+				float aabb_size[3];
 			} pc_ni;
 			pc_ni.src_vtx_lo = pc.src_vtx_lo;
 			pc_ni.src_vtx_hi = pc.src_vtx_hi;
@@ -3024,12 +3037,15 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			pc_ni.instance_count = pc.instance_count;
 			pc_ni.pos_stride_words = pc.pos_stride_words;
 			pc_ni.src_tbn_base_words = pc.src_tbn_base_words;
-			pc_ni.src_tbn_stride_words = pc.src_tbn_stride_words;
+			pc_ni.tbn_stride_words = pc.tbn_stride_words;
 			pc_ni.dst_tbn_base_words = pc.dst_tbn_base_words;
 			pc_ni.mm_stride = pc.mm_stride;
 			pc_ni.mm_offset = pc.mm_offset;
 			pc_ni.has_tbn = pc.has_tbn;
 			pc_ni.attr_stride_words = pc.attr_stride_words;
+			pc_ni.compressed = pc.compressed;
+			memcpy(pc_ni.aabb_position, pc.aabb_position, sizeof(pc.aabb_position));
+			memcpy(pc_ni.aabb_size, pc.aabb_size, sizeof(pc.aabb_size));
 			rd->compute_list_set_push_constant(p_compute_list, &pc_ni, sizeof(MergePCNonIndexed));
 		}
 
