@@ -2379,13 +2379,29 @@ static void _push_split_global_barrier(LocalVector<D3D12_GLOBAL_BARRIER> &r_barr
 	}
 }
 
+// The synchronization of a barrier that waits for stages without any access: D3D12_BARRIER_SYNC_NONE would state nothing
+// accessed the resource earlier in the ExecuteCommandLists scope, which a resource the render graph starts tracking (or
+// discards) may have been. The scopes reserved to their own accesses (UAV clears, acceleration structure builds) do not
+// accept D3D12_BARRIER_ACCESS_NO_ACCESS: the whole queue is waited for instead.
+static D3D12_BARRIER_SYNC _rd_stages_to_d3d12_without_access(BitField<RDD::PipelineStageBits> p_stages) {
+	D3D12_BARRIER_SYNC sync = D3D12_BARRIER_SYNC_NONE;
+	_rd_stages_to_d3d12(p_stages, sync);
+	const D3D12_BARRIER_SYNC reserved = D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE |
+			D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO;
+	if (sync & reserved) {
+		sync = D3D12_BARRIER_SYNC_ALL;
+	}
+	return sync;
+}
+
 static void _rd_stages_and_access_to_d3d12(BitField<RDD::PipelineStageBits> p_stages, RDD::TextureLayout p_texture_layout, BitField<RDD::BarrierAccessBits> p_access, D3D12_BARRIER_SYNC &r_sync, D3D12_BARRIER_ACCESS &r_access) {
 	D3D12_BARRIER_SYNC sync_mask;
 	r_sync = D3D12_BARRIER_SYNC_NONE;
 
 	if (p_texture_layout == RDD::TEXTURE_LAYOUT_UNDEFINED) {
-		// Undefined texture layouts are a special case where no access bits or synchronization scopes are allowed.
+		// Undefined texture layouts allow no access, but the barrier still waits for the stages ordered before it.
 		r_access = D3D12_BARRIER_ACCESS_NO_ACCESS;
+		r_sync = _rd_stages_to_d3d12_without_access(p_stages);
 		return;
 	}
 
@@ -2405,8 +2421,9 @@ static void _rd_stages_and_access_to_d3d12(BitField<RDD::PipelineStageBits> p_st
 
 	if (r_sync == D3D12_BARRIER_SYNC_NONE) {
 		if (p_access.is_empty()) {
-			// No valid synchronization scope was defined and no access in particular is required.
+			// No access in particular is required: an execution dependency on the stages alone, as in Vulkan.
 			r_access = D3D12_BARRIER_ACCESS_NO_ACCESS;
+			r_sync = _rd_stages_to_d3d12_without_access(p_stages);
 		} else {
 			// Access is required but the synchronization scope wasn't compatible. We fall back to the global synchronization scope and access.
 			r_sync = D3D12_BARRIER_SYNC_ALL;
