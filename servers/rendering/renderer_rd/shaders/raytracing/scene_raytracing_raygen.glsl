@@ -21,7 +21,8 @@
 #define RT_STAGE_RAYGEN 1
 #include "raytracing_common_inc.glsl"
 
-layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+// The path tracer's output, RB_TEX_RAYTRACING: its format, or the writes are undefined on Vulkan (D3D12 converts them).
+layout(set = 0, binding = 0, rgba16f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
