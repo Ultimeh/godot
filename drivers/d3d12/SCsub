@@ -47,6 +47,15 @@ mesa_gen_dir = (mesa_libs + "/godot-mesa/generated").replace("\\", "/")
 mesa_absdir = Dir(mesa_dir).abspath
 mesa_gen_absdir = Dir(mesa_dir + "/generated").abspath
 
+# The official Mesa emits integer division and modulo by a value that can be 0 as plain DXIL divisions (UDiv gives ~0 where
+# NIR says 0, imod became an unsigned remainder): this fork builds with a Mesa patched for it (MESA-DIV-BY-ZERO-FIXES).
+nir_to_dxil_path = Path(mesa_absdir + "/src/microsoft/compiler/nir_to_dxil.c")
+if not nir_to_dxil_path.is_file() or "emit_div_rem" not in nir_to_dxil_path.read_text(encoding="utf-8", errors="ignore"):
+    methods.print_warning(
+        f'The Mesa in "{mesa_libs}" lacks the integer division fix (emit_div_rem): D3D12 shaders may divide by 0 wrongly. '
+        "Pass mesa_libs= a godot-nir-static built with godot-patches/05_div_by_zero.patch."
+    )
+
 custom_build_steps = [
     [
         "src/compiler",
