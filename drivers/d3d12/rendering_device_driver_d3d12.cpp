@@ -1049,7 +1049,11 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 		p_size = p_size * frames.size();
 	}
 
-	CD3DX12_RESOURCE_DESC1 resource_desc = CD3DX12_RESOURCE_DESC1::Buffer(p_size);
+	// D3D12MA places every allocation at a multiple of D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT (its default alignment).
+	// With tight alignment a buffer takes only its own size, so a smaller one would leave a hole after it that no other
+	// buffer can use: thousands of them stayed in the heaps' free lists (Solfarer: 13,500 holes of 128 bytes), and every
+	// allocation walked them, 50 to 100 us each.
+	CD3DX12_RESOURCE_DESC1 resource_desc = CD3DX12_RESOURCE_DESC1::Buffer(STEPIFY(p_size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT));
 	// A buffer read through a GPU pointer is reached through a raw UAV (see buffer_get_device_address()).
 	const bool device_address_view = p_usage.has_flag(BUFFER_USAGE_DEVICE_ADDRESS_BIT) && p_allocation_type == MEMORY_ALLOCATION_TYPE_GPU && !p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 	if (p_usage.has_flag(RDD::BUFFER_USAGE_STORAGE_BIT) || device_address_view) {
