@@ -3275,13 +3275,13 @@
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_cache_cpu_transforms" type="bool" setter="" getter="" default="false">
-			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. This lets the path tracer read the per-instance transforms of a MultiMesh it cannot merge into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]) without copying the GPU buffer back. That copy is asynchronous, and the MultiMesh is traced from the next frame on; when [member MultiMesh.buffer] is set again before the copy arrives, the MultiMesh keeps a CPU-side mirror from then on, as with this setting.
+			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. With a rendering driver that cannot write acceleration structure instances on the GPU (Vulkan and Direct3D 12 can), this lets the path tracer read the per-instance transforms of a MultiMesh it traces as one TLAS instance per instance without copying the GPU buffer back. That copy is asynchronous, and the MultiMesh is traced from the next frame on; when [member MultiMesh.buffer] is set again before the copy arrives, the MultiMesh keeps a CPU-side mirror from then on, as with this setting.
 			[b]Warning:[/b] Enabling this setting increases CPU memory usage. Every [MultiMesh] that assigns [member MultiMesh.buffer] will maintain a full duplicate of its transform data in RAM.
 			Enable this only when such a [MultiMesh] must be traced on the very frame it appears.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_displacement_distance" type="float" setter="" getter="" default="30.0">
-			Distance from the camera within which the path tracer runs the [code]vertex()[/code] function of a [MultiMesh]'s material on its instances, as the rasterizer does, so that effects such as grass swaying in the wind are traced. The MultiMesh's acceleration structure is then refitted every frame its shader uses [code]TIME[/code] or reads the moving camera. Beyond this distance the instances are traced at their rest positions. Only MultiMeshes merged into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]) are displaced. Set to [code]0.0[/code] to disable.
+			Distance from the camera within which the path tracer runs the [code]vertex()[/code] function of a [MultiMesh]'s material on its instances, as the rasterizer does, so that effects such as grass swaying in the wind are traced. The MultiMesh's acceleration structure is then refitted every frame its shader uses [code]TIME[/code] or reads the moving camera. Within this distance such a MultiMesh is merged into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]), which holds the displaced vertices; beyond it, its instances are traced at their rest positions, one TLAS instance each. Set to [code]0.0[/code] to disable.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_lod_switch_triangles_per_frame" type="int" setter="" getter="" default="1048576">
@@ -3289,7 +3289,7 @@
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_merged_blas_max_triangles" type="int" setter="" getter="" default="65536">
-			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. When the combined triangle count exceeds this value, the path tracer falls back to one TLAS entry per instance sharing a common BLAS instead. Lower this value to reduce peak GPU memory for large MultiMeshes; raise it to prefer the merged path (which avoids per-instance TLAS overhead).
+			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. The path tracer traces a MultiMesh as one TLAS instance per instance, sharing its mesh's BLAS, the instances written on the GPU from the MultiMesh's buffer; it merges only a MultiMesh whose material moves its vertices within [member rendering/pathtracing/multimesh_displacement_distance], since only a merged BLAS holds displaced vertices. Beyond this triangle count, such a MultiMesh is traced as one TLAS instance per instance too, at its rest positions. Lower this value to reduce peak GPU memory for large displaced MultiMeshes.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/static_cache_ttl_frames" type="int" setter="" getter="" default="3600">

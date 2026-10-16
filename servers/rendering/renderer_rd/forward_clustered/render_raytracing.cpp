@@ -79,6 +79,16 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	lod_view_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
 	displace_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
 
+	tlas_expand_supported = RD::get_singleton()->tlas_instance_layout_is_standard() && RD::get_singleton()->has_feature(RD::SUPPORTS_BUFFER_DEVICE_ADDRESS);
+	if (tlas_expand_supported) {
+		Vector<String> expand_modes;
+		expand_modes.push_back("\n");
+		tlas_expand_shader.shader.initialize(expand_modes);
+		tlas_expand_shader.version = tlas_expand_shader.shader.version_create();
+		tlas_expand_shader.version_shader = tlas_expand_shader.shader.version_get_shader(tlas_expand_shader.version, 0);
+		tlas_expand_shader.pipeline = RD::get_singleton()->compute_pipeline_create(tlas_expand_shader.version_shader);
+	}
+
 	Vector<String> fog_modes;
 	fog_modes.push_back("\n");
 	volumetric_fog_shader.shader.initialize(fog_modes);
@@ -138,6 +148,14 @@ RenderRaytracing::~RenderRaytracing() {
 	if (mm_displace_job_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(mm_displace_job_buffer);
 	}
+	if (tlas_expand_supported) {
+		tlas_expand_shader.shader.version_free(tlas_expand_shader.version);
+	}
+	for (RID buffer : { tlas_expand_job_buffer, tlas_expand_geometry_template_buffer, tlas_expand_material_template_buffer }) {
+		if (buffer.is_valid()) {
+			RD::get_singleton()->free_rid(buffer);
+		}
+	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 	sky_guide_shader.shader.version_free(sky_guide_shader.version);
 	background_output_shader.shader.version_free(background_output_shader.version);
@@ -188,6 +206,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	}
 	if (p_state->motion_transform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->motion_transform_buffer);
+	}
+	if (p_state->tlas_instance_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->tlas_instance_buffer);
 	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
@@ -666,6 +687,11 @@ void RenderRaytracing::prepare_frame() {
 	material_data.clear();
 	motion_indices.clear();
 	motion_transforms.clear();
+	tlas_expand_jobs.clear();
+	tlas_expand_geometry_templates.clear();
+	tlas_expand_material_templates.clear();
+	tlas_expand_instance_count = 0;
+	tlas_expand_motion_count = 0;
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
 	multimesh_buffers_read_this_frame.clear();
@@ -2532,7 +2558,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 
 	RENDER_TIMESTAMP("TLAS Build");
 
-	uint32_t needed = MAX(blass.size(), (uint32_t)1);
+	uint32_t needed = MAX(blass.size() + tlas_expand_instance_count, (uint32_t)1);
 	if (!p_state->tlas.is_valid() || needed > p_state->tlas_max_instances) {
 		if (p_state->tlas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->tlas);
@@ -2555,37 +2581,164 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
 	}
 
+	if (tlas_expand_instance_count > 0) {
+		_build_tlas_with_expanded_multimeshes(p_state, instances);
+		return;
+	}
 	RD::get_singleton()->tlas_build(p_state->tlas, instances);
 }
 
+void RenderRaytracing::_build_tlas_with_expanded_multimeshes(RTViewportState *p_state, LocalVector<RD::AccelerationStructureInstance> &p_instances) {
+	RD *rd = RD::get_singleton();
+	DEV_ASSERT(geometry_data.size() == p_instances.size() && motion_indices.size() == p_instances.size());
+	const uint32_t cpu_count = p_instances.size();
+	const uint32_t total = cpu_count + tlas_expand_instance_count;
+	const uint32_t instance_size = rd->tlas_get_instance_size();
+
+	if (!p_state->tlas_instance_buffer.is_valid() || p_state->tlas_instance_buffer_capacity < total) {
+		if (p_state->tlas_instance_buffer.is_valid()) {
+			rd->free_rid(p_state->tlas_instance_buffer);
+		}
+		p_state->tlas_instance_buffer_capacity = p_state->tlas_max_instances;
+		p_state->tlas_instance_buffer = rd->storage_buffer_create(p_state->tlas_instance_buffer_capacity * instance_size, {}, 0,
+				RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		ERR_FAIL_COND(!p_state->tlas_instance_buffer.is_valid());
+		rd->set_resource_name(p_state->tlas_instance_buffer, "RT TLAS instances");
+	}
+
+	// The CPU's instances, then for each job its instance's last words (BLAS, mask, flags, hit group) as the driver writes them.
+	const uint32_t job_count = tlas_expand_jobs.size();
+	thread_local LocalVector<RD::AccelerationStructureInstance> templates;
+	thread_local LocalVector<uint8_t> encoded;
+	templates.resize(job_count);
+	for (uint32_t i = 0; i < job_count; i++) {
+		const TlasExpandJob &job = tlas_expand_jobs[i];
+		RD::AccelerationStructureInstance &inst = templates[i];
+		inst = RD::AccelerationStructureInstance();
+		inst.blas = job.blas;
+		inst.mask = job.mask;
+		inst.flags = BitField<RD::AccelerationStructureInstanceFlagBits>(job.flags);
+		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(job.sbt_offset));
+	}
+	encoded.resize(MAX(cpu_count, job_count) * instance_size);
+	ERR_FAIL_COND(rd->tlas_instances_encode(templates, encoded.ptr()) != OK);
+	for (uint32_t i = 0; i < job_count; i++) {
+		memcpy(tlas_expand_jobs[i].data.instance_tail, encoded.ptr() + i * instance_size + 48, 16);
+	}
+	if (cpu_count > 0) {
+		ERR_FAIL_COND(rd->tlas_instances_encode(p_instances, encoded.ptr()) != OK);
+		rd->buffer_update(p_state->tlas_instance_buffer, 0, cpu_count * instance_size, encoded.ptr());
+	}
+
+	// The jobs and their records' templates.
+	thread_local LocalVector<RT_TlasExpandJob> job_data;
+	job_data.resize(job_count);
+	for (uint32_t i = 0; i < job_count; i++) {
+		job_data[i] = tlas_expand_jobs[i].data;
+	}
+	const uint32_t template_count = tlas_expand_geometry_templates.size();
+	if (tlas_expand_job_capacity < job_count) {
+		if (tlas_expand_job_buffer.is_valid()) {
+			rd->free_rid(tlas_expand_job_buffer);
+		}
+		tlas_expand_job_capacity = Math::next_power_of_2(job_count);
+		tlas_expand_job_buffer = rd->storage_buffer_create(tlas_expand_job_capacity * sizeof(RT_TlasExpandJob));
+		rd->set_resource_name(tlas_expand_job_buffer, "RT TLAS expand jobs");
+	}
+	if (tlas_expand_template_capacity < template_count) {
+		for (RID *buffer : { &tlas_expand_geometry_template_buffer, &tlas_expand_material_template_buffer }) {
+			if (buffer->is_valid()) {
+				rd->free_rid(*buffer);
+			}
+		}
+		tlas_expand_template_capacity = Math::next_power_of_2(template_count);
+		tlas_expand_geometry_template_buffer = rd->storage_buffer_create(tlas_expand_template_capacity * sizeof(RT_GeometryData));
+		tlas_expand_material_template_buffer = rd->storage_buffer_create(tlas_expand_template_capacity * sizeof(RT_MaterialData));
+		rd->set_resource_name(tlas_expand_geometry_template_buffer, "RT TLAS expand geometry templates");
+		rd->set_resource_name(tlas_expand_material_template_buffer, "RT TLAS expand material templates");
+	}
+	rd->buffer_update(tlas_expand_job_buffer, 0, job_count * sizeof(RT_TlasExpandJob), job_data.ptr());
+	rd->buffer_update(tlas_expand_geometry_template_buffer, 0, template_count * sizeof(RT_GeometryData), tlas_expand_geometry_templates.ptr());
+	rd->buffer_update(tlas_expand_material_template_buffer, 0, template_count * sizeof(RT_MaterialData), tlas_expand_material_templates.ptr());
+
+	const LocalVector<RD::Uniform> uniforms = {
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, tlas_expand_job_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, tlas_expand_geometry_template_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, tlas_expand_material_template_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, p_state->tlas_instance_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, p_state->geometry_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, p_state->material_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, p_state->motion_index_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, p_state->motion_transform_buffer),
+	};
+	const RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(tlas_expand_shader.version_shader, 0, uniforms);
+
+	struct {
+		uint32_t job_count;
+		uint32_t first_slot;
+		uint32_t instance_count;
+		uint32_t geometry_words;
+		uint32_t material_words;
+		uint32_t mm_offset_word;
+		uint32_t mm_prev_offset_word;
+		uint32_t pad;
+	} params = { job_count, cpu_count, tlas_expand_instance_count, uint32_t(sizeof(RT_GeometryData) / 4), uint32_t(sizeof(RT_MaterialData) / 4),
+		uint32_t(offsetof(RT_GeometryData, multimesh_offset) / 4), uint32_t(offsetof(RT_GeometryData, multimesh_previous_offset) / 4), 0 };
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, tlas_expand_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+	rd->compute_list_set_push_constant(compute_list, &params, sizeof(params));
+	// Read through their addresses: the graph orders this pass after their updates.
+	for (const TlasExpandJob &job : tlas_expand_jobs) {
+		rd->compute_list_add_buffer_dependency(compute_list, job.mm_gpu_buffer, false);
+	}
+	rd->compute_list_dispatch_threads(compute_list, tlas_expand_instance_count, 1, 1);
+	rd->compute_list_end();
+
+	// Every BLAS the instances reference: the build waits for those built this frame.
+	thread_local LocalVector<RID> tlas_blases;
+	tlas_blases.clear();
+	for (const RD::AccelerationStructureInstance &inst : p_instances) {
+		if (inst.blas.is_valid()) {
+			tlas_blases.push_back(inst.blas);
+		}
+	}
+	for (const TlasExpandJob &job : tlas_expand_jobs) {
+		tlas_blases.push_back(job.blas);
+	}
+	rd->tlas_build_from_buffer(p_state->tlas, p_state->tlas_instance_buffer, total, tlas_blases);
+}
+
 void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
-	// Grow-only uploads. Callers must not free these in prepare_frame().
-	auto update_or_grow = [](RID &p_buffer, uint32_t &p_capacity, const void *p_data, uint32_t p_size) {
-		if (p_size == 0) {
+	// Grow-only uploads. Callers must not free these in prepare_frame(). p_size: the CPU's part, uploaded; p_total_size:
+	// with what the GPU writes after it (_build_tlas_with_expanded_multimeshes()).
+	auto update_or_grow = [](RID &p_buffer, uint32_t &p_capacity, const void *p_data, uint32_t p_size, uint32_t p_total_size) {
+		if (p_total_size == 0) {
 			return;
 		}
-		if (p_size > p_capacity) {
+		if (p_total_size > p_capacity) {
 			if (p_buffer.is_valid()) {
 				RD::get_singleton()->free_rid(p_buffer);
 			}
-			p_capacity = p_size;
-			Vector<uint8_t> init;
-			init.resize(p_size);
-			memcpy(init.ptrw(), p_data, p_size);
-			p_buffer = RD::get_singleton()->storage_buffer_create(p_size, init);
-		} else {
+			// With room for the GPU's part to grow a little (units entering the view) without a new buffer each frame.
+			p_capacity = p_size == p_total_size ? p_total_size : STEPIFY(p_total_size + p_total_size / 4, 16u);
+			p_buffer = RD::get_singleton()->storage_buffer_create(p_capacity);
+		}
+		if (p_size > 0) {
 			RD::get_singleton()->buffer_update(p_buffer, 0, p_size, p_data);
 		}
 	};
 
+	const uint32_t expanded = tlas_expand_instance_count;
 	update_or_grow(p_state->geometry_buffer, p_state->geometry_buffer_capacity,
-			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData));
+			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData), (geometry_data.size() + expanded) * sizeof(RT_GeometryData));
 	update_or_grow(p_state->material_buffer, p_state->material_buffer_capacity,
-			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData));
+			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData), (material_data.size() + expanded) * sizeof(RT_MaterialData));
 	update_or_grow(p_state->motion_index_buffer, p_state->motion_index_buffer_capacity,
-			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
+			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t), (motion_indices.size() + expanded) * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
-			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
+			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData), (motion_transforms.size() + tlas_expand_motion_count) * sizeof(RT_InstanceMotionData));
 }
 
 // ---------------------------------------------------------------------------
@@ -3338,6 +3491,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool transform_moved;
 		RTMaterialData *mat_data;
 		uint32_t inst_flags;
+		bool per_instance; // One TLAS instance per instance (_build_tlas_with_expanded_multimeshes()), not a merged BLAS.
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -3526,11 +3680,32 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					}
 				}
 
+				// Near the camera, a material whose vertex() moves the MultiMesh (wind) is evaluated on it, as raster draws it.
+				bool displace = false;
+				bool reevaluate = false;
+				static const float mm_displacement_distance = GLOBAL_GET("rendering/pathtracing/multimesh_displacement_distance");
+				if (mm_displacement_distance > 0.0f && lod_distance <= mm_displacement_distance && mat_data->rt_sbt_offset > 0) {
+					const SceneShaderRaytracing::CustomShaderEntry *displace_cse = rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
+					RID displace_shader;
+					if (displace_cse && displace_cse->writes_vertex && rt_shader_singleton->get_displace_pipeline(mat_data->rt_sbt_offset, displace_shader).is_valid()) {
+						displace = true;
+						reevaluate = displace_cse->uses_vertex_time || (displace_cse->vertex_reads_camera && displace_camera_moved);
+					}
+				}
+
+				// One TLAS instance per instance, sharing the mesh's BLAS, written on the GPU from the MultiMesh buffer. A merged
+				// BLAS is built again or refit whenever its instances change (moving units: hundreds of refits a frame, a
+				// hierarchy that degrades, a copy of the mesh per instance in video memory); it is kept for the displaced
+				// MultiMeshes, whose vertices only it holds. Measured on Solfarer's army and godot3d's village: faster on the
+				// render thread and the GPU, less memory, also for static foliage.
+				const bool per_instance = tlas_expand_supported && mm_gpu_buffer.is_valid() && !displace;
+
 				uint32_t lod = 0;
 				const RTLodView *lod_view = nullptr;
-				// GODOT_RT_MULTIMESH_LOD=0 merges every MultiMesh at its full detail.
+				// GODOT_RT_MULTIMESH_LOD=0 merges every MultiMesh at its full detail. One TLAS instance per instance traces
+				// the mesh itself: its BLAS is shared, whatever the instance count.
 				static const bool multimesh_lod = OS::get_singleton()->get_environment("GODOT_RT_MULTIMESH_LOD") != "0";
-				if (multimesh_lod && p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(mesh_surface)) {
+				if (!per_instance && multimesh_lod && p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(mesh_surface)) {
 					uint32_t lod_indices = 0;
 					const float lod_model_scale = inst->lod_model_scale * inst->lod_bias;
 					const float lod_distance_scaled = lod_distance * p_render_data->scene_data->lod_distance_multiplier;
@@ -3580,10 +3755,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					}
 				}
 
-				if (!mm_gpu_buffer.is_valid() || !_mm_fits_merged_blas(mesh_surface, mm_count, lod_view)) {
-					// One TLAS instance per instance needs the instances on the CPU; the merged BLAS reads them from the GPU
-					// buffer. A copy of the buffer that waited for the GPU stalled the frame for every new MultiMesh (foliage
-					// streamed in as the camera moves): the copy is asynchronous, and the MultiMesh traced once it is there.
+				if (!(tlas_expand_supported && mm_gpu_buffer.is_valid()) && (!mm_gpu_buffer.is_valid() || !_mm_fits_merged_blas(mesh_surface, mm_count, lod_view))) {
+					// One TLAS instance per instance, without writing them on the GPU, needs the instances on the CPU. A copy
+					// of the buffer that waited for the GPU stalled the frame for every new MultiMesh (foliage streamed in as
+					// the camera moves): the copy is asynchronous, and the MultiMesh traced once it is there.
 					if (!mesh_storage->multimesh_get_local_data_ptr_async(mm_rid)) {
 						mm_surf = mm_surf->next;
 						continue;
@@ -3600,24 +3775,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.surface_counter = surface_counter;
 				pending.lod = lod;
 				pending.lod_view = lod_view;
-				// Near the camera, a material whose vertex() moves the MultiMesh (wind) is evaluated on it, as raster draws it.
-				pending.displace = false;
-				pending.reevaluate = false;
+				pending.displace = displace;
+				pending.reevaluate = reevaluate;
 				pending.material_counter = material_counter;
-				static const float mm_displacement_distance = GLOBAL_GET("rendering/pathtracing/multimesh_displacement_distance");
-				if (mm_displacement_distance > 0.0f && lod_distance <= mm_displacement_distance && mat_data->rt_sbt_offset > 0) {
-					const SceneShaderRaytracing::CustomShaderEntry *displace_cse = rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
-					RID displace_shader;
-					if (displace_cse && displace_cse->writes_vertex && rt_shader_singleton->get_displace_pipeline(mat_data->rt_sbt_offset, displace_shader).is_valid()) {
-						pending.displace = true;
-						pending.reevaluate = displace_cse->uses_vertex_time || (displace_cse->vertex_reads_camera && displace_camera_moved);
-					}
-				}
 				pending.instance_transform = instance_transform;
 				pending.prev_instance_transform = prev_instance_transform;
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
+				pending.per_instance = per_instance;
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -3848,7 +4014,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_pre_refit_size = dirty_blas_update_list.size();
 #endif
 		RTSurfaceData merged_sd;
-		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
+		bool use_merged = !pending.per_instance && pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter, pending.lod,
 						pending.displace, pending.reevaluate, pending.mat_data, pending.material_counter, pending.instance_transform, pending.prev_instance_transform,
@@ -3887,8 +4053,61 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				rt_triangles_refit += prim_count * refit_delta;
 			}
 #endif
+		} else if (tlas_expand_supported && pending.mm_gpu_buffer.is_valid()) {
+			// One TLAS instance per instance, sharing the mesh's BLAS, written on the GPU from the MultiMesh buffer
+			// (_build_tlas_with_expanded_multimeshes()): no copy of the instances to the CPU, no work per instance here.
+			RTSurfaceData *surf_data = process_surface(pending.mm_surf, pending.mesh_surface,
+					pending.surface_counter, pending.instance_transform, dirty_blas_list);
+			if (!surf_data || !surf_data->blas.is_valid()) {
+				continue;
+			}
+
+			RT_GeometryData mm_geometry = surf_data->geometry;
+			if (_set_multimesh_instance_data(mm_geometry, pending.mm_rid, pending.mm_gpu_buffer, UINT32_MAX)) {
+				multimesh_buffers_read_this_frame.push_back(pending.mm_gpu_buffer);
+			}
+			mm_geometry.layer_mask = pending.mm_surf->owner->layer_mask;
+			RT_MaterialData mm_material = pending.mat_data->data;
+			mm_material.instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
+
+			TlasExpandJob job;
+			RendererRD::MaterialStorage::store_transform_transposed_3x4(pending.instance_transform, job.data.node);
+			RendererRD::MaterialStorage::store_transform_transposed_3x4(pending.transform_moved ? pending.prev_instance_transform : pending.instance_transform, job.data.prev_node);
+			RendererRD::MaterialStorage::store_transform_transposed_3x4(surf_data->is_compressed ? surf_data->aabb_transform : Transform3D(), job.data.aabb);
+			const uint64_t mm_address = RD::get_singleton()->buffer_get_device_address(pending.mm_gpu_buffer);
+			job.data.mm_address_lo = uint32_t(mm_address);
+			job.data.mm_address_hi = uint32_t(mm_address >> 32);
+			job.data.mm_stride = mesh_storage->multimesh_get_stride(pending.mm_rid);
+			job.data.mm_offset = mesh_storage->multimesh_get_current_instance_offset(pending.mm_rid);
+			// The instances' previous transforms, as raster's motion vectors read them (while a viewport uses them).
+			uint32_t mm_motion_current_offset = 0;
+			uint32_t mm_prev_offset = 0;
+			const bool mm_moved = mesh_storage->_multimesh_get_motion_vectors_offsets(pending.mm_rid, mm_motion_current_offset, mm_prev_offset) && mm_prev_offset != job.data.mm_offset;
+			job.data.mm_prev_offset = mm_moved ? mm_prev_offset : job.data.mm_offset;
+			job.data.template_index = tlas_expand_geometry_templates.size();
+			tlas_expand_geometry_templates.push_back(mm_geometry);
+			tlas_expand_material_templates.push_back(mm_material);
+			job.blas = surf_data->blas;
+			job.mm_gpu_buffer = pending.mm_gpu_buffer;
+			job.count = pending.mm_count;
+			job.sbt_offset = pending.mat_data->rt_sbt_offset;
+			job.flags = pending.inst_flags;
+			job.mask = instance_mask(pending.mm_surf->owner);
+			tlas_expand_jobs.push_back(job);
+
+#ifdef TOOLS_ENABLED
+			if (collect_render_info) {
+				tlas_instance_count += pending.mm_count;
+				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(pending.mesh_surface);
+				uint32_t prim_count = _rt_indices_to_primitives(pending.mm_surf->primitive, vertices);
+				tlas_primitive_count += prim_count * pending.mm_count;
+				uint32_t build_delta = dirty_blas_list.size() - mm_pre_build_size;
+				rt_blas_builds += build_delta;
+				rt_triangles_built += prim_count * build_delta;
+			}
+#endif
 		} else {
-			// Fallback: expanded TLAS — one entry per instance, shared BLAS.
+			// Without the standard instance layout: the instances read back to the CPU, one TLAS instance each.
 			const float *mm_data = mesh_storage->multimesh_get_local_data_ptr_async(pending.mm_rid);
 			if (!mm_data) {
 				continue;
@@ -4005,6 +4224,29 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		instance_flags.push_back(instance_flags[i] | RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT);
 		instance_masks.push_back(RT_INSTANCE_MASK_SHADOW);
 	}
+	const uint32_t expand_job_count = tlas_expand_jobs.size();
+	for (uint32_t i = 0; i < expand_job_count; i++) {
+		TlasExpandJob &job = tlas_expand_jobs[i];
+		if (!(job.mask & RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW)) {
+			continue;
+		}
+		job.mask &= ~RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW;
+		if (job.flags & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
+			continue;
+		}
+		job.mask &= ~RT_INSTANCE_MASK_SHADOW;
+		TlasExpandJob shadow_job = job;
+		shadow_job.flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+		shadow_job.mask = RT_INSTANCE_MASK_SHADOW;
+		tlas_expand_jobs.push_back(shadow_job);
+	}
+	// The GPU's instances, records and motion transforms follow the CPU's.
+	for (TlasExpandJob &job : tlas_expand_jobs) {
+		job.data.first_slot = blass.size() + tlas_expand_instance_count;
+		job.data.first_motion = motion_transforms.size() + tlas_expand_motion_count;
+		tlas_expand_instance_count += job.count;
+		tlas_expand_motion_count += job.count;
+	}
 
 	// Phase 3: BLAS / TLAS build.
 #ifdef TOOLS_ENABLED
@@ -4067,8 +4309,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// After the merges: the displaced positions overwrite the merged ones before the BLAS builds read them.
 	_displace_merged_multimeshes();
 
-	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
+	// The records first: the instances written on the GPU add theirs after these.
 	finalize_buffers(state);
+	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 
 	return state;
 }

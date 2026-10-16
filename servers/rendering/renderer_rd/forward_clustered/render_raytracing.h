@@ -43,6 +43,7 @@
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_lod_compact.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_background_output.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_sky_guide.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_tlas_expand.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -157,6 +158,24 @@ struct alignas(16) RT_MaterialData {
 	uint32_t ao_pad;
 };
 static_assert(sizeof(RT_MaterialData) == 144, "RT_MaterialData must be 144 bytes for std430");
+
+// A MultiMesh traced as one TLAS instance per instance, the instances written on the GPU (raytracing_tlas_expand.glsl
+// ExpandJob, std430).
+struct RT_TlasExpandJob {
+	float node[12]; // Rows of the MultiMesh node's transform.
+	float prev_node[12]; // In the previous frame.
+	float aabb[12]; // A compressed mesh's AABB transform, identity otherwise.
+	uint32_t instance_tail[4]; // Words 12-15 of the TLAS instance, as the driver writes them.
+	uint32_t mm_address_lo;
+	uint32_t mm_address_hi;
+	uint32_t mm_stride;
+	uint32_t mm_offset;
+	uint32_t mm_prev_offset;
+	uint32_t first_slot;
+	uint32_t first_motion;
+	uint32_t template_index;
+};
+static_assert(sizeof(RT_TlasExpandJob) == 192, "RT_TlasExpandJob must be 192 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -500,6 +519,9 @@ struct RTViewportState {
 	uint32_t motion_index_buffer_capacity = 0;
 	RID motion_transform_buffer;
 	uint32_t motion_transform_buffer_capacity = 0;
+	// The TLAS instances when some are written on the GPU (RenderRaytracing::tlas_expand_jobs), in instances.
+	RID tlas_instance_buffer;
+	uint32_t tlas_instance_buffer_capacity = 0;
 
 	RID light_buffer;
 	RID params_buffer;
@@ -558,6 +580,38 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} lod_compact_shader;
 	RID lod_view_dummy_buffer; // Bound in the merge's LOD view slots when a MultiMesh keeps its full mesh.
+
+	// MultiMeshes traced as one TLAS instance per instance, the instances written on the GPU from the MultiMesh buffer
+	// (raytracing_tlas_expand.glsl), after the ones the CPU writes. Without the standard instance layout, the instances
+	// are read back to the CPU instead (multimesh_get_local_data_ptr_async()), a frame late.
+	struct TlasExpandShader {
+		RaytracingTlasExpandShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} tlas_expand_shader;
+	bool tlas_expand_supported = false;
+	struct TlasExpandJob {
+		RT_TlasExpandJob data;
+		RID blas;
+		RID mm_gpu_buffer;
+		uint32_t count = 0;
+		uint32_t sbt_offset = 0;
+		uint32_t flags = 0;
+		uint8_t mask = 0;
+	};
+	LocalVector<TlasExpandJob> tlas_expand_jobs;
+	LocalVector<RT_GeometryData> tlas_expand_geometry_templates;
+	LocalVector<RT_MaterialData> tlas_expand_material_templates;
+	uint32_t tlas_expand_instance_count = 0; // Of all the jobs.
+	uint32_t tlas_expand_motion_count = 0; // Motion transforms written by the jobs.
+	RID tlas_expand_job_buffer;
+	uint32_t tlas_expand_job_capacity = 0;
+	RID tlas_expand_geometry_template_buffer;
+	RID tlas_expand_material_template_buffer;
+	uint32_t tlas_expand_template_capacity = 0;
+	// Writes the jobs' instances, records and motion after the CPU's, then builds the TLAS from p_instances and them.
+	void _build_tlas_with_expanded_multimeshes(RTViewportState *p_state, LocalVector<RD::AccelerationStructureInstance> &p_instances);
 
 	// Merged MultiMeshes whose material's vertex() moves them (wind), displaced after the merge.
 	struct MMDisplaceRequest {
