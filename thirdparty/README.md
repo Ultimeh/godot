@@ -975,6 +975,10 @@ Files extracted from upstream source:
 - `re-spirv.h`
 - `LICENSE`
 
+Patches:
+
+- `0001-loop-continue-phi-operand-uses.patch` (not upstream yet)
+
 
 ## rvo2
 

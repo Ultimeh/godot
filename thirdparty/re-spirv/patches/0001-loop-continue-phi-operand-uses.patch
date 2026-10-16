@@ -1,0 +1,67 @@
+diff --git a/thirdparty/re-spirv/re-spirv.cpp b/thirdparty/re-spirv/re-spirv.cpp
+index 871d345df9..429ebda391 100644
+--- a/thirdparty/re-spirv/re-spirv.cpp
++++ b/thirdparty/re-spirv/re-spirv.cpp
+@@ -783,6 +783,7 @@ namespace respv {
+         decorations.clear();
+         phis.clear();
+         loopHeaders.clear();
++        loopContinuePhiOperandIndices.clear();
+         listNodes.clear();
+         defaultSwitchOpConstantInt = UINT32_MAX;
+     }
+@@ -1969,11 +1970,6 @@ namespace respv {
+                         fprintf(stderr, "SPIR-V Parsing error. Invalid Parent ID: %u.\n", labelId);
+                         return false;
+                     }
+-                    
+-                    // Make sure this label doesn't come from the loop continue.
+-                    if (labelId == continueLabelId) {
+-                        continue;
+-                    }
+ 
+                     uint32_t operandId = dataWords[wordIndex + j];
+                     if (operandId >= results.size()) {
+@@ -1986,8 +1982,17 @@ namespace respv {
+                         return false;
+                     }
+ 
+-                    uint32_t labelIndex = results[labelId].instructionIndex;
+                     uint32_t resultIndex = results[operandId].instructionIndex;
++
++                    // Make sure this label doesn't come from the loop continue. The operand is still a use of its result:
++                    // it's left out of the graph to keep it acyclic, but its out degree must count it, or the result is
++                    // eliminated while the OpPhi still references it.
++                    if (labelId == continueLabelId) {
++                        loopContinuePhiOperandIndices.emplace_back(resultIndex);
++                        continue;
++                    }
++
++                    uint32_t labelIndex = results[labelId].instructionIndex;
+                     instructionAdjacentListIndices[labelIndex] = addToList(i, instructionAdjacentListIndices[labelIndex], listNodes);
+                     instructionAdjacentListIndices[resultIndex] = addToList(i, instructionAdjacentListIndices[resultIndex], listNodes);
+                 }
+@@ -2138,6 +2143,11 @@ namespace respv {
+             }
+         }
+ 
++        // Uses by loop header OpPhis coming from the loop continue have no edge in the graph but must be counted.
++        for (uint32_t resultIndex : loopContinuePhiOperandIndices) {
++            instructionOutDegrees[resultIndex]++;
++        }
++
+         // Sort degrees doesn't need to be cleared as its contents will be copied over.
+         thread_local std::vector<uint32_t> sortDegrees;
+         thread_local std::vector<uint32_t> instructionStack;
+diff --git a/thirdparty/re-spirv/re-spirv.h b/thirdparty/re-spirv/re-spirv.h
+index a9043e9d78..55f1215004 100644
+--- a/thirdparty/re-spirv/re-spirv.h
++++ b/thirdparty/re-spirv/re-spirv.h
+@@ -185,6 +185,7 @@ namespace respv {
+         std::vector<Decoration> decorations;
+         std::vector<Phi> phis;
+         std::vector<LoopHeader> loopHeaders;
++        std::vector<uint32_t> loopContinuePhiOperandIndices;
+         std::vector<ListNode> listNodes;
+         uint32_t defaultSwitchOpConstantInt = UINT32_MAX;
+ 
