@@ -300,7 +300,7 @@
 		<member name="animation/warnings/check_invalid_track_paths" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], [AnimationMixer] prints the warning of no matching object of the track path in the scene.
 		</member>
-		<member name="application/boot_splash/bg_color" type="Color" setter="" getter="" default="Color(0.14, 0.14, 0.14, 1)">
+		<member name="application/boot_splash/bg_color" type="Color" setter="" getter="" default="Color(0.055, 0.055, 0.1, 1)">
 			Background color for the boot splash.
 		</member>
 		<member name="application/boot_splash/image" type="String" setter="" getter="" default="&quot;&quot;">

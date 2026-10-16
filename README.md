@@ -1,5 +1,9 @@
 # Godot Engine
 
+> **Wagnardsoft Game Engine** is Wagnardsoft's fork of Godot Engine, with NVIDIA path tracing and DLSS. It is based on
+> Godot Engine and released under the same MIT license; it is not affiliated with or endorsed by the Godot Foundation.
+> "Godot" and the Godot logo are trademarks of the Godot Foundation. The text below is upstream Godot's.
+
 <p align="center">
   <a href="https://godotengine.org">
     <img src="misc/logo/logo_outlined.svg" width="400" alt="Godot Engine logo">
