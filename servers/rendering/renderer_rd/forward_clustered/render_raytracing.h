@@ -406,19 +406,30 @@ struct RTDeformedCacheEntry {
 /// Cache entry for a per-(MultiMesh, surface) merged BLAS.
 /// All vertex data (positions, normals, tangents, UVs, colors) is fully baked per-instance
 /// so the hit shader uses the standard code path — no special per-instance lookups.
+/// The buffers and the BLAS are sized for cap_vertices / cap_indices, more than the N*V / N*I in use: a change of
+/// instance count or LOD within them rebuilds the BLAS in place. The unused vertices are NaN, which makes the triangles
+/// using them inactive, and the unused indices point to the last vertex, always unused.
 struct RTMergedMMEntry {
-	// Merged vertex buffer: [float3 pos × N*V] + [packed TBN × N*V] (if mesh has normals).
+	uint32_t cap_vertices = 0;
+	uint32_t cap_indices = 0; // 0 if non-indexed.
+	uint32_t oversized_since_frame = 0; // The frame from which the capacity has been more than twice the need, or 0.
+	uint64_t buffer_bytes = 0; // Of the merged vertex, attribute and index buffers.
+
+	// Merged vertex buffer: [float3 pos × cap_vertices] + [packed TBN × cap_vertices] (if mesh has normals).
 	// The BLAS reads only the position section; the hit shader reads TBN via normal_byte_offset.
 	RID merged_vtx_buffer;
-	uint32_t vtx_capacity_bytes = 0;
 
-	// Merged attribute buffer: [UV + color × N*V] replicated per instance.
+	// Merged attribute buffer: [UV + color × cap_vertices] replicated per instance.
 	RID merged_attr_buffer;
-	uint32_t attr_capacity_bytes = 0;
 
-	// Replicated index buffer: uint32 N*I entries (invalid if non-indexed).
+	// Replicated index buffer: uint32 × cap_indices (invalid if non-indexed).
 	RID replicated_idx_buffer;
-	uint32_t idx_capacity = 0;
+
+	// The merge pass's uniform set, kept while it binds the same buffers: a MultiMesh whose buffer is set every frame is
+	// merged again every frame, and one set per merge and frame (Solfarer: ~30,000 a second) filled the D3D12 heap.
+	RID merge_uniform_set;
+	RID merge_set_buffers[7];
+	uint32_t merge_set_mode = UINT32_MAX;
 
 	RID blas;
 	uint32_t last_mm_count = 0;
@@ -433,8 +444,9 @@ struct RTMergedMMEntry {
 	bool displaced_this_frame = false; // Its positions moved this frame: the previous ones are valid.
 	uint32_t displaced_inputs = 0; // Hash of the material's parameters and the instance uniforms vertex() was evaluated with.
 	RID merged_prev_buffer; // float3 per merged vertex, the previous frame's displaced positions.
-	uint32_t prev_capacity_bytes = 0;
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
+	uint32_t last_tbn_stride = 0; // The strides the buffers were sized with.
+	uint32_t last_attrib_stride = 0;
 };
 
 /// A mesh LOD reduced to the vertices its indices use, for the merged MultiMesh BLASes: a LOD keeps the base
@@ -629,6 +641,9 @@ class RenderRaytracing {
 		}
 	};
 	LocalVector<MMSurfaceHandles> mm_handles;
+	uint32_t mm_handles_sweep_cursor = 0; // Next handle checked for a freed MultiMesh.
+	uint32_t lod_switch_frame = 0; // The frame lod_switch_triangles counts.
+	uint64_t lod_switch_triangles = 0; // Merged BLAS triangles built again this frame for a LOD switch alone.
 
 	RID_Owner<RTDeformedCacheEntry> deformed_pool;
 	LocalVector<RID> deformed_active_this_frame;
@@ -654,6 +669,8 @@ class RenderRaytracing {
 	Projection displace_camera_projection;
 	void _displace_surfaces(const RenderDataRD *p_render_data);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
+	void _free_merged_mm_entry(RID p_handle);
+	const RTMergedMMEntry *_get_merged_mm_entry(RID p_mm_rid, uint32_t p_surface_index); // With a BLAS built, or null.
 
 	LocalVector<uint32_t> material_free_slots;
 	uint32_t next_material_slot = 0;

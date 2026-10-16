@@ -82,7 +82,7 @@ layout(push_constant, std430) uniform PC {
 	uint pos_stride_words; // position stride in float words (3 for uncompressed, 2 for compressed)
 	uint src_tbn_base_words; // word offset of TBN section in source vertex buffer
 	uint tbn_stride_words; // 1 = normal only, 2 = normal + tangent (uint32 each), in the output (and an uncompressed source)
-	uint dst_tbn_base_words; // N * V * 3 (word offset of TBN section in output)
+	uint dst_tbn_base_words; // cap_vertices * 3 (word offset of TBN section in output)
 	uint mm_stride; // mm transform stride in floats
 	uint mm_offset; // mm current instance offset (motion vectors double-buffer)
 	uint has_tbn; // 1 if mesh has normals/tangents, 0 otherwise
@@ -92,6 +92,10 @@ layout(push_constant, std430) uniform PC {
 	uint compressed;
 	float aabb_pos_x, aabb_pos_y, aabb_pos_z;
 	float aabb_size_x, aabb_size_y, aabb_size_z;
+	// The merged buffers' capacity. Unused vertices are NaN, which makes inactive every triangle using one; unused
+	// indices point to the last vertex, always unused.
+	uint cap_vertices;
+	uint cap_indices;
 }
 push;
 
@@ -212,6 +216,11 @@ void main() {
 				dst_vtx.v[tbn_dst + 1u] = pack_oct(rt_oct);
 			}
 		}
+	} else if (idx < push.cap_vertices) {
+		uint pos_base = idx * 3u;
+		dst_vtx.v[pos_base + 0u] = 0x7FC00000u; // NaN.
+		dst_vtx.v[pos_base + 1u] = 0u;
+		dst_vtx.v[pos_base + 2u] = 0u;
 	}
 
 #ifdef MODE_INDEXED
@@ -235,6 +244,8 @@ void main() {
 		}
 
 		dst_idx.v[idx] = src_idx + inst_i * push.vertex_count;
+	} else if (idx < push.cap_indices) {
+		dst_idx.v[idx] = push.cap_vertices - 1u;
 	}
 #endif
 }

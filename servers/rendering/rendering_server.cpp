@@ -3832,7 +3832,9 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_unused_size_mb", PROPERTY_HINT_RANGE, "0,16384,1,suffix:MiB"), 256);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/static_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_lod_switch_triangles_per_frame", PROPERTY_HINT_RANGE, "1024,16777216,1"), 1048576);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/multimesh_displacement_distance", PROPERTY_HINT_RANGE, "0,500,0.1,or_greater,suffix:m"), 30.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/displacement_update_distance", PROPERTY_HINT_RANGE, "0,500,0.1,or_greater,suffix:m"), 30.0);

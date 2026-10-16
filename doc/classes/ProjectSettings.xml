@@ -3270,6 +3270,10 @@
 			Number of frames a merged MultiMesh BLAS is kept alive in the path tracer cache after its last visible frame. At 60 fps, the default of 3600 corresponds to approximately one minute. Once this threshold is exceeded the BLAS and all merged vertex, attribute, and index buffers are freed. Decrease this value to reclaim GPU memory when MultiMeshes disappear from the scene.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/multimesh_blas_cache_unused_size_mb" type="int" setter="" getter="" default="256">
+			Size in mebibytes of the merged vertex, attribute and index buffers the path tracer keeps for MultiMeshes no view traced in the last 60 frames, so that they need not be merged and built again when the camera comes back (their BLASes take about as much memory again). Beyond it the least recently traced are freed first, before [member rendering/pathtracing/multimesh_blas_cache_ttl_frames] expires. Increase it when the camera often returns to scenes with many MultiMeshes and video memory allows; decrease it to reclaim video memory.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/multimesh_cache_cpu_transforms" type="bool" setter="" getter="" default="false">
 			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. This lets the path tracer read the per-instance transforms of a MultiMesh it cannot merge into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]) without copying the GPU buffer back. That copy is asynchronous, and the MultiMesh is traced from the next frame on; when [member MultiMesh.buffer] is set again before the copy arrives, the MultiMesh keeps a CPU-side mirror from then on, as with this setting.
 			[b]Warning:[/b] Enabling this setting increases CPU memory usage. Every [MultiMesh] that assigns [member MultiMesh.buffer] will maintain a full duplicate of its transform data in RAM.
@@ -3278,6 +3282,10 @@
 		</member>
 		<member name="rendering/pathtracing/multimesh_displacement_distance" type="float" setter="" getter="" default="30.0">
 			Distance from the camera within which the path tracer runs the [code]vertex()[/code] function of a [MultiMesh]'s material on its instances, as the rasterizer does, so that effects such as grass swaying in the wind are traced. The MultiMesh's acceleration structure is then refitted every frame its shader uses [code]TIME[/code] or reads the moving camera. Beyond this distance the instances are traced at their rest positions. Only MultiMeshes merged into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]) are displaced. Set to [code]0.0[/code] to disable.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/multimesh_lod_switch_triangles_per_frame" type="int" setter="" getter="" default="1048576">
+			Number of triangles the path tracer builds again per frame for merged MultiMeshes that only switch to another LOD. A zoom switches many of them at once, each a full build of its acceleration structure on the GPU: beyond this budget, the next ones keep their current LOD for another frame, spreading the work over the following frames. A MultiMesh whose instance count changes is built again anyway and switches its LOD regardless. Decrease it to smooth the GPU load during zooms; increase it to make distant MultiMeshes reach their new LOD sooner.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_merged_blas_max_triangles" type="int" setter="" getter="" default="65536">
