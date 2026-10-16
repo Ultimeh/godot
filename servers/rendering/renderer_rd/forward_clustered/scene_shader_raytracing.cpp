@@ -1796,6 +1796,8 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.renames["MODELVIEW_MATRIX"] = "rt_modelview_matrix";
 		actions.renames["MODELVIEW_NORMAL_MATRIX"] = "rt_modelview_normal_matrix";
 		actions.renames["MAIN_CAM_INV_VIEW_MATRIX"] = "inv_view_matrix";
+		// No shadow pass: shadow rays meet the geometry the camera's rays do, that of the BLAS.
+		actions.renames["IN_SHADOW_PASS"] = "false";
 
 		actions.renames["VERTEX"] = "vertex";
 		actions.renames["NORMAL"] = "normal";
