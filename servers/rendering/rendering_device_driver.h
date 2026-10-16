@@ -961,6 +961,10 @@ public:
 		API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS,
 		API_TRAIT_TEXTURE_OUTPUTS_REQUIRE_CLEARS,
 		API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE,
+		// An instance is VkAccelerationStructureInstanceKHR / D3D12_RAYTRACING_INSTANCE_DESC: a row-major 3x4 transform, then
+		// the custom index (24 bits) and mask (8), the hit group offset (24) and flags (8), the BLAS address (64), so that a
+		// shader can write instances.
+		API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT,
 		API_TRAIT_SHADER_GROUP_HANDLE_SIZE,
 		API_TRAIT_SHADER_GROUP_BASE_ALIGNMENT,
 		API_TRAIT_SHADER_GROUP_HANDLE_ALIGNMENT,

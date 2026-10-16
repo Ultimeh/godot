@@ -6607,6 +6607,8 @@ void RenderingDeviceDriverD3D12::command_build_tlas(CommandBufferID p_cmd_buffer
 			BufferInfo *blas_buffer_info = (BufferInfo *)blas_info->buffer.id;
 			_resource_transition_batch(cmd_buffer_info, blas_buffer_info, 0, 1, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
 		}
+		// Instances a shader wrote (tlas_build_from_buffer()); an upload heap's GENERIC_READ already includes this state.
+		_resource_transition_batch(cmd_buffer_info, (BufferInfo *)instance_buffer_info, 0, 1, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
 		BufferInfo *acceleration_structure_buffer_info = (BufferInfo *)acceleration_structure_info->buffer.id;
 		_resource_transition_batch(cmd_buffer_info, acceleration_structure_buffer_info, 0, 1, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
@@ -7035,6 +7037,9 @@ uint64_t RenderingDeviceDriverD3D12::api_trait_get(ApiTrait p_trait) {
 			return true;
 		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE:
 			return sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT:
+			static_assert(sizeof(D3D12_RAYTRACING_INSTANCE_DESC) == 64 && offsetof(D3D12_RAYTRACING_INSTANCE_DESC, AccelerationStructure) == 56);
+			return true;
 		case API_TRAIT_SHADER_GROUP_HANDLE_SIZE:
 			return D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
 		case API_TRAIT_SHADER_GROUP_BASE_ALIGNMENT:

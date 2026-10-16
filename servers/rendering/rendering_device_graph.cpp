@@ -2484,7 +2484,9 @@ void RenderingDeviceGraph::add_tlas_build(RDD::AccelerationStructureID p_acceler
 
 	for (uint32_t i = 0; i < p_src_trackers.size(); ++i) {
 		trackers[i] = p_src_trackers[i];
-		usages[i] = RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ;
+		// The BLASes, and an instance buffer written on the GPU (read as a BLAS build reads its inputs: D3D12 allows the
+		// acceleration structure accesses only on acceleration structures).
+		usages[i] = p_src_trackers[i]->buffer_driver_id.id != 0 ? RESOURCE_USAGE_STORAGE_BUFFER_READ : RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ;
 	}
 
 	trackers[resource_count - 1] = p_dst_tracker;

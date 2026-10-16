@@ -57,6 +57,8 @@ uint64_t RenderingDeviceDriver::api_trait_get(ApiTrait p_trait) {
 			return false;
 		case API_TRAIT_RESUMABLE_RENDER_PASSES:
 			return false;
+		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT:
+			return false;
 		default:
 			ERR_FAIL_V(0);
 	}

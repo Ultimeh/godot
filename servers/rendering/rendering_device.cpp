@@ -732,6 +732,101 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	return OK;
 }
 
+uint32_t RenderingDevice::tlas_get_instance_size() const {
+	return driver->api_trait_get(RDD::API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE);
+}
+
+bool RenderingDevice::tlas_instance_layout_is_standard() const {
+	return driver->api_trait_get(RDD::API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT);
+}
+
+Error RenderingDevice::tlas_instances_encode(Span<AccelerationStructureInstance> p_instances, uint8_t *r_data) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	const uint32_t instance_size = tlas_get_instance_size();
+	for (uint32_t i = 0; i < p_instances.size(); i++) {
+		const AccelerationStructureInstance &rd_instance = p_instances[i];
+
+		RDD::AccelerationStructureInstance rdd_instance;
+		rdd_instance.transform = rd_instance.transform;
+		rdd_instance.id = rd_instance.id;
+		rdd_instance.mask = rd_instance.mask;
+		rdd_instance.hit_sbt_offset = _decode_hit_sbt_range_offset(rd_instance.hit_sbt_range);
+		rdd_instance.flags = rd_instance.flags;
+
+		if (rd_instance.blas.is_valid()) {
+			ERR_FAIL_COND_V_MSG(!rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
+
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(rd_instance.blas);
+			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+			rdd_instance.blas = blas->driver_id;
+		}
+
+		driver->acceleration_structure_instance_write(r_data + instance_size * i, rdd_instance);
+	}
+
+	return OK;
+}
+
+Error RenderingDevice::tlas_build_from_buffer(RID p_tlas, RID p_instance_buffer, uint32_t p_instance_count, Span<RID> p_blases) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a raytracing list.");
+
+	AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(p_tlas);
+	ERR_FAIL_NULL_V_MSG(tlas, ERR_INVALID_PARAMETER, "TLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(p_instance_count > tlas->max_instance_count, ERR_INVALID_PARAMETER, "Exceeded the maximum amount of instances allowed in the TLAS.");
+
+	Buffer *instance_buffer = storage_buffer_owner.get_or_null(p_instance_buffer);
+	ERR_FAIL_NULL_V_MSG(instance_buffer, ERR_INVALID_PARAMETER, "The instance buffer must be a valid storage buffer.");
+	ERR_FAIL_COND_V_MSG(!instance_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !instance_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT), ERR_INVALID_PARAMETER,
+			"The instance buffer must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT.");
+	ERR_FAIL_COND_V_MSG(uint64_t(p_instance_count) * tlas_get_instance_size() > instance_buffer->size, ERR_INVALID_PARAMETER, "The instance buffer is too small for the instance count.");
+
+	Error err = _acceleration_structure_scratch_buffer_create(tlas);
+	ERR_FAIL_COND_V(err != OK, err);
+
+	_tlas_remove_blas_dependencies(tlas, p_tlas);
+
+	thread_local LocalVector<RDD::AccelerationStructureID> blases;
+	thread_local LocalVector<RDG::ResourceTracker *> draw_trackers;
+	blases.clear();
+	draw_trackers.clear();
+
+	for (const RID &blas_rid : p_blases) {
+		AccelerationStructure *blas = acceleration_structure_owner.get_or_null(blas_rid);
+		ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+		if (tlas->acceleration_structure_dependencies.has(blas_rid)) {
+			continue;
+		}
+		tlas->acceleration_structure_dependencies.insert(blas_rid);
+		blas->acceleration_structure_dependencies.insert(p_tlas);
+		blases.push_back(blas->driver_id);
+		if (blas->draw_tracker != nullptr) {
+			draw_trackers.push_back(blas->draw_tracker);
+		}
+	}
+
+	// The build reads the instances after whatever wrote them (a copy, a shader).
+	if (_buffer_make_mutable(instance_buffer, p_instance_buffer)) {
+		draw_graph->add_synchronization();
+	}
+	draw_trackers.push_back(instance_buffer->draw_tracker);
+	_check_transfer_worker_buffer(instance_buffer);
+
+	draw_graph->add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer->driver_id, 0, p_instance_count, blases, tlas->draw_tracker, draw_trackers);
+
+	tlas->invalidated = false;
+
+	return OK;
+}
+
 /**********************************/
 /**** HIT SHADER BINDING TABLE ****/
 /**********************************/
@@ -7629,6 +7724,26 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 
 	if (buffer->draw_tracker != nullptr) {
 		draw_graph->add_compute_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+	}
+
+	_check_transfer_worker_buffer(buffer);
+}
+
+void RenderingDevice::compute_list_add_buffer_dependency(ComputeListID p_list, RID p_buffer, bool p_writable) {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND(p_list != ID_TYPE_COMPUTE_LIST);
+	ERR_FAIL_COND(!compute_list.active);
+
+	Buffer *buffer = _get_buffer_from_owner(p_buffer);
+	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
+
+	if (_buffer_make_mutable(buffer, p_buffer)) {
+		draw_graph->add_synchronization();
+	}
+
+	if (buffer->draw_tracker != nullptr) {
+		draw_graph->add_compute_list_usage(buffer->draw_tracker, p_writable ? RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ_WRITE : RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
 	}
 
 	_check_transfer_worker_buffer(buffer);

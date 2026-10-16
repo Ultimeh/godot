@@ -1529,6 +1529,17 @@ public:
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
 
+	// Instances in a buffer of the caller's: a storage buffer made with BUFFER_CREATION_DEVICE_ADDRESS_BIT and
+	// BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT, filled by buffer_update() with
+	// tlas_instances_encode()'s bytes, or by a shader when tlas_instance_layout_is_standard().
+	uint32_t tlas_get_instance_size() const;
+	// The Vulkan / D3D12 instance layout (RDD::API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT).
+	bool tlas_instance_layout_is_standard() const;
+	// p_instances in the driver's layout, tlas_get_instance_size() bytes each; their BLASes must be built.
+	Error tlas_instances_encode(Span<AccelerationStructureInstance> p_instances, uint8_t *r_data);
+	// The first p_instance_count instances of p_instance_buffer; p_blases: every BLAS they reference.
+	Error tlas_build_from_buffer(RID p_tlas, RID p_instance_buffer, uint32_t p_instance_count, Span<RID> p_blases);
+
 private:
 	/**********************************/
 	/**** HIT SHADER BINDING TABLE ****/
@@ -1865,6 +1876,8 @@ public:
 	void compute_list_dispatch_threads(ComputeListID p_list, uint32_t p_x_threads, uint32_t p_y_threads, uint32_t p_z_threads);
 	void compute_list_dispatch_indirect(ComputeListID p_list, RID p_buffer, uint32_t p_offset);
 	void compute_list_add_barrier(ComputeListID p_list);
+	// A buffer the list's shaders read or write through its device address, which no uniform set declares.
+	void compute_list_add_buffer_dependency(ComputeListID p_list, RID p_buffer, bool p_writable = false);
 
 	void compute_list_end();
 

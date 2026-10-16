@@ -7747,6 +7747,9 @@ uint64_t RenderingDeviceDriverVulkan::api_trait_get(ApiTrait p_trait) {
 			return (uint64_t)SHADER_CHANGE_INVALIDATION_INCOMPATIBLE_SETS_PLUS_CASCADE;
 		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE:
 			return sizeof(VkAccelerationStructureInstanceKHR);
+		case API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT:
+			static_assert(sizeof(VkAccelerationStructureInstanceKHR) == 64 && offsetof(VkAccelerationStructureInstanceKHR, accelerationStructureReference) == 56);
+			return true;
 		case API_TRAIT_SHADER_GROUP_HANDLE_SIZE:
 			return raytracing_capabilities.shader_group_handle_size;
 		case API_TRAIT_SHADER_GROUP_HANDLE_ALIGNMENT:
