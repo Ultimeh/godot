@@ -660,6 +660,37 @@ void Environment::_update_pathtracing() {
 			pathtracing_denoiser);
 }
 
+void Environment::set_pathtracing_culling_enabled(bool p_enabled) {
+	pathtracing_culling_enabled = p_enabled;
+	_update_pathtracing_culling();
+}
+
+bool Environment::is_pathtracing_culling_enabled() const {
+	return pathtracing_culling_enabled;
+}
+
+void Environment::set_pathtracing_culling_radius(float p_radius) {
+	pathtracing_culling_radius = MAX(p_radius, 0.0f);
+	_update_pathtracing_culling();
+}
+
+float Environment::get_pathtracing_culling_radius() const {
+	return pathtracing_culling_radius;
+}
+
+void Environment::set_pathtracing_culling_angle(float p_angle) {
+	pathtracing_culling_angle = CLAMP(p_angle, 0.0f, 90.0f);
+	_update_pathtracing_culling();
+}
+
+float Environment::get_pathtracing_culling_angle() const {
+	return pathtracing_culling_angle;
+}
+
+void Environment::_update_pathtracing_culling() {
+	RS::get_singleton()->environment_set_pathtracing_culling(environment, pathtracing_culling_enabled, pathtracing_culling_radius, pathtracing_culling_angle);
+}
+
 // Glow
 
 void Environment::set_glow_enabled(bool p_enabled) {
@@ -1499,6 +1530,12 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_max_bounces"), &Environment::get_pathtracing_max_bounces);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_denoiser", "denoiser"), &Environment::set_pathtracing_denoiser);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_denoiser"), &Environment::get_pathtracing_denoiser);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_culling_enabled", "enabled"), &Environment::set_pathtracing_culling_enabled);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_culling_enabled"), &Environment::is_pathtracing_culling_enabled);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_culling_radius", "radius"), &Environment::set_pathtracing_culling_radius);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_culling_radius"), &Environment::get_pathtracing_culling_radius);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_culling_angle", "angle"), &Environment::set_pathtracing_culling_angle);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_culling_angle"), &Environment::get_pathtracing_culling_angle);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1507,6 +1544,10 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
+	ADD_SUBGROUP("Culling", "pathtracing_culling_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_culling_enabled"), "set_pathtracing_culling_enabled", "is_pathtracing_culling_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_culling_radius", PROPERTY_HINT_RANGE, "0,4000,1,or_greater,suffix:m"), "set_pathtracing_culling_radius", "get_pathtracing_culling_radius");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_culling_angle", PROPERTY_HINT_RANGE, "0,10,0.01,or_greater,suffix:°"), "set_pathtracing_culling_angle", "get_pathtracing_culling_angle");
 
 	// Glow
 
@@ -1757,6 +1798,7 @@ Environment::Environment() {
 	_update_ssil();
 	_update_sdfgi();
 	_update_pathtracing();
+	_update_pathtracing_culling();
 	_update_glow();
 	_update_fog();
 	_update_adjustment();

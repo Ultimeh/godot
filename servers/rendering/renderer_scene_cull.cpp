@@ -3335,6 +3335,11 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 			if (cull_data.cull->rt_enabled && (idata.layer_mask & ((1 << 20) - 1))) {
 				// For off-frustum instances, also run VIS_CHECK to match raster gating.
 				bool rt_in_range = in_frustum || (cull_data.scenario->instance_aabbs[i].in_aabb(cull_data.cull->rt_aabb) && VIS_CHECK);
+				// Out of view (outside the frustum, or hidden by occlusion culling), what is near or looks large stays: it
+				// can be reflected or cast a shadow in view, whatever its direction. Far and small, it would not cover a pixel.
+				if (rt_in_range && !in_frustum && cull_data.cull->rt_culling) {
+					rt_in_range = _rt_culling_keeps(cull_data.scenario->instance_aabbs[i], *cull_data.cull, idata.instance);
+				}
 				if (rt_in_range) {
 					// Exclude visibility-parent children while their parent is in the
 					// FADE_CHILDREN cross-fade band. PT is binary: only one LOD at a time.
@@ -3473,6 +3478,10 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		float z_far = p_camera_data->main_projection.get_z_far();
 		Vector3 cam_origin = p_camera_data->main_transform.origin;
 		cull.rt_aabb = AABB(cam_origin - Vector3(z_far, z_far, z_far), Vector3(z_far, z_far, z_far) * 2.0);
+		cull.rt_culling = scene_render->environment_get_pathtracing_culling_enabled(p_environment);
+		cull.rt_camera_origin = cam_origin;
+		cull.rt_culling_radius = scene_render->environment_get_pathtracing_culling_radius(p_environment);
+		cull.rt_culling_tan_half_angle = Math::tan(Math::deg_to_rad(scene_render->environment_get_pathtracing_culling_angle(p_environment)) * 0.5f);
 	}
 
 	Vector<RID> directional_lights;

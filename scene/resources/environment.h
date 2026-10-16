@@ -197,6 +197,10 @@ private:
 	int pathtracing_max_bounces = 3;
 	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
 	void _update_pathtracing();
+	bool pathtracing_culling_enabled = true;
+	float pathtracing_culling_radius = 200.0;
+	float pathtracing_culling_angle = 1.0;
+	void _update_pathtracing_culling();
 
 	// Glow
 	bool glow_enabled = false;
@@ -396,6 +400,12 @@ public:
 	int get_pathtracing_max_bounces() const;
 	void set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser);
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
+	void set_pathtracing_culling_enabled(bool p_enabled);
+	bool is_pathtracing_culling_enabled() const;
+	void set_pathtracing_culling_radius(float p_radius);
+	float get_pathtracing_culling_radius() const;
+	void set_pathtracing_culling_angle(float p_angle);
+	float get_pathtracing_culling_angle() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

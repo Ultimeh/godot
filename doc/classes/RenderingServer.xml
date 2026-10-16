@@ -1410,6 +1410,16 @@
 			<description>
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_culling">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<param index="2" name="radius" type="float" />
+			<param index="3" name="angle" type="float" />
+			<description>
+				Sets which objects out of view the path tracer leaves out of the scene it traces. See [member Environment.pathtracing_culling_enabled], [member Environment.pathtracing_culling_radius] and [member Environment.pathtracing_culling_angle] for more details.
+			</description>
+		</method>
 		<method name="environment_set_sdfgi">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />
