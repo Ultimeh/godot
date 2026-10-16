@@ -54,6 +54,12 @@ Copyright: 2011, Ole Kniemeyer, MAXON, www.maxon.net
  2007-2014, Juan Linietsky, Ariel Manzur
 License: Expat and Zlib
 
+Files: main/splash.png
+Comment: Wagnardsoft Game Engine boot splash
+Copyright: 2026, Wagnardsoft (the Wagnardsoft logo)
+ 2017, Andrea Calabró (the Godot Engine logo)
+License: Wagnardsoft-logo and CC-BY-4.0
+
 Files: misc/dist/linux/org.godotengine.Godot.appdata.xml
 Comment: Linux AppStream Metadata File
 Copyright: 2017-2022, Rémi Verschelde
@@ -2349,6 +2355,13 @@ License: WOL
  the above copyright notice and this license appear in all source copies.
  THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY OF
  ANY KIND. See https://dspguru.com/wide-open-license/ for more information.
+
+License: Wagnardsoft-logo
+ The Wagnardsoft logo and the Wagnardsoft name are the property of Wagnardsoft.
+ All rights reserved. They are not licensed under the Expat license that covers
+ the rest of this engine: they may be used only as part of this engine's boot
+ splash, in builds of the engine and in projects exported with it, and in no
+ other way without Wagnardsoft's written permission.
 
 License: X11
  Permission to use, copy, modify, distribute, and sell this
