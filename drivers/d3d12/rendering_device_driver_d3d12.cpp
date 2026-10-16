@@ -6556,13 +6556,14 @@ bool RenderingDeviceDriverD3D12::raytracing_pipeline_get_shader_group_handles(Ra
 
 // ----- COMMANDS -----
 
-void RenderingDeviceDriverD3D12::command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
+void RenderingDeviceDriverD3D12::command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) {
 	CommandBufferInfo *cmd_buffer_info = (CommandBufferInfo *)p_cmd_buffer.id;
 
 	AccelerationStructureInfo *acceleration_structure_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 	const BufferInfo *scratch_buffer_info = (const BufferInfo *)p_scratch_buffer.id;
 
-	acceleration_structure_info->build_desc.ScratchAccelerationStructureData = scratch_buffer_info->gpu_virtual_address;
+	DEV_ASSERT(p_scratch_offset % D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT == 0);
+	acceleration_structure_info->build_desc.ScratchAccelerationStructureData = scratch_buffer_info->gpu_virtual_address + p_scratch_offset;
 
 	if (!barrier_capabilities.enhanced_barriers_supported) {
 		for (BufferInfo *input_buffer_info : acceleration_structure_info->input_buffer_infos) {
@@ -6577,14 +6578,14 @@ void RenderingDeviceDriverD3D12::command_build_blas(CommandBufferID p_cmd_buffer
 	cmd_buffer_info->cmd_list_4->BuildRaytracingAccelerationStructure(&acceleration_structure_info->build_desc, 0, nullptr);
 }
 
-void RenderingDeviceDriverD3D12::command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) {
+void RenderingDeviceDriverD3D12::command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) {
 	AccelerationStructureInfo *acceleration_structure_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 	ERR_FAIL_COND_MSG(!(acceleration_structure_info->build_desc.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE), "A BLAS can only be refitted if it was created with ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT.");
 
 	// A refit in place: the structure is its own source.
 	acceleration_structure_info->build_desc.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
 	acceleration_structure_info->build_desc.SourceAccelerationStructureData = acceleration_structure_info->build_desc.DestAccelerationStructureData;
-	command_build_blas(p_cmd_buffer, p_acceleration_structure, p_scratch_buffer);
+	command_build_blas(p_cmd_buffer, p_acceleration_structure, p_scratch_buffer, p_scratch_offset);
 	acceleration_structure_info->build_desc.Inputs.Flags &= ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
 	acceleration_structure_info->build_desc.SourceAccelerationStructureData = 0;
 }

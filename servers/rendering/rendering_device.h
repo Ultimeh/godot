@@ -1422,7 +1422,7 @@ private:
 		HashSet<RID> acceleration_structure_dependencies;
 		bool invalidated = true;
 
-		// Scratch buffer used during build, owned by the AS.
+		// Scratch buffer used during build, owned by a TLAS (a BLAS's is a range of the frame's scratch).
 		RDD::BufferID scratch_buffer;
 
 		// --- Bottom Level ---
@@ -1443,6 +1443,23 @@ private:
 	};
 
 	Error _acceleration_structure_scratch_buffer_create(AccelerationStructure *p_acceleration_structure);
+
+	// The scratch memory of the BLAS builds and refits recorded in a frame: each takes a range of its own (concurrent builds
+	// need disjoint scratch memory), and the frame slot's ranges are free again once the GPU finished it. A buffer per BLAS
+	// was a GPU allocation per build (most of the render thread's time when merged MultiMeshes change every frame), and
+	// every refit BLAS kept its own for its whole life.
+	struct AccelerationStructureScratch {
+		LocalVector<RDD::BufferID> chunks;
+		LocalVector<uint64_t> chunk_sizes;
+		uint32_t chunk = 0; // The one the next range comes from.
+		uint64_t offset = 0; // In it.
+		uint64_t used = 0; // Since the slot was last reset, in all chunks.
+		uint64_t next_chunk_size = 0; // At least, for the next chunk made: the capacity of those consolidated into it.
+		uint32_t underused_frames = 0;
+	};
+	Error _acceleration_structure_scratch_allocate(uint64_t p_size, RDD::BufferID &r_buffer, uint64_t &r_offset);
+	void _acceleration_structure_scratch_reset(AccelerationStructureScratch &r_scratch);
+	void _acceleration_structure_scratch_free(AccelerationStructureScratch &r_scratch);
 	void _blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id);
 	void _tlas_remove_blas_dependencies(AccelerationStructure *p_tlas, RID p_tlas_id);
 
@@ -1966,6 +1983,8 @@ private:
 		List<ComputePipeline> compute_pipelines_to_dispose_of;
 		List<AccelerationStructure> acceleration_structures_to_dispose_of;
 		List<RaytracingPipeline> raytracing_pipelines_to_dispose_of;
+
+		AccelerationStructureScratch acceleration_structure_scratch;
 
 		// Pending asynchronous data transfer for buffers.
 		LocalVector<RDD::BufferID> download_buffer_staging_buffers;

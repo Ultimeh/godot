@@ -284,6 +284,74 @@ Error RenderingDevice::_acceleration_structure_scratch_buffer_create(Acceleratio
 	return OK;
 }
 
+static const uint64_t AS_SCRATCH_RANGE_ALIGNMENT = 256; // D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT; Vulkan's size includes its own.
+static const uint64_t AS_SCRATCH_MIN_CHUNK_SIZE = 16 * 1024 * 1024;
+static const uint32_t AS_SCRATCH_SHRINK_DELAY_FRAMES = 600; // Used under a quarter of its capacity this long: freed.
+
+Error RenderingDevice::_acceleration_structure_scratch_allocate(uint64_t p_size, RDD::BufferID &r_buffer, uint64_t &r_offset) {
+	AccelerationStructureScratch &scratch = frames[frame].acceleration_structure_scratch;
+	const uint64_t size = STEPIFY(p_size, AS_SCRATCH_RANGE_ALIGNMENT);
+	while (scratch.chunk < scratch.chunks.size()) {
+		if (scratch.offset + size <= scratch.chunk_sizes[scratch.chunk]) {
+			r_buffer = scratch.chunks[scratch.chunk];
+			r_offset = scratch.offset;
+			scratch.offset += size;
+			scratch.used += size;
+			return OK;
+		}
+		scratch.chunk++;
+		scratch.offset = 0;
+	}
+
+	// A new chunk, at least as large as the others together: once consolidated, the slot needs a single one.
+	uint64_t capacity = 0;
+	for (uint64_t existing : scratch.chunk_sizes) {
+		capacity += existing;
+	}
+	const uint64_t chunk_size = MAX(MAX(size, AS_SCRATCH_MIN_CHUNK_SIZE), MAX(scratch.next_chunk_size, capacity));
+	const RDD::BufferID buffer = driver->buffer_create(chunk_size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	ERR_FAIL_COND_V(!buffer, ERR_CANT_CREATE);
+	buffer_memory.add(chunk_size);
+	scratch.next_chunk_size = 0;
+	scratch.chunks.push_back(buffer);
+	scratch.chunk_sizes.push_back(chunk_size);
+	scratch.chunk = scratch.chunks.size() - 1;
+	scratch.offset = size;
+	scratch.used += size;
+	r_buffer = buffer;
+	r_offset = 0;
+	return OK;
+}
+
+void RenderingDevice::_acceleration_structure_scratch_reset(AccelerationStructureScratch &r_scratch) {
+	uint64_t capacity = 0;
+	for (uint64_t size : r_scratch.chunk_sizes) {
+		capacity += size;
+	}
+	r_scratch.underused_frames = r_scratch.used * 4 < capacity ? r_scratch.underused_frames + 1 : 0;
+	if (r_scratch.chunks.size() > 1) {
+		// One chunk as large as all of them, made when next needed.
+		_acceleration_structure_scratch_free(r_scratch);
+		r_scratch.next_chunk_size = capacity;
+	} else if (r_scratch.underused_frames > AS_SCRATCH_SHRINK_DELAY_FRAMES) {
+		// A burst (a level loading) left it larger than the builds need since.
+		_acceleration_structure_scratch_free(r_scratch);
+	}
+	r_scratch.chunk = 0;
+	r_scratch.offset = 0;
+	r_scratch.used = 0;
+}
+
+void RenderingDevice::_acceleration_structure_scratch_free(AccelerationStructureScratch &r_scratch) {
+	for (uint32_t i = 0; i < r_scratch.chunks.size(); i++) {
+		buffer_memory.sub(r_scratch.chunk_sizes[i]);
+		driver->buffer_free(r_scratch.chunks[i]);
+	}
+	r_scratch.chunks.clear();
+	r_scratch.chunk_sizes.clear();
+	r_scratch.underused_frames = 0;
+}
+
 void RenderingDevice::_blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id) {
 	for (RID id : p_blas->acceleration_structure_dependencies) {
 		AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(id);
@@ -511,22 +579,12 @@ Error RenderingDevice::blas_build(RID p_blas) {
 	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
 	ERR_FAIL_NULL_V_MSG(blas, ERR_INVALID_PARAMETER, "BLAS argument is not valid.");
 
-	Error err = _acceleration_structure_scratch_buffer_create(blas);
+	RDD::BufferID scratch_buffer;
+	uint64_t scratch_offset = 0;
+	Error err = _acceleration_structure_scratch_allocate(driver->acceleration_structure_get_scratch_size_bytes(blas->driver_id), scratch_buffer, scratch_offset);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
-
-	// The scratch memory of a build is about as large as the BLAS itself, and most BLASes are never built again: it
-	// goes once the GPU is done with this frame. blas_update() creates it again, and keeps it, for the ones refit.
-	// GODOT_RD_KEEP_BLAS_SCRATCH=1 keeps it.
-	static const bool keep_scratch = OS::get_singleton()->get_environment("GODOT_RD_KEEP_BLAS_SCRATCH") == "1";
-	if (!keep_scratch) {
-		Buffer to_dispose;
-		to_dispose.driver_id = blas->scratch_buffer;
-		to_dispose.size = driver->buffer_get_allocation_size(blas->scratch_buffer);
-		frames[frame].buffers_to_dispose_of.push_back(to_dispose);
-		blas->scratch_buffer = RDD::BufferID();
-	}
+	draw_graph->add_blas_build(blas->driver_id, scratch_buffer, scratch_offset, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -544,10 +602,12 @@ Error RenderingDevice::blas_update(RID p_blas) {
 	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
 	ERR_FAIL_NULL_V_MSG(blas, ERR_INVALID_PARAMETER, "BLAS argument is not valid.");
 
-	Error err = _acceleration_structure_scratch_buffer_create(blas);
+	RDD::BufferID scratch_buffer;
+	uint64_t scratch_offset = 0;
+	Error err = _acceleration_structure_scratch_allocate(driver->acceleration_structure_get_scratch_size_bytes(blas->driver_id), scratch_buffer, scratch_offset);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph->add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	draw_graph->add_blas_update(blas->driver_id, scratch_buffer, scratch_offset, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -8665,6 +8725,7 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	// Erase pending resources.
 	GodotProfileZoneGrouped(_profile_zone, "_free_pending_resources");
 	_free_pending_resources(frame);
+	_acceleration_structure_scratch_reset(frames[frame].acceleration_structure_scratch);
 
 	// Advance staging buffers if used.
 	if (upload_staging_buffers.used) {
@@ -9803,6 +9864,7 @@ void RenderingDevice::finalize() {
 	for (uint32_t i = 0; i < frames.size(); i++) {
 		int f = (frame + i) % frames.size();
 		_free_pending_resources(f);
+		_acceleration_structure_scratch_free(frames[i].acceleration_structure_scratch);
 		driver->command_pool_free(frames[i].command_pool);
 		driver->timestamp_query_pool_free(frames[i].timestamp_pool);
 		driver->semaphore_free(frames[i].semaphore);
