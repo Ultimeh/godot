@@ -50,9 +50,16 @@ public:
 
 	RID get_uniform_set() const { return uniform_set; }
 
-	// The same table in a second set, for shaders whose set layout differs from the finalized one (other stages).
-	// Every caller must share p_shader's layout.
-	RID get_secondary_uniform_set(RID p_shader, uint32_t p_set_index);
+	// The other set layouts of the table, for shaders whose stages differ from the finalized one's: every caller of a
+	// layout passes a shader of that layout.
+	enum SecondaryLayout {
+		SECONDARY_LAYOUT_COMPUTE, // The displacement passes.
+		SECONDARY_LAYOUT_FRAGMENT, // The path tracer's transparent pass (USE_RT_SHADOWS).
+		SECONDARY_LAYOUT_MAX,
+	};
+
+	// The same table in a second set, for shaders of another layout.
+	RID get_secondary_uniform_set(RID p_shader, uint32_t p_set_index, SecondaryLayout p_layout = SECONDARY_LAYOUT_COMPUTE);
 	uint32_t get_texture_count() const { return textures.size(); }
 	bool is_initialized() const { return rd != nullptr; }
 	bool is_finalized() const { return uniform_set.is_valid(); }
@@ -72,8 +79,8 @@ private:
 	bool needs_refinalize = false;
 
 	uint64_t textures_version = 0; // Bumped whenever the table changes.
-	RID secondary_uniform_set;
-	uint64_t secondary_textures_version = 0;
+	RID secondary_uniform_sets[SECONDARY_LAYOUT_MAX];
+	uint64_t secondary_textures_versions[SECONDARY_LAYOUT_MAX] = {};
 
 	RID _create_uniform_set(RID p_shader, uint32_t p_set_index);
 };

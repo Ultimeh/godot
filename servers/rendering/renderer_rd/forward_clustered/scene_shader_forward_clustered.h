@@ -49,6 +49,7 @@ public:
 		SHADER_GROUP_MULTIVIEW,
 		SHADER_GROUP_ADVANCED_MULTIVIEW,
 		SHADER_GROUP_CUBE_LAYERED, // Cube shadows in one pass, when the device lets the vertex shader choose the layer.
+		SHADER_GROUP_RT_SHADOWS, // The path tracer's transparent pass: shadows from rays through its TLAS.
 	};
 
 	// Not an enum because these values are constants that are processed as numbers
@@ -73,7 +74,8 @@ public:
 		SHADER_COLOR_PASS_FLAG_LIGHTMAP = 1 << 2,
 		SHADER_COLOR_PASS_FLAG_MULTIVIEW = 1 << 3,
 		SHADER_COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 4,
-		SHADER_COLOR_PASS_FLAG_COUNT = 1 << 5
+		SHADER_COLOR_PASS_FLAG_RT_SHADOWS = 1 << 5,
+		SHADER_COLOR_PASS_FLAG_COUNT = 1 << 6
 	};
 
 	enum PipelineVersion {
@@ -97,7 +99,8 @@ public:
 		PIPELINE_COLOR_PASS_FLAG_LIGHTMAP = 1 << 2,
 		PIPELINE_COLOR_PASS_FLAG_MULTIVIEW = 1 << 3,
 		PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 4,
-		PIPELINE_COLOR_PASS_FLAG_OPTIONS = 5,
+		PIPELINE_COLOR_PASS_FLAG_RT_SHADOWS = 1 << 5, // Transparent pass only: never with SEPARATE_SPECULAR, MULTIVIEW or MOTION_VECTORS.
+		PIPELINE_COLOR_PASS_FLAG_OPTIONS = 6,
 		PIPELINE_COLOR_PASS_FLAG_COMBINATIONS = 1 << PIPELINE_COLOR_PASS_FLAG_OPTIONS,
 	};
 
@@ -405,6 +408,7 @@ public:
 	RID debug_shadow_splits_material_shader;
 	RID debug_shadow_splits_material;
 	RID default_shader_rd;
+	RID default_shader_rt_shadows_rd; // Its render pass uniform set has the TLAS; set by enable_rt_shadows_shader_group().
 	RID default_shader_sdfgi_rd;
 
 	RID default_vec4_xform_buffer;
@@ -435,6 +439,9 @@ public:
 	bool is_multiview_shader_group_enabled() const;
 	bool is_cube_layered_shader_group_enabled() const;
 	bool is_advanced_shader_group_enabled(bool p_multiview) const;
+	// The transparent pass of the path tracer, once a view traces: compiled for every material then. Needs ray queries.
+	void enable_rt_shadows_shader_group();
+	bool is_rt_shadows_shader_group_enabled() const;
 	uint32_t get_pipeline_compilations(RSE::PipelineSource p_source);
 };
 

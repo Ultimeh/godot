@@ -131,18 +131,20 @@ void BindlessBlock::finalize(RID p_shader, uint32_t p_set_index) {
 	needs_refinalize = false;
 }
 
-RID BindlessBlock::get_secondary_uniform_set(RID p_shader, uint32_t p_set_index) {
+RID BindlessBlock::get_secondary_uniform_set(RID p_shader, uint32_t p_set_index, SecondaryLayout p_layout) {
 	ERR_FAIL_COND_V_MSG(!is_initialized(), RID(), "BindlessBlock not initialized.");
+	ERR_FAIL_INDEX_V(p_layout, SECONDARY_LAYOUT_MAX, RID());
 
-	if (secondary_uniform_set.is_valid() && rd->uniform_set_is_valid(secondary_uniform_set) && secondary_textures_version == textures_version) {
-		return secondary_uniform_set;
+	RID &set = secondary_uniform_sets[p_layout];
+	if (set.is_valid() && rd->uniform_set_is_valid(set) && secondary_textures_versions[p_layout] == textures_version) {
+		return set;
 	}
-	if (secondary_uniform_set.is_valid() && rd->uniform_set_is_valid(secondary_uniform_set)) {
-		rd->free_rid(secondary_uniform_set);
+	if (set.is_valid() && rd->uniform_set_is_valid(set)) {
+		rd->free_rid(set);
 	}
-	secondary_uniform_set = _create_uniform_set(p_shader, p_set_index);
-	secondary_textures_version = textures_version;
-	return secondary_uniform_set;
+	set = _create_uniform_set(p_shader, p_set_index);
+	secondary_textures_versions[p_layout] = textures_version;
+	return set;
 }
 
 RID BindlessBlock::_create_uniform_set(RID p_shader, uint32_t p_set_index) {
@@ -166,10 +168,12 @@ void BindlessBlock::clear() {
 		rd->free_rid(uniform_set);
 	}
 	uniform_set = RID();
-	if (secondary_uniform_set.is_valid() && rd && rd->uniform_set_is_valid(secondary_uniform_set)) {
-		rd->free_rid(secondary_uniform_set);
+	for (RID &set : secondary_uniform_sets) {
+		if (set.is_valid() && rd && rd->uniform_set_is_valid(set)) {
+			rd->free_rid(set);
+		}
+		set = RID();
 	}
-	secondary_uniform_set = RID();
 	textures.clear();
 	texture_to_index.clear();
 	free_indices.clear();

@@ -886,6 +886,11 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 			uses_descriptor_heap_indexing = true;
 			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_6);
 		}
+		if (_uses_ray_queries(it.value)) {
+			// Ray queries outside the ray tracing stages (the path tracer's transparent pass): 6.5, and 6.6 where the device
+			// reports ray tracing.
+			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_6);
+		}
 		if (_uses_hit_objects(it.value)) {
 			// Shader execution reordering: only compiled when the device has Shader Model 6.9.
 			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_9);
@@ -984,6 +989,19 @@ bool RenderingShaderContainerD3D12::_uses_descriptor_heap_indexing(nir_shader *p
 				}
 				nir_instr *source = intr->src[0].ssa->parent_instr;
 				if (source->type != nir_instr_type_intrinsic || nir_instr_as_intrinsic(source)->intrinsic != nir_intrinsic_vulkan_resource_index) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+bool RenderingShaderContainerD3D12::_uses_ray_queries(nir_shader *p_shader) {
+	nir_foreach_function_impl(impl, p_shader) {
+		nir_foreach_block(block, impl) {
+			nir_foreach_instr(instr, block) {
+				if (instr->type == nir_instr_type_intrinsic && nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_rq_initialize) {
 					return true;
 				}
 			}

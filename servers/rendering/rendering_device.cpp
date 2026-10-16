@@ -6368,6 +6368,26 @@ void RenderingDevice::draw_list_bind_index_array(DrawListID p_list, RID p_index_
 	}
 }
 
+void RenderingDevice::draw_list_add_buffer_dependency(DrawListID p_list, RID p_buffer) {
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
+
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
+
+	Buffer *buffer = _get_buffer_from_owner(p_buffer);
+	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
+
+	// Unlike the compute and ray tracing lists, a draw list cannot make the buffer mutable (a synchronization in the middle
+	// of a draw list). Without a tracker, no recorded command wrote it: the commands that write a buffer make it mutable.
+	if (buffer->draw_tracker != nullptr) {
+		draw_graph->add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ, graph_split);
+	}
+}
+
 void RenderingDevice::draw_list_set_line_width(DrawListID p_list, float p_width) {
 	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 

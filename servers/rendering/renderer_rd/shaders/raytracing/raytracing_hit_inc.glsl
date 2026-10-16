@@ -1,5 +1,7 @@
 // Shared utilities for hit shaders (closest_hit, any_hit)
 // Requires: GL_EXT_buffer_reference, GL_ARB_gpu_shader_int64, oct_inc.glsl, raytracing_inc.glsl
+// (or raytracing_geometry_consts_inc.glsl). RT_NO_HIT_BUILTINS leaves out what reads the hit shaders' built-ins, for
+// the other stages.
 
 #include "raytracing_data_inc.glsl"
 
@@ -60,7 +62,7 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 	}
 }
 
-#ifndef RT_DISPLACE_PASS
+#ifndef RT_NO_HIT_BUILTINS
 /// Convenience wrapper using gl_PrimitiveID (hit shaders only).
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
 	get_triangle_indices_ex(geom, gl_PrimitiveID, i0, i1, i2);
@@ -96,7 +98,7 @@ vec3 fetch_mesh_position(in GeometryData geom, uint index) {
 	return p;
 }
 
-#ifndef RT_DISPLACE_PASS
+#ifndef RT_NO_HIT_BUILTINS
 /// The barycentrics of the point where the ray p_origin + t * p_direction meets the triangle's plane.
 vec3 ray_plane_barycentrics(vec3 p_origin, vec3 p_direction, vec3 p0, vec3 e1, vec3 e2, vec3 n) {
 	float denom = dot(p_direction, n);

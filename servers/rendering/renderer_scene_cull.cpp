@@ -3487,6 +3487,21 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		cull.rt_culling_tan_half_angle = Math::tan(Math::deg_to_rad(scene_render->environment_get_pathtracing_culling_angle(p_environment)) * 0.5f);
 	}
 
+	// A path traced view traces its shadows, its transparent pass's too: only the volumetric fog reads shadow maps then,
+	// those of the lights it scatters (volumetric fog energy), within its length.
+	const bool rt_shadow_maps_for_fog_only = cull.rt_enabled && p_reflection_probe.is_null() && p_camera_data->view_count == 1 && scene_render->environment_pathtracing_replaces_shadow_maps(p_environment);
+	const bool rt_volumetric_fog = rt_shadow_maps_for_fog_only && scene_render->environment_get_volumetric_fog_enabled(p_environment);
+	// The fog's froxels reach this view depth, and this distance from the camera at the frustum's corners.
+	const real_t rt_fog_depth = rt_volumetric_fog ? scene_render->environment_get_volumetric_fog_length(p_environment) : 0.0;
+	real_t rt_fog_distance = rt_fog_depth;
+	if (rt_volumetric_fog && !p_camera_data->is_orthogonal) {
+		const Vector2 corner = p_camera_data->main_projection.get_viewport_half_extents() / p_camera_data->main_projection.get_z_near();
+		rt_fog_distance *= Math::sqrt(1.0 + corner.length_squared());
+	}
+	auto needs_shadow_map = [&](RID p_light) {
+		return !rt_shadow_maps_for_fog_only || (rt_volumetric_fog && RSG::light_storage->light_get_param(p_light, RSE::LIGHT_PARAM_VOLUMETRIC_FOG_ENERGY) > 0.001);
+	};
+
 	Vector<RID> directional_lights;
 	// directional lights
 	{
@@ -3508,7 +3523,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			//check shadow..
 
 			if (light) {
-				if (p_using_shadows && p_shadow_atlas.is_valid() && RSG::light_storage->light_has_shadow(E->base) && !(RSG::light_storage->light_get_type(E->base) == RSE::LIGHT_DIRECTIONAL && RSG::light_storage->light_directional_get_sky_mode(E->base) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY)) {
+				if (p_using_shadows && p_shadow_atlas.is_valid() && RSG::light_storage->light_has_shadow(E->base) && !(RSG::light_storage->light_get_type(E->base) == RSE::LIGHT_DIRECTIONAL && RSG::light_storage->light_directional_get_sky_mode(E->base) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) && needs_shadow_map(E->base)) {
 					lights_with_shadow.push_back(E);
 				}
 				//add to list
@@ -3520,6 +3535,15 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 		for (int i = 0; i < lights_with_shadow.size(); i++) {
 			_light_instance_setup_directional_shadow(i, lights_with_shadow[i], p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect);
+			if (rt_shadow_maps_for_fog_only) {
+				// The cascades that begin beyond the fog are neither culled nor drawn.
+				Cull::Shadow &shadow = cull.shadows[i];
+				uint32_t needed = 1;
+				while (needed < shadow.cascade_count && shadow.cascades[needed - 1].split < rt_fog_depth) {
+					needed++;
+				}
+				shadow.cascade_count = needed;
+			}
 		}
 	}
 
@@ -3750,6 +3774,23 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			// We can detect whether multiple cameras are hitting this light, whether or not the shadow is dirty,
 			// so that we can turn off tighter caster culling.
 			light->detect_light_intersects_multiple_cameras(Engine::get_singleton()->get_frames_drawn());
+
+			bool fog_reads_map = needs_shadow_map(ins->base);
+			if (fog_reads_map && rt_shadow_maps_for_fog_only) {
+				real_t reach = RSG::light_storage->light_get_param(ins->base, RSE::LIGHT_PARAM_RANGE);
+				if (RSG::light_storage->light_get_type(ins->base) == RSE::LIGHT_AREA) {
+					reach += RSG::light_storage->light_area_get_size(ins->base).length();
+				}
+				fog_reads_map = ins->transform.origin.distance_to(camera_position) - reach < rt_fog_distance;
+			}
+			if (!fog_reads_map) {
+				// Its place in the atlas still gives it its (traced) shadow, but nothing reads the map: it is drawn once
+				// a view rasterizes the light again, the light staying dirty until then.
+				if (RSG::light_storage->shadow_atlas_update_light(p_shadow_atlas, light->instance, coverage, light->last_version)) {
+					light->make_shadow_dirty();
+				}
+				continue;
+			}
 
 			if (light->is_shadow_dirty()) {
 				// Dirty shadows have no need to be drawn if

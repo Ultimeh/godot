@@ -874,6 +874,14 @@ public:
 	RID dlss_rr_get_color_before_transparency(RenderSceneBuffersRD *p_render_buffers) const;
 
 	void register_raytracing_buffer_dependencies(RD::RaytracingListID p_list);
+	// The buffers written per frame that the shaders read through the addresses in RT_GeometryData and RT_MaterialData.
+	void get_buffers_read_by_address(LocalVector<RID> &r_buffers);
+
+	// The material textures, for the shadow rays' alpha test in the transparent pass (USE_RT_SHADOWS), in a set of
+	// p_shader's layout.
+	RID get_fragment_texture_set(RID p_shader, uint32_t p_set_index) const {
+		return bindless_block ? bindless_block->get_secondary_uniform_set(p_shader, p_set_index, BindlessBlock::SECONDARY_LAYOUT_FRAGMENT) : RID();
+	}
 
 	SceneShaderRaytracing *get_shader() const { return shader; }
 

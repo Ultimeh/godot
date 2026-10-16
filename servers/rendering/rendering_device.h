@@ -1734,6 +1734,9 @@ public:
 	void draw_list_bind_vertex_array(DrawListID p_list, RID p_vertex_array);
 	void draw_list_bind_vertex_buffers_format(DrawListID p_list, VertexFormatID p_vertex_format, uint32_t p_vertex_count, const Span<RID> &p_vertex_buffers, const Span<uint64_t> &p_offsets = Vector<uint64_t>());
 	void draw_list_bind_index_array(DrawListID p_list, RID p_index_array);
+	// A buffer the draw list's shaders read without a binding (through its address): its writes recorded earlier come
+	// before the draw list.
+	void draw_list_add_buffer_dependency(DrawListID p_list, RID p_buffer);
 	void draw_list_set_line_width(DrawListID p_list, float p_width);
 	void draw_list_set_push_constant(DrawListID p_list, const void *p_data, uint32_t p_data_size);
 

@@ -231,6 +231,13 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		global_pipeline_data_required.use_lightmaps = true;
 	}
 
+	// The transparent surfaces are shadowed by rays through the TLAS, as the path traced ones.
+	const bool rt_shadows = rt_state && rt_state->tlas.is_valid() && p_render_data->scene_data->view_count == 1 && _transparent_pass_traces_shadows();
+	if (rt_shadows) {
+		scene_shader.enable_rt_shadows_shader_group();
+		global_pipeline_data_required.use_rt_shadows = true;
+	}
+
 	// Recompile pipelines if any of the requirements changed this frame.
 	_update_dirty_geometry_pipelines();
 
@@ -495,15 +502,39 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, false, screen_size, screen_size, p_default_bg_color, false);
 
+		RID rt_shadow_texture_set;
+		if (rt_shadows && scene_shader.is_rt_shadows_shader_group_enabled() && rt_state->geometry_buffer.is_valid() && rt_state->material_buffer.is_valid()) {
+			rt_shadow_texture_set = raytracing->get_fragment_texture_set(scene_shader.default_shader_rt_shadows_rd, RT_SHADOW_TEXTURES_UNIFORM_SET);
+		}
+		const bool use_rt_shadows = rt_shadow_texture_set.is_valid();
+		if (use_rt_shadows) {
+			rt_shadow_tlas = rt_state->tlas;
+			rt_shadow_geometry_buffer = rt_state->geometry_buffer;
+			rt_shadow_material_buffer = rt_state->material_buffer;
+		}
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
+		rt_shadow_tlas = RID();
+		rt_shadow_geometry_buffer = RID();
+		rt_shadow_material_buffer = RID();
 
 		{
 			uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
 			// Motion vectors should not be overwritten by transparent objects.
 			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
+			if (use_rt_shadows) {
+				transparent_color_pass_flags |= COLOR_PASS_FLAG_RT_SHADOWS;
+			}
 
 			RID alpha_framebuffer = rb_data->get_color_pass_fb(transparent_color_pass_flags);
 			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+			render_list_params.rt_shadow_texture_uniform_set = rt_shadow_texture_set;
+			// The alpha test reads the vertices through their addresses.
+			thread_local LocalVector<RID> rt_shadow_buffers;
+			rt_shadow_buffers.clear();
+			if (use_rt_shadows) {
+				raytracing->get_buffers_read_by_address(rt_shadow_buffers);
+				render_list_params.buffer_dependencies = &rt_shadow_buffers;
+			}
 			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 		}
 		front_layer_reflection = RID();
@@ -584,6 +615,17 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 }
 
 // Raytracing methods
+
+bool RenderForwardClusteredPT::_transparent_pass_traces_shadows() {
+	// GODOT_RT_TRANSPARENT_SHADOWS=0: the shadow maps instead, rendered for every light again (comparisons).
+	static const bool off = OS::get_singleton()->get_environment("GODOT_RT_TRANSPARENT_SHADOWS") == "0";
+	return RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && !off;
+}
+
+bool RenderForwardClusteredPT::environment_pathtracing_replaces_shadow_maps(RID p_env) const {
+	// Until the path tracer is set up (its first frame), the transparent pass may still read the shadow maps.
+	return environment_get_pathtracing_enabled(p_env) && raytracing && raytracing->get_shader() && raytracing->get_shader()->is_usable() && _transparent_pass_traces_shadows();
+}
 
 bool RenderForwardClusteredPT::_setup_rt() {
 	if (!RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE)) {

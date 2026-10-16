@@ -20,7 +20,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #define GLSL 1
-#define RT_DISPLACE_PASS 1
+#define RT_NO_HIT_BUILTINS 1
 
 // clang-format off
 #include "raytracing_inc.glsl"

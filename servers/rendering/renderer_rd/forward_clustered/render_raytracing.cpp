@@ -5176,22 +5176,30 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingListID p_list) {
 	RD *rd = RD::get_singleton();
+	thread_local LocalVector<RID> buffers;
+	buffers.clear();
+	get_buffers_read_by_address(buffers);
+	for (const RID &buffer : buffers) {
+		rd->raytracing_list_add_buffer_dependency(p_list, buffer, /*p_writable=*/false);
+	}
+}
 
+void RenderRaytracing::get_buffers_read_by_address(LocalVector<RID> &r_buffers) {
 	// The hit shader reads vertex / attribute / index data via BDA stored in
 	// RT_GeometryData. The draw graph cannot infer those reads from the BDA, so
 	// every per-frame-written buffer that the trace will touch via BDA must be
-	// declared here -- otherwise the producing copy/dispatch may not be visible
+	// declared -- otherwise the producing copy/dispatch may not be visible
 	// to the trace. (Static mesh VB/AB/IB are uploaded once via the transfer
 	// worker and don't need per-frame barriers.)
 
 	// Mat UBO pool buffer dependency.
 	if (mat_ubo_pool_buffer.is_valid()) {
-		rd->raytracing_list_add_buffer_dependency(p_list, mat_ubo_pool_buffer, /*p_writable=*/false);
+		r_buffers.push_back(mat_ubo_pool_buffer);
 	}
 	// Materials too large for a pool slot: their buffers can be created this frame, the upload of their data
 	// must come before the trace.
 	for (const RID &buffer : mat_ubo_dedicated_buffers) {
-		rd->raytracing_list_add_buffer_dependency(p_list, buffer, /*p_writable=*/false);
+		r_buffers.push_back(buffer);
 	}
 
 	// Deformed surface buffer dependencies.
@@ -5201,13 +5209,13 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 			continue;
 		}
 		if (e->owned_vb_full.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->owned_vb_full, /*p_writable=*/false);
+			r_buffers.push_back(e->owned_vb_full);
 		}
 		if (e->prev_pos_vb.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->prev_pos_vb, /*p_writable=*/false);
+			r_buffers.push_back(e->prev_pos_vb);
 		}
 		if (e->displaced_vb.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->displaced_vb, /*p_writable=*/false);
+			r_buffers.push_back(e->displaced_vb);
 		}
 	}
 
@@ -5218,21 +5226,21 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 			continue;
 		}
 		if (e->merged_vtx_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_vtx_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->merged_vtx_buffer);
 		}
 		if (e->merged_attr_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_attr_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->merged_attr_buffer);
 		}
 		if (e->replicated_idx_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->replicated_idx_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->replicated_idx_buffer);
 		}
 		if (e->displaced && e->merged_prev_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_prev_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->merged_prev_buffer);
 		}
 	}
 	// MultiMesh buffers, written by every change of their instances.
 	for (const RID &buffer : multimesh_buffers_read_this_frame) {
-		rd->raytracing_list_add_buffer_dependency(p_list, buffer, /*p_writable=*/false);
+		r_buffers.push_back(buffer);
 	}
 }
 
