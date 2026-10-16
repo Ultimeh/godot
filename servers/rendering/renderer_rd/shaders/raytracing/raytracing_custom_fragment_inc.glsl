@@ -47,7 +47,10 @@ binormal = mat3(rt_world_to_object_decomp) * rt_bitangent;
 uv_interp = rt_uv;
 uv2_interp = rt_uv;
 color_interp = rt_color;
-view = -gl_WorldRayDirectionEXT;
+// In view space, as raster's VIEW and as NORMAL is given to fragment(): towards the ray's origin, the camera for a primary
+// ray. A world-space VIEW against a view-space NORMAL made dot(NORMAL, VIEW) depend on the camera's orientation (Solfarer's
+// rim emission lit whole hulls white at some angles).
+view = normalize(mat3(rt_view_matrix) * -gl_WorldRayDirectionEXT);
 rt_front_facing = rt_front_face;
 rt_screen_uv = vec2(gl_LaunchIDEXT.xy) / vec2(gl_LaunchSizeEXT.xy);
 rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
