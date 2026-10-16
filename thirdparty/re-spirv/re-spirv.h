@@ -185,6 +185,7 @@ namespace respv {
         std::vector<Decoration> decorations;
         std::vector<Phi> phis;
         std::vector<LoopHeader> loopHeaders;
+        std::vector<uint32_t> loopContinuePhiOperandIndices;
         std::vector<ListNode> listNodes;
         uint32_t defaultSwitchOpConstantInt = UINT32_MAX;
 

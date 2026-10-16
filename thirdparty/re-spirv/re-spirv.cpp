@@ -783,6 +783,7 @@ namespace respv {
         decorations.clear();
         phis.clear();
         loopHeaders.clear();
+        loopContinuePhiOperandIndices.clear();
         listNodes.clear();
         defaultSwitchOpConstantInt = UINT32_MAX;
     }
@@ -1969,11 +1970,6 @@ namespace respv {
                         fprintf(stderr, "SPIR-V Parsing error. Invalid Parent ID: %u.\n", labelId);
                         return false;
                     }
-                    
-                    // Make sure this label doesn't come from the loop continue.
-                    if (labelId == continueLabelId) {
-                        continue;
-                    }
 
                     uint32_t operandId = dataWords[wordIndex + j];
                     if (operandId >= results.size()) {
@@ -1986,8 +1982,17 @@ namespace respv {
                         return false;
                     }
 
-                    uint32_t labelIndex = results[labelId].instructionIndex;
                     uint32_t resultIndex = results[operandId].instructionIndex;
+
+                    // Make sure this label doesn't come from the loop continue. The operand is still a use of its result:
+                    // it's left out of the graph to keep it acyclic, but its out degree must count it, or the result is
+                    // eliminated while the OpPhi still references it.
+                    if (labelId == continueLabelId) {
+                        loopContinuePhiOperandIndices.emplace_back(resultIndex);
+                        continue;
+                    }
+
+                    uint32_t labelIndex = results[labelId].instructionIndex;
                     instructionAdjacentListIndices[labelIndex] = addToList(i, instructionAdjacentListIndices[labelIndex], listNodes);
                     instructionAdjacentListIndices[resultIndex] = addToList(i, instructionAdjacentListIndices[resultIndex], listNodes);
                 }
@@ -2136,6 +2141,11 @@ namespace respv {
                 instructionOutDegrees[i]++;
                 listIndex = listNode.nextListIndex;
             }
+        }
+
+        // Uses by loop header OpPhis coming from the loop continue have no edge in the graph but must be counted.
+        for (uint32_t resultIndex : loopContinuePhiOperandIndices) {
+            instructionOutDegrees[resultIndex]++;
         }
 
         // Sort degrees doesn't need to be cleared as its contents will be copied over.
