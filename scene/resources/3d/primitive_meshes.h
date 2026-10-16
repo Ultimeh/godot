@@ -52,6 +52,9 @@ private:
 
 	mutable int array_len = 0;
 	mutable int index_array_len = 0;
+	// The arrays _update() gave the RenderingServer, returned by surface_get_arrays(): reading them back from the server
+	// waits for the render thread and copies the buffers back from the GPU.
+	mutable Array arrays;
 
 	Ref<Material> material;
 	bool flip_faces = false;

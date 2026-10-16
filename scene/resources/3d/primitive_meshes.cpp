@@ -124,6 +124,7 @@ void PrimitiveMesh::_update() const {
 
 	array_len = pc;
 	index_array_len = indices.size();
+	arrays = arr.duplicate(); // Not the one _create_mesh_array() returned: a script could change it afterwards.
 	// in with the new
 	RenderingServer::get_singleton()->mesh_clear(mesh);
 	RenderingServer::get_singleton()->mesh_add_surface_from_arrays(mesh, (RSE::PrimitiveType)primitive_type, arr);
@@ -174,7 +175,8 @@ Array PrimitiveMesh::surface_get_arrays(int p_surface) const {
 		_update();
 	}
 
-	return RenderingServer::get_singleton()->mesh_surface_get_arrays(mesh, 0);
+	// A copy of the array itself: the caller may change it. Its packed arrays are copied on write.
+	return arrays.duplicate();
 }
 
 Dictionary PrimitiveMesh::surface_get_lods(int p_surface) const {
