@@ -416,6 +416,9 @@ public:
 
 		bool ignore_occlusion_culling;
 		bool ignore_all_culling;
+		// Kept by the path tracer's culling the last time it was out of view (_rt_culling_keeps()'s hysteresis). Only the
+		// cull thread handling this instance writes it.
+		bool rt_culling_kept = true;
 
 		Vector<RID> materials;
 
@@ -1155,6 +1158,12 @@ public:
 		// Raytracing: wider AABB cull volume for TLAS and light gathering.
 		bool rt_enabled = false;
 		AABB rt_aabb;
+		// Out of view, an instance beyond rt_culling_radius whose bounding sphere looks smaller than the culling angle is
+		// left out (Environment.pathtracing_culling_*): its reflection or shadow would not cover a pixel.
+		bool rt_culling = false;
+		Vector3 rt_camera_origin;
+		real_t rt_culling_radius = 0.0;
+		real_t rt_culling_tan_half_angle = 0.0;
 	} cull;
 
 	struct VisibilityCullData {
@@ -1184,6 +1193,18 @@ public:
 	};
 
 	void _scene_cull_threaded(uint32_t p_thread, CullData *cull_data);
+	// The path tracer's culling of an instance out of view: kept when its bounding sphere reaches within the culling
+	// radius, or looks at least as wide as the culling angle. Once kept, it stays until 10 % past both, so that an instance
+	// at the boundary does not enter and leave the TLAS every frame (popping in reflections, rebuilding).
+	static _FORCE_INLINE_ bool _rt_culling_keeps(const InstanceBounds &p_bounds, const Cull &p_cull, Instance *p_instance) {
+		const Vector3 center((p_bounds.bounds[0] + p_bounds.bounds[3]) * 0.5f, (p_bounds.bounds[1] + p_bounds.bounds[4]) * 0.5f, (p_bounds.bounds[2] + p_bounds.bounds[5]) * 0.5f);
+		const real_t radius = Vector3(p_bounds.bounds[3] - p_bounds.bounds[0], p_bounds.bounds[4] - p_bounds.bounds[1], p_bounds.bounds[5] - p_bounds.bounds[2]).length() * 0.5f;
+		const real_t distance = center.distance_to(p_cull.rt_camera_origin);
+		const real_t slack = p_instance->rt_culling_kept ? 1.1f : 1.0f;
+		const bool keep = distance - radius <= p_cull.rt_culling_radius * slack || radius * slack >= distance * p_cull.rt_culling_tan_half_angle;
+		p_instance->rt_culling_kept = keep;
+		return keep;
+	}
 	void _scene_cull(CullData &cull_data, InstanceCullResult &cull_result, uint64_t p_from, uint64_t p_to);
 	static void _scene_particles_set_view_axis(RID p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis);
 	static void _scene_particles_set_view_axis_list(const Array &p_particles, const Vector3 &p_axis, const Vector3 &p_up_axis);
@@ -1407,6 +1428,7 @@ public:
 	PASS1RC(int, environment_get_pathtracing_samples_per_pixel, RID)
 	PASS1RC(int, environment_get_pathtracing_max_bounces, RID)
 	PASS1RC(RSE::PathtracingDenoiser, environment_get_pathtracing_denoiser, RID)
+	PASS4(environment_set_pathtracing_culling, RID, bool, float, float)
 
 	// Adjustment
 	PASS7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)

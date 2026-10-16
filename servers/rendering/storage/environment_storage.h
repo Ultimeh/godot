@@ -178,6 +178,9 @@ private:
 		int pathtracing_samples_per_pixel = 1;
 		int pathtracing_max_bounces = 3;
 		RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_NONE;
+		bool pathtracing_culling_enabled = true;
+		float pathtracing_culling_radius = 200.0;
+		float pathtracing_culling_angle = 1.0; // Degrees.
 
 		// Adjustments
 		bool adjustments_enabled = false;
@@ -338,6 +341,10 @@ public:
 	int environment_get_pathtracing_samples_per_pixel(RID p_env) const;
 	int environment_get_pathtracing_max_bounces(RID p_env) const;
 	RSE::PathtracingDenoiser environment_get_pathtracing_denoiser(RID p_env) const;
+	void environment_set_pathtracing_culling(RID p_env, bool p_enable, float p_radius, float p_angle);
+	bool environment_get_pathtracing_culling_enabled(RID p_env) const;
+	float environment_get_pathtracing_culling_radius(RID p_env) const;
+	float environment_get_pathtracing_culling_angle(RID p_env) const;
 
 	// Adjustment
 	void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction);

@@ -938,6 +938,32 @@ RSE::PathtracingDenoiser RendererEnvironmentStorage::environment_get_pathtracing
 	return env->pathtracing_denoiser;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_culling(RID p_env, bool p_enable, float p_radius, float p_angle) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_culling_enabled = p_enable;
+	env->pathtracing_culling_radius = MAX(p_radius, 0.0f);
+	env->pathtracing_culling_angle = CLAMP(p_angle, 0.0f, 90.0f);
+}
+
+bool RendererEnvironmentStorage::environment_get_pathtracing_culling_enabled(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, false);
+	return env->pathtracing_culling_enabled;
+}
+
+float RendererEnvironmentStorage::environment_get_pathtracing_culling_radius(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 0.0f);
+	return env->pathtracing_culling_radius;
+}
+
+float RendererEnvironmentStorage::environment_get_pathtracing_culling_angle(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 0.0f);
+	return env->pathtracing_culling_angle;
+}
+
 // Adjustments
 
 void RendererEnvironmentStorage::environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) {

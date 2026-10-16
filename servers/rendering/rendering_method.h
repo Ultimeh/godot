@@ -324,6 +324,7 @@ public:
 	virtual int environment_get_pathtracing_samples_per_pixel(RID p_env) const = 0;
 	virtual int environment_get_pathtracing_max_bounces(RID p_env) const = 0;
 	virtual RSE::PathtracingDenoiser environment_get_pathtracing_denoiser(RID p_env) const = 0;
+	virtual void environment_set_pathtracing_culling(RID p_env, bool p_enable, float p_radius, float p_angle) = 0;
 
 	virtual void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) = 0;
 

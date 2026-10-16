@@ -200,6 +200,18 @@
 			The strength that is used when blurring across the screen to generate the glow effect. This affects the distance and intensity of the blur. When using the Mobile rendering method, this should be increased to compensate for the lower dynamic range.
 			[b]Note:[/b] [member glow_strength] has no effect when using the Compatibility rendering method, due to this rendering method using a simpler glow implementation optimized for low-end devices.
 		</member>
+		<member name="pathtracing_culling_angle" type="float" setter="set_pathtracing_culling_angle" getter="get_pathtracing_culling_angle" default="1.0">
+			The apparent size, in degrees, below which an object out of view and beyond [member pathtracing_culling_radius] is left out of the scene the path tracer traces. An object is measured by its bounding sphere as seen from the camera: at [code]1.0[/code], an object 1 km away is kept when it is at least about 17.5 m wide. A [MultiMesh] counts as one object. Lower it to keep smaller distant objects in reflections and shadows, raise it to trace fewer. Can be changed at any time.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_culling_enabled] are [code]true[/code].
+		</member>
+		<member name="pathtracing_culling_enabled" type="bool" setter="set_pathtracing_culling_enabled" getter="is_pathtracing_culling_enabled" default="true">
+			If [code]true[/code], the path tracer leaves out of the scene it traces the objects that are out of view (outside the camera's frustum, or hidden by occlusion culling), farther than [member pathtracing_culling_radius] and smaller than [member pathtracing_culling_angle] as seen from the camera: their reflections, shadows and bounced light would not cover a pixel, and they cost acceleration structure work every frame. Objects in view are always traced, as are objects out of view that are near or large, whatever their direction (a building behind the camera is still reflected in a mirror). If [code]false[/code], everything within the camera's [member Camera3D.far] distance is traced. Can be changed at any time, for example from a game's graphics options.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_culling_radius" type="float" setter="set_pathtracing_culling_radius" getter="get_pathtracing_culling_radius" default="200.0">
+			The distance from the camera, in meters, within which every object is path traced whatever its size and direction (see [member pathtracing_culling_enabled]). Beyond it, an object out of view is traced only when it looks larger than [member pathtracing_culling_angle]. Can be changed at any time.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_culling_enabled] are [code]true[/code].
+		</member>
 		<member name="pathtracing_debug_mode" type="int" setter="set_pathtracing_debug_mode" getter="get_pathtracing_debug_mode" enum="Environment.PathtracingDebugMode" default="0">
 			Selects a debug visualization channel to display instead of the final path-traced image. Useful for inspecting individual G-buffer inputs and intermediate shading data. Set to [constant RT_DEBUG_DISABLED] to show the normal rendered result.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
