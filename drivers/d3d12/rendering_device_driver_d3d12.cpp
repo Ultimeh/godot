@@ -413,16 +413,149 @@ Error RenderingDeviceDriverD3D12::DescriptorHeap::_allocate(uint32_t p_descripto
 	return OK;
 }
 
+Error RenderingDeviceDriverD3D12::DescriptorHeap::allocate_single(Allocation &r_allocation) {
+	ERR_FAIL_NULL_V(mutex, ERR_UNAVAILABLE); // Shader-visible heaps only.
+	MutexLock lock(*mutex);
+
+	uint32_t slab_index = single_slab_with_room;
+	if (slab_index >= single_slabs.size() || single_slabs[slab_index].free_slots.is_empty()) {
+		slab_index = UINT32_MAX;
+		for (uint32_t i = 0; i < single_slabs.size(); i++) {
+			if (!single_slabs[i].free_slots.is_empty()) {
+				slab_index = i;
+				break;
+			}
+		}
+	}
+	if (slab_index == UINT32_MAX) {
+		// A new slab, in place of an empty one if any (freed slabs keep their slot, so the indices in handles stay valid).
+		Allocation slab_allocation;
+		Error err = _allocate(SINGLE_SLAB_SIZE, slab_allocation);
+		if (err != OK) {
+			return _allocate(1, r_allocation); // No room for a slab: one by one, as before.
+		}
+		for (uint32_t i = 0; i < single_slabs.size(); i++) {
+			if (single_slabs[i].virtual_alloc_handle == 0) {
+				slab_index = i;
+				break;
+			}
+		}
+		if (slab_index == UINT32_MAX) {
+			slab_index = single_slabs.size();
+			single_slabs.push_back(SingleSlab());
+		}
+		SingleSlab &slab = single_slabs[slab_index];
+		slab.virtual_alloc_handle = slab_allocation.virtual_alloc_handle;
+		slab.offset = uint32_t((slab_allocation.cpu_handle.ptr - cpu_handle.ptr) / increment_size);
+		slab.free_slots.resize(SINGLE_SLAB_SIZE);
+		for (uint32_t i = 0; i < SINGLE_SLAB_SIZE; i++) {
+			slab.free_slots[i] = uint16_t(SINGLE_SLAB_SIZE - 1 - i);
+		}
+	}
+
+	SingleSlab &slab = single_slabs[slab_index];
+	const uint32_t slot = slab.free_slots[slab.free_slots.size() - 1];
+	slab.free_slots.resize(slab.free_slots.size() - 1);
+	single_slab_with_room = slab_index;
+
+	const uint64_t offset = slab.offset + slot;
+	r_allocation.virtual_alloc_handle = SINGLE_SLAB_HANDLE_BIT | slab_index;
+	r_allocation.cpu_handle = get_cpu_handle(cpu_handle, offset, increment_size);
+	r_allocation.gpu_handle = get_gpu_handle(gpu_handle, offset, increment_size);
+	return OK;
+}
+
+Error RenderingDeviceDriverD3D12::DescriptorHeap::allocate_linear(uint32_t p_pool_index, uint32_t p_descriptor_count, Allocation &r_allocation) {
+	ERR_FAIL_NULL_V(mutex, ERR_UNAVAILABLE); // Shader-visible heaps only.
+	MutexLock lock(*mutex);
+
+	if (p_pool_index >= linear_pools.size()) {
+		linear_pools.resize(p_pool_index + 1);
+	}
+	LinearPool &pool = linear_pools[p_pool_index];
+	while (pool.chunk < pool.chunks.size() && pool.used + p_descriptor_count > pool.chunks[pool.chunk].size) {
+		pool.chunk++;
+		pool.used = 0;
+	}
+	if (pool.chunk == pool.chunks.size()) {
+		Allocation chunk_allocation;
+		const uint32_t size = MAX(LINEAR_CHUNK_SIZE, p_descriptor_count);
+		if (_allocate(size, chunk_allocation) != OK) {
+			return _allocate(p_descriptor_count, r_allocation); // No room for a chunk: on its own, freed as usual.
+		}
+		LinearChunk chunk;
+		chunk.virtual_alloc_handle = chunk_allocation.virtual_alloc_handle;
+		chunk.offset = uint32_t((chunk_allocation.cpu_handle.ptr - cpu_handle.ptr) / increment_size);
+		chunk.size = size;
+		pool.chunks.push_back(chunk);
+		pool.used = 0;
+	}
+
+	const uint64_t offset = pool.chunks[pool.chunk].offset + pool.used;
+	pool.used += p_descriptor_count;
+	r_allocation.virtual_alloc_handle = LINEAR_HANDLE_BIT;
+	r_allocation.cpu_handle = get_cpu_handle(cpu_handle, offset, increment_size);
+	r_allocation.gpu_handle = get_gpu_handle(gpu_handle, offset, increment_size);
+	return OK;
+}
+
+void RenderingDeviceDriverD3D12::DescriptorHeap::reset_linear(uint32_t p_pool_index) {
+	MutexLock lock(*mutex);
+	if (p_pool_index >= linear_pools.size()) {
+		return;
+	}
+	LinearPool &pool = linear_pools[p_pool_index];
+	// The chunks the frame did not reach go back to the heap: a burst of sets must not keep its share of the heap.
+	const uint32_t needed = pool.used > 0 ? pool.chunk + 1 : pool.chunk;
+	while (pool.chunks.size() > needed) {
+		D3D12MA::VirtualAllocation virtual_alloc = {};
+		virtual_alloc.AllocHandle = pool.chunks[pool.chunks.size() - 1].virtual_alloc_handle;
+		virtual_block->FreeAllocation(virtual_alloc);
+		pool.chunks.resize(pool.chunks.size() - 1);
+	}
+	pool.chunk = 0;
+	pool.used = 0;
+}
+
 void RenderingDeviceDriverD3D12::DescriptorHeap::free(const Allocation &p_allocation) {
+	if (p_allocation.virtual_alloc_handle == LINEAR_HANDLE_BIT) {
+		return; // Its pool's reset reuses it.
+	}
+	if (mutex == nullptr) {
+		// The CPU heaps of the pools, which allocate no single descriptor.
+		D3D12MA::VirtualAllocation virtual_alloc = {};
+		virtual_alloc.AllocHandle = p_allocation.virtual_alloc_handle;
+		virtual_block->FreeAllocation(virtual_alloc);
+		return;
+	}
+	MutexLock lock(*mutex);
+
+	if (p_allocation.virtual_alloc_handle & SINGLE_SLAB_HANDLE_BIT) {
+		const uint32_t slab_index = uint32_t(p_allocation.virtual_alloc_handle & ~SINGLE_SLAB_HANDLE_BIT);
+		ERR_FAIL_UNSIGNED_INDEX(slab_index, single_slabs.size());
+		SingleSlab &slab = single_slabs[slab_index];
+		const uint64_t offset = (p_allocation.cpu_handle.ptr - cpu_handle.ptr) / increment_size;
+		slab.free_slots.push_back(uint16_t(offset - slab.offset));
+		if (slab.free_slots.size() == SINGLE_SLAB_SIZE) {
+			// Empty: back to the heap, unless it is the only slab with room (buffers come and go every frame).
+			bool other_room = false;
+			for (uint32_t i = 0; i < single_slabs.size() && !other_room; i++) {
+				other_room = i != slab_index && !single_slabs[i].free_slots.is_empty();
+			}
+			if (other_room) {
+				D3D12MA::VirtualAllocation virtual_alloc = {};
+				virtual_alloc.AllocHandle = slab.virtual_alloc_handle;
+				virtual_block->FreeAllocation(virtual_alloc);
+				slab.virtual_alloc_handle = 0;
+				slab.free_slots.clear();
+			}
+		}
+		return;
+	}
+
 	D3D12MA::VirtualAllocation virtual_alloc = {};
 	virtual_alloc.AllocHandle = p_allocation.virtual_alloc_handle;
-
-	if (mutex != nullptr) {
-		MutexLock lock(*mutex);
-		virtual_block->FreeAllocation(virtual_alloc);
-	} else {
-		virtual_block->FreeAllocation(virtual_alloc);
-	}
+	virtual_block->FreeAllocation(virtual_alloc);
 }
 
 void RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type) {
@@ -1095,7 +1228,7 @@ uint64_t RenderingDeviceDriverD3D12::buffer_get_device_address(BufferID p_buffer
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
 	if (!buf_info->has_device_address_descriptor) {
 		ERR_FAIL_COND_V_MSG(!(buf_info->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), 0, "D3D12: the device address of a buffer in CPU or upload memory cannot be read by shaders.");
-		ERR_FAIL_COND_V(resource_descriptor_heap.allocate(1, buf_info->device_address_descriptor) != OK, 0);
+		ERR_FAIL_COND_V(resource_descriptor_heap.allocate_single(buf_info->device_address_descriptor) != OK, 0);
 
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
 		uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3867,7 +4000,9 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		}
 	}
 	if (resource_descriptor_count > 0) {
-		Error err = resource_descriptor_heap.allocate(resource_descriptor_count, uniform_set_info->resource_descriptor_heap_alloc);
+		Error err = p_linear_pool_index >= 0
+				? resource_descriptor_heap.allocate_linear(uint32_t(p_linear_pool_index), resource_descriptor_count, uniform_set_info->resource_descriptor_heap_alloc)
+				: resource_descriptor_heap.allocate(resource_descriptor_count, uniform_set_info->resource_descriptor_heap_alloc);
 		if (unlikely(err != OK)) {
 			VersatileResource::free(resources_allocator, uniform_set_info);
 
@@ -4118,6 +4253,10 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 	}
 
 	return UniformSetID(uniform_set_info);
+}
+
+void RenderingDeviceDriverD3D12::linear_uniform_set_pools_reset(int p_linear_pool_index) {
+	resource_descriptor_heap.reset_linear(uint32_t(p_linear_pool_index));
 }
 
 void RenderingDeviceDriverD3D12::uniform_set_free(UniformSetID p_uniform_set) {

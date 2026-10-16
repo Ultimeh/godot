@@ -162,9 +162,42 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 		uint32_t last_failed_count = 0;
 		uint64_t last_failed_largest_free = 0;
 
+		// Single descriptors (the GPU pointers of buffers, one per buffer: thousands in a big path traced scene) come from
+		// slabs of contiguous descriptors. Scattered one by one through the heap, they left no free range of the few dozen
+		// descriptors a uniform set needs with a third of the heap free: every failed allocation searched all of it.
+		static constexpr uint32_t SINGLE_SLAB_SIZE = 256;
+		static constexpr uint64_t SINGLE_SLAB_HANDLE_BIT = 1ULL << 63; // In Allocation::virtual_alloc_handle: slab index below.
+		struct SingleSlab {
+			uint64_t virtual_alloc_handle = 0;
+			uint32_t offset = 0;
+			LocalVector<uint16_t> free_slots;
+		};
+		LocalVector<SingleSlab> single_slabs;
+		uint32_t single_slab_with_room = 0; // Where the next single descriptor is looked for first.
+
+		// The uniform sets of a linear pool (one frame's: RenderingDevice resets its pool once the frame is done) take
+		// their descriptors one after the other from chunks kept for that pool, as Vulkan's linear descriptor pools do.
+		// Allocated and freed one by one, hundreds every frame in path tracing searched a heap they fragmented.
+		static constexpr uint32_t LINEAR_CHUNK_SIZE = 4096;
+		static constexpr uint64_t LINEAR_HANDLE_BIT = 1ULL << 62; // In Allocation::virtual_alloc_handle: freed by the pool reset.
+		struct LinearChunk {
+			uint64_t virtual_alloc_handle = 0;
+			uint32_t offset = 0;
+			uint32_t size = 0;
+		};
+		struct LinearPool {
+			LocalVector<LinearChunk> chunks;
+			uint32_t chunk = 0; // The one being filled.
+			uint32_t used = 0; // In it.
+		};
+		LocalVector<LinearPool> linear_pools;
+
 		Error initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible);
 
 		Error allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
+		Error allocate_single(Allocation &r_allocation);
+		Error allocate_linear(uint32_t p_pool_index, uint32_t p_descriptor_count, Allocation &r_allocation);
+		void reset_linear(uint32_t p_pool_index);
 		Error _allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
 		void free(const Allocation &p_allocation);
 	};
@@ -745,6 +778,7 @@ private:
 
 public:
 	virtual UniformSetID uniform_set_create(VectorView<BoundUniform> p_uniforms, ShaderID p_shader, uint32_t p_set_index, int p_linear_pool_index) override final;
+	virtual void linear_uniform_set_pools_reset(int p_linear_pool_index) override final;
 	virtual void uniform_set_free(UniformSetID p_uniform_set) override final;
 	virtual uint32_t uniform_sets_get_dynamic_offsets(VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count) const override final;
 
