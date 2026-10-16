@@ -6279,7 +6279,11 @@ bool RenderingDeviceDriverD3D12::_acceleration_structure_create(AccelerationStru
 		return false;
 	}
 
+	// One scratch buffer serves the builds and, when it allows them, the updates, which have their own size.
 	r_acceleration_structure_info->scratch_buffer_size = prebuild_info.ScratchDataSizeInBytes;
+	if (r_acceleration_structure_info->build_desc.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE) {
+		r_acceleration_structure_info->scratch_buffer_size = MAX(r_acceleration_structure_info->scratch_buffer_size, prebuild_info.UpdateScratchDataSizeInBytes);
+	}
 
 	const BufferInfo *buffer_info = (const BufferInfo *)r_acceleration_structure_info->buffer.id;
 	r_acceleration_structure_info->build_desc.DestAccelerationStructureData = buffer_info->gpu_virtual_address;
