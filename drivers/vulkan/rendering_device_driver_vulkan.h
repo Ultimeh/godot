@@ -851,7 +851,8 @@ private:
 			ShaderInfo,
 			UniformSetInfo,
 			RenderPassInfo,
-			CommandBufferInfo>;
+			CommandBufferInfo,
+			AccelerationStructureInfo>;
 	PagedAllocator<VersatileResource, true> resources_allocator;
 
 	/******************/
