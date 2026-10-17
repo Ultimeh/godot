@@ -519,6 +519,16 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.hit_t = gl_HitTEXT;
 		ps.offset_normal = h.geometry_normal;
 		ps.next_ray_dir = front_dir;
+#ifdef DLSS_RR_ENABLED
+		// For the raygen, which blends Ray Reconstruction's albedo and roughness guides toward this surface where its
+		// reflection dominates (DLSS-RR Integration Guide, 3.4.1): its specular albedo (with the geometry normal, so the
+		// waves of a normal map do not make the guides noisy) and roughness in the radiance, its diffuse albedo in the
+		// throughput. Neither is read again for this ray.
+		const float front_NdotV = max(dot(h.geometry_normal, V), 0.0001);
+		const vec3 front_specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, front_mat.dielectricF0, m.roughness, front_NdotV);
+		ps.radiance = vec3(dot(front_specular_albedo, vec3(1.0 / 3.0)), m.roughness, 0.0);
+		ps.throughput = DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness);
+#endif
 		path_pack(payload, ps);
 		return;
 	}

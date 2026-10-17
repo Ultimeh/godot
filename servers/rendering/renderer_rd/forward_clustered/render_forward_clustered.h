@@ -1417,6 +1417,8 @@ protected:
 		RID normal_roughness;
 		RID specular_hit_dist;
 		RID color_before_transparency;
+		// In place of the depth buffer: a transparent surface's where its reflection dominates (RenderRaytracing::dlss_rr_get_depth()).
+		RID depth;
 	};
 
 	Scale3DMode _resolve_scale_3d_mode(Ref<RenderSceneBuffersRD> p_render_buffers) const;

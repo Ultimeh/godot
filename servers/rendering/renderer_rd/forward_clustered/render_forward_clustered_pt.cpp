@@ -571,6 +571,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			dlss_rr_guides.normal_roughness = raytracing->dlss_rr_get_normal_roughness(rb.ptr());
 			dlss_rr_guides.specular_hit_dist = raytracing->dlss_rr_get_specular_hit_dist(rb.ptr());
 			dlss_rr_guides.color_before_transparency = raytracing->dlss_rr_get_color_before_transparency(rb.ptr());
+			dlss_rr_guides.depth = raytracing->dlss_rr_get_depth(rb.ptr());
 		}
 		_render_3d_upscaling(p_render_data, scale_type, using_taa, time_step, dlss_rr_guides);
 	}

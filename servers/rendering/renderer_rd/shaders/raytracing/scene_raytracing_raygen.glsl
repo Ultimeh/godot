@@ -108,8 +108,14 @@ void main() {
 	imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));
 
 	// Front layer: the first transparent surface before the opaque hit, and one path along its reflection, for the raster
-	// transparent pass (RenderForwardClustered::front_layer_reflection). Not a primary ray: no depth, motion or RR guides.
+	// transparent pass (RenderForwardClustered::front_layer_reflection). Not a primary ray: no depth or motion; it adjusts
+	// Ray Reconstruction's guides where the surface's reflection matters (below).
 	vec4 front_layer = vec4(0.0);
+#ifdef DLSS_RR_ENABLED
+	// Ray Reconstruction's depth guide: the opaque surface's (rt_depth, written by this sample 0's primary hit or miss),
+	// unless a transparent surface in front dominates (below).
+	float rr_depth = imageLoad(rt_depth_image, ivec2(pixel)).r;
+#endif
 	if (get_rt_param(RT_PARAM_FRONT_LAYER_COUNT) > 0.0) {
 		PathState fs;
 		fs.radiance = vec3(0.0);
@@ -125,6 +131,14 @@ void main() {
 
 		if (!is_path_terminated(fs.packed_bounces_flags)) {
 			float view_depth = fs.hit_t * dot(direction.xyz, -normalize(inv_view[2].xyz));
+#ifdef DLSS_RR_ENABLED
+			// What the closest hit returned for the guides (raytracing_closest_hit_common_inc.glsl, front layer branch).
+			const float front_reflectance = clamp(fs.radiance.x, 0.0, 1.0);
+			const float front_roughness = fs.radiance.y;
+			const vec3 front_diffuse_albedo = fs.throughput;
+			const vec3 front_normal = fs.offset_normal;
+			const vec3 front_position = origin.xyz + direction.xyz * fs.hit_t;
+#endif
 
 			PathState rs;
 			rs.radiance = vec3(0.0);
@@ -136,6 +150,7 @@ void main() {
 			// The reflected point's direct light and one indirect bounce, as Lumen's front layer reflections: a full path
 			// for every pixel of a window close to the camera doubled the cost of the trace.
 			uint front_layer_bounces = min(max_bounces, 1u);
+			float front_reflection_t = -1.0; // As dlss_rr_specular_hit_dist: -1 when the reflection reaches the sky.
 			[[dont_unroll]] for (uint bounce = 0u; bounce <= front_layer_bounces; bounce++) {
 				path_pack(payload, rs);
 #ifdef USE_SER
@@ -151,14 +166,51 @@ void main() {
 				if (is_path_terminated(rs.packed_bounces_flags)) {
 					break;
 				}
+				if (bounce == 0u) {
+					front_reflection_t = rs.hit_t;
+				}
 				vec3 hit_pos = ray_origin + ray_dir * rs.hit_t;
 				ray_origin = offset_ray_origin(hit_pos, rs.offset_normal);
 				ray_dir = rs.next_ray_dir;
 			}
 			front_layer = vec4(rs.radiance, view_depth);
+
+#ifdef DLSS_RR_ENABLED
+			// Ray Reconstruction's guides describe the opaque surface behind, and it took the reflection of a transparent
+			// surface in front (water, a window) for noise on that surface and smeared it. As the DLSS-RR Integration Guide
+			// recommends (3.4.1, 3.4.8): the albedo and roughness guides blend toward the transparent surface's by its
+			// reflectance, and where its reflection dominates, depth, normal and specular hit distance are all the
+			// transparent surface's, consistent with each other as the guide requires without specular motion vectors.
+			// The reflectance comes from the geometry normal, so the switch follows the view angle, not a normal map's waves.
+			{
+				const ivec2 guide_pixel = ivec2(pixel);
+				const vec3 diffuse_albedo = imageLoad(dlss_rr_diffuse_albedo, guide_pixel).rgb;
+				const vec3 specular_albedo = imageLoad(dlss_rr_specular_albedo, guide_pixel).rgb;
+				const vec4 normal_roughness = imageLoad(dlss_rr_normal_roughness, guide_pixel);
+				// The floor of DLSSRR_encodeDiffuseAlbedo() (brdf_inc.glsl, not included in the raygen).
+				imageStore(dlss_rr_diffuse_albedo, guide_pixel, vec4(max(mix(diffuse_albedo, front_diffuse_albedo, front_reflectance), vec3(0.001)), 1.0));
+				imageStore(dlss_rr_specular_albedo, guide_pixel, vec4(clamp(mix(specular_albedo, vec3(front_reflectance), front_reflectance), vec3(0.04), vec3(1.0)), 1.0));
+				const float roughness = mix(normal_roughness.w, front_roughness, front_reflectance);
+				if (front_reflectance >= 0.5) {
+					imageStore(dlss_rr_normal_roughness, guide_pixel, vec4(front_normal, roughness));
+					imageStore(dlss_rr_specular_hit_dist, guide_pixel, vec4(front_reflection_t));
+					const mat4 view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0],
+							scene_data_block.data.view_matrix[1],
+							scene_data_block.data.view_matrix[2],
+							vec4(0.0, 0.0, 0.0, 1.0)));
+					const vec4 front_clip = scene_data_block.data.projection_matrix * (view_matrix * vec4(front_position, 1.0));
+					rr_depth = front_clip.z / front_clip.w; // NDC, as write_primary_hit_depth().
+				} else {
+					imageStore(dlss_rr_normal_roughness, guide_pixel, vec4(normal_roughness.xyz, roughness));
+				}
+			}
+#endif
 		}
 	}
 	imageStore(front_layer_image, ivec2(pixel), front_layer);
+#ifdef DLSS_RR_ENABLED
+	imageStore(dlss_rr_depth, ivec2(pixel), vec4(rr_depth));
+#endif
 }
 
 #[miss]

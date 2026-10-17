@@ -58,6 +58,7 @@
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
 #define RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY SNAME("color_before_transparency")
+#define RB_TEX_DLSS_RR_DEPTH SNAME("rr_depth")
 
 class RenderDataRD;
 class RenderSceneBuffersRD;
@@ -951,6 +952,9 @@ public:
 	RID dlss_rr_get_specular_albedo(RenderSceneBuffersRD *p_render_buffers) const;
 	RID dlss_rr_get_normal_roughness(RenderSceneBuffersRD *p_render_buffers) const;
 	RID dlss_rr_get_specular_hit_dist(RenderSceneBuffersRD *p_render_buffers) const;
+	// Ray Reconstruction's depth guide (NDC, as rt_depth): the opaque surface's, or the transparent one in front where
+	// its reflection dominates. The raster depth buffer keeps the opaque one, which the transparent pass reads.
+	RID dlss_rr_get_depth(RenderSceneBuffersRD *p_render_buffers) const;
 	RID dlss_rr_get_color_before_transparency(RenderSceneBuffersRD *p_render_buffers) const;
 
 	void register_raytracing_buffer_dependencies(RD::RaytracingListID p_list);

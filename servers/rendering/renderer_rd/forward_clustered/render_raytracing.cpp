@@ -301,6 +301,9 @@ void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buf
 	// The noisy color before the transparent pass draws on it: RR tells the transparents apart and keeps them
 	// sharp. The guide says to use the noisy color's format, or precision differences read as transparency.
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY, p_render_buffers->get_base_data_format(), usage_bits, RD::TEXTURE_SAMPLES_1);
+	// Depth, NDC as rt_depth: where a transparent surface's reflection dominates, that surface's (DLSS-RR Integration
+	// Guide, 3.4.1: depth, normal and specular hit distance set consistently on the transparent surface).
+	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 }
 
 void RenderRaytracing::dlss_rr_free_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -335,6 +338,11 @@ RID RenderRaytracing::dlss_rr_get_color_before_transparency(RenderSceneBuffersRD
 RID RenderRaytracing::dlss_rr_get_specular_hit_dist(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
 	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST);
+}
+
+RID RenderRaytracing::dlss_rr_get_depth(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DEPTH);
 }
 
 // ---------------------------------------------------------------------------
@@ -5398,6 +5406,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.append_id(dlss_rr_get_specular_hit_dist(rb));
 			uniforms.push_back(u);
 		}
+
+		// Binding 39: DLSS RR Depth (the raygen writes it, see dlss_rr_get_depth()).
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 39, dlss_rr_get_depth(rb)));
 	}
 
 	// Binding 13: Light buffer (SSBO).
