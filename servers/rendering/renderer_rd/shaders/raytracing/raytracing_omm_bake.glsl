@@ -322,8 +322,10 @@ uint rt_omm_sample(vec3 p_bary, vec3 p_bary_dx, vec3 p_bary_dy) {
 void main() {
 	OmmBakeJob job = jobs[params.job_index];
 	const uint micro_count = 1u << (job.level * 2u);
-	const uint triangle = gl_GlobalInvocationID.x / micro_count;
-	const uint micro = gl_GlobalInvocationID.x % micro_count;
+	// _rt_dispatch_linear(): the groups beyond the device's X limit go on Y.
+	const uint thread = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+	const uint triangle = thread / micro_count;
+	const uint micro = thread % micro_count;
 
 	if (params.never != 0u) {
 		float value = global_shader_uniforms.data[0].x + scene_data_block.data.time;

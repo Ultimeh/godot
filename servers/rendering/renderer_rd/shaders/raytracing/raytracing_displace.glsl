@@ -201,7 +201,8 @@ vec3 displace_vertex(DisplaceJob p_job, vec3 p_rest_position, TBNResult p_tbn, u
 
 void main() {
 	DisplaceJob job = jobs[params.job_index];
-	uint index = gl_GlobalInvocationID.x;
+	// _rt_dispatch_linear(): the groups beyond the device's X limit go on Y.
+	uint index = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
 
 	if (params.never != 0u) {
 		float value = global_shader_uniforms.data[0].x + scene_data_block.data.time;

@@ -1348,6 +1348,19 @@ void RenderRaytracing::_populate_surface_blas(
 	}
 }
 
+// p_threads threads of a shader with local_size_x = 64 and its index at gl_GlobalInvocationID.x +
+// gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64: the groups beyond the device's X limit (65535 on most GPUs, 4M
+// threads) go on Y. A MultiMesh's vertices or a surface's micro-triangles reach that count.
+static void _rt_dispatch_linear(RenderingDevice *p_rd, RD::ComputeListID p_compute_list, uint32_t p_threads) {
+	if (p_threads == 0) {
+		return;
+	}
+	const uint32_t groups = Math::division_round_up(p_threads, 64u);
+	const uint32_t max_x = MAX(uint32_t(p_rd->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_X)), 1u);
+	const uint32_t x = MIN(groups, max_x);
+	p_rd->compute_list_dispatch(p_compute_list, x, Math::division_round_up(groups, x), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Displacement by material vertex() code
 // ---------------------------------------------------------------------------
@@ -1570,7 +1583,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 
 		const uint32_t push_constant[4] = { i, 0, 0, 0 };
 		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
-		rd->compute_list_dispatch_threads(compute_list, job.vertex_count, 1, 1);
+		_rt_dispatch_linear(rd, compute_list, job.vertex_count);
 	}
 	rd->compute_list_end();
 	for (const RID &job_set : job_sets) {
@@ -1816,7 +1829,7 @@ void RenderRaytracing::_omm_dispatch_bakes() {
 
 		const uint32_t push_constant[4] = { i, 0, 0, 0 };
 		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
-		rd->compute_list_dispatch_threads(compute_list, bake.micro_triangles, 1, 1);
+		_rt_dispatch_linear(rd, compute_list, bake.micro_triangles);
 	}
 	rd->compute_list_end();
 	for (const RID &job_set : job_sets) {
@@ -1978,7 +1991,7 @@ void RenderRaytracing::_displace_merged_multimeshes() {
 
 		const uint32_t push_constant[4] = { i, 0, 0, 0 };
 		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
-		rd->compute_list_dispatch_threads(compute_list, request.mm_count * request.vertex_count, 1, 1);
+		_rt_dispatch_linear(rd, compute_list, request.mm_count * request.vertex_count);
 	}
 	rd->compute_list_end();
 	for (const RID &job_set : job_sets) {
