@@ -422,6 +422,18 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		RD::get_singleton()->draw_command_end_label();
 	}
 
+	// Ray Reconstruction's background is drawn again at the output resolution, and replaces its output where nothing was
+	// drawn over it (dlss_rr_composite_background()). What the compositor effects draw over it from here on (a sky's
+	// volumetric clouds) must be kept as the transparent pass's is: the reference is the color before them.
+	RID background_reference;
+	if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr()) &&
+			(_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE, p_render_data) ||
+					_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_SKY, p_render_data) ||
+					_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data))) {
+		background_reference = raytracing->dlss_rr_get_color_before_effects(rb.ptr());
+		copy_effects->copy_to_rect(rb->get_internal_texture(), background_reference, Rect2i(Point2i(), rb->get_internal_size()));
+	}
+
 	{
 		// RT output is already in internal_texture, so the color MSAA resolve is
 		// skipped; only depth is resolved for compositor effects that need it.
@@ -592,7 +604,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			RD::get_singleton()->draw_list_end();
 
 			sky.sky_scene_state.cam_projection = jittered_projection;
-			raytracing->dlss_rr_composite_background(p_render_data);
+			raytracing->dlss_rr_composite_background(p_render_data, background_reference.is_valid() ? background_reference : raytracing->dlss_rr_get_color_before_transparency(rb.ptr()));
 			RD::get_singleton()->draw_command_end_label();
 		}
 	}

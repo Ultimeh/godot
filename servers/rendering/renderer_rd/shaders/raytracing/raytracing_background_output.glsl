@@ -17,7 +17,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform texture2D background_texture; // Output resolution.
 layout(r32f, set = 0, binding = 1) uniform restrict readonly image2D depth_image; // Internal resolution; 0 where the camera rays missed.
 layout(set = 0, binding = 2) uniform texture2D color_texture; // Internal resolution, after the transparent pass.
-layout(set = 0, binding = 3) uniform texture2D color_before_transparency_texture; // Internal resolution.
+// Internal resolution: the color before anything was drawn over the background (the transparent pass, compositor effects).
+layout(set = 0, binding = 3) uniform texture2D color_before_transparency_texture;
 layout(rgba16f, set = 0, binding = 4) uniform restrict image2D output_image; // Ray Reconstruction's output.
 
 layout(push_constant, std430) uniform Params {

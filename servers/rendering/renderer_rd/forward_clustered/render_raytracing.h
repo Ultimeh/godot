@@ -60,6 +60,7 @@
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
 #define RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY SNAME("color_before_transparency")
 #define RB_TEX_DLSS_RR_BACKGROUND SNAME("background")
+#define RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS SNAME("color_before_effects")
 
 class RenderDataRD;
 class RenderSceneBuffersRD;
@@ -850,7 +851,12 @@ public:
 	// The background at the output resolution, for the sky shader to draw into (null when it cannot be composited), and
 	// its composition over Ray Reconstruction's output where the camera rays missed (raytracing_background_output.glsl).
 	RID dlss_rr_get_background_output(RenderSceneBuffersRD *p_render_buffers);
-	void dlss_rr_composite_background(const RenderDataRD *p_render_data);
+	// p_unchanged_reference: the internal color before anything was drawn over the background (the color before
+	// transparency, or before the compositor effects, dlss_rr_get_color_before_effects()): where the internal color differs
+	// from it, Ray Reconstruction's output is kept.
+	void dlss_rr_composite_background(const RenderDataRD *p_render_data, RID p_unchanged_reference);
+	// The internal color before the compositor effects that may draw over the background.
+	RID dlss_rr_get_color_before_effects(RenderSceneBuffersRD *p_render_buffers);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
 
 	// Raytracing output textures (stored on the render buffers via named scopes).

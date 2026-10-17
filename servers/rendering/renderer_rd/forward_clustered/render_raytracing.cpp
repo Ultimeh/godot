@@ -5321,7 +5321,17 @@ RID RenderRaytracing::dlss_rr_get_background_output(RenderSceneBuffersRD *p_rend
 			RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT, RD::TEXTURE_SAMPLES_1, size);
 }
 
-void RenderRaytracing::dlss_rr_composite_background(const RenderDataRD *p_render_data) {
+RID RenderRaytracing::dlss_rr_get_color_before_effects(RenderSceneBuffersRD *p_render_buffers) {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	if (p_render_buffers->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS)) {
+		return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS);
+	}
+	// As the color before transparency, which it stands for: the composition compares it with the internal color.
+	return p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS, p_render_buffers->get_base_data_format(),
+			RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT, RD::TEXTURE_SAMPLES_1);
+}
+
+void RenderRaytracing::dlss_rr_composite_background(const RenderDataRD *p_render_data, RID p_unchanged_reference) {
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
 	ERR_FAIL_COND(!rb->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND));
@@ -5337,7 +5347,7 @@ void RenderRaytracing::dlss_rr_composite_background(const RenderDataRD *p_render
 	RD::Uniform background(RD::UNIFORM_TYPE_TEXTURE, 0, rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND));
 	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
 	RD::Uniform color(RD::UNIFORM_TYPE_TEXTURE, 2, rb->get_internal_texture());
-	RD::Uniform color_before_transparency(RD::UNIFORM_TYPE_TEXTURE, 3, dlss_rr_get_color_before_transparency(rb.ptr()));
+	RD::Uniform color_before_transparency(RD::UNIFORM_TYPE_TEXTURE, 3, p_unchanged_reference);
 	RD::Uniform output(RD::UNIFORM_TYPE_IMAGE, 4, rb->get_upscaled_texture());
 
 	RD *rd = RD::get_singleton();
