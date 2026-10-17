@@ -2331,7 +2331,7 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 RTMaterialData *RenderRaytracing::_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out) {
 	// A neutral standard material, so the ground and the walls do not vanish for the seconds a new pipeline takes to
 	// compile (a pipeline cache miss: a new shader or engine version). Cut-out and billboard materials wait: their shape
-	// comes from their shader, a grey card would be worse than nothing.
+	// comes from their shader, a gray card would be worse than nothing.
 	if (p_cut_out) {
 		return nullptr;
 	}

@@ -30,14 +30,13 @@
 
 #include "rendering_device_driver_d3d12.h"
 
-#include "fsr_frame_generation_d3d12.h"
-
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
 #include "drivers/aftermath/aftermath.h"
 #include "drivers/aftermath/aftermath_context.h"
 #include "drivers/d3d12/d3d12_hooks.h"
+#include "drivers/d3d12/fsr_frame_generation_d3d12.h"
 #include "drivers/d3d12/rendering_context_driver_d3d12.h"
 #include "drivers/streamline/streamline.h"
 
@@ -4011,8 +4010,8 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 			VersatileResource::free(resources_allocator, uniform_set_info);
 
 			ERR_FAIL_COND_V_MSG(err == ERR_OUT_OF_MEMORY, UniformSetID(), vformat("Cannot create uniform set because there's not enough room in the RESOURCES descriptor heap (%d descriptors needed, largest free range %d).\n"
-																		  "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.",
-																		  resource_descriptor_count, resource_descriptor_heap.last_failed_largest_free));
+																				  "Please increase the value of the rendering/rendering_device/d3d12/max_resource_descriptors project setting.",
+																				  resource_descriptor_count, resource_descriptor_heap.last_failed_largest_free));
 
 			ERR_FAIL_V_MSG(UniformSetID(), "Failed to allocate resource descriptors.");
 		}
@@ -7226,7 +7225,6 @@ RenderingDeviceDriverD3D12::RenderingDeviceDriverD3D12(RenderingContextDriverD3D
 
 RenderingDeviceDriverD3D12::~RenderingDeviceDriverD3D12() {
 	rtv_descriptor_heap_pool.free(null_rtv_alloc);
-
 
 	if (Streamline::get_singleton()) {
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY);
