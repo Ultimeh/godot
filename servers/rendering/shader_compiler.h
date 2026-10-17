@@ -145,6 +145,8 @@ private:
 
 public:
 	Error compile(RSE::ShaderMode p_mode, const String &p_code, IdentifierActions *p_actions, const String &p_path, GeneratedCode &r_gen_code);
+	// The tree of the last successful compile(), valid until the next one.
+	const ShaderLanguage::ShaderNode *get_parsed_shader() const { return shader; }
 
 	void initialize(DefaultIdentifierActions p_actions);
 	ShaderCompiler();

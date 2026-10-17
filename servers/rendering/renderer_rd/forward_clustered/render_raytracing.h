@@ -316,6 +316,47 @@ struct alignas(16) RT_DisplaceJob {
 };
 static_assert(sizeof(RT_DisplaceJob) == 480, "RT_DisplaceJob must be 480 bytes for std430");
 
+// Must match GLSL OmmBakeJob (raytracing_omm_bake.glsl, std430).
+struct alignas(16) RT_OmmBakeJob {
+	RT_GeometryData geometry; // The mesh surface as stored.
+	uint64_t material_address; // Its uniforms (custom shaders).
+	uint32_t triangle_count;
+	uint32_t level;
+	uint32_t data_offset; // In words.
+	uint32_t desc_offset; // In words.
+	// Hit group 0 (BaseMaterial3D).
+	uint32_t albedo_texture_idx;
+	float albedo_alpha;
+	float uv1_scale[2];
+	float uv1_offset[2];
+	uint32_t use_vertex_color;
+	uint32_t max_samples; // Evaluations per micro-triangle edge, beyond which it stays unknown.
+	uint32_t pad[2];
+};
+static_assert(sizeof(RT_OmmBakeJob) == 240, "RT_OmmBakeJob must be 240 bytes for std430");
+
+// A mesh surface's cut-out baked with a material (raytracing_omm_bake.glsl): for its static BLAS built again with it, and
+// for the BLASes of its deformed copies (skinned, displaced).
+struct RTOmmKey {
+	RID mesh;
+	uint32_t surface_index = 0;
+	uint32_t surface_counter = 0; // The surface's data changed.
+	RID material;
+	uint16_t material_counter = 0;
+
+	bool operator==(const RTOmmKey &p_other) const {
+		return mesh == p_other.mesh && surface_index == p_other.surface_index && surface_counter == p_other.surface_counter &&
+				material == p_other.material && material_counter == p_other.material_counter;
+	}
+	static uint32_t hash(const RTOmmKey &p_key) {
+		uint32_t h = hash_murmur3_one_64(p_key.mesh.get_id());
+		h = hash_murmur3_one_32(p_key.surface_index, h);
+		h = hash_murmur3_one_32(p_key.surface_counter, h);
+		h = hash_murmur3_one_64(p_key.material.get_id(), h);
+		return hash_fmix32(hash_murmur3_one_32(p_key.material_counter, h));
+	}
+};
+
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
 	AABB culling_aabb;
@@ -335,6 +376,17 @@ struct RTSurfaceData {
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+};
+
+struct RTOmmEntry {
+	RID micromap;
+	RID data_buffer; // The micro-triangles' states.
+	RID desc_buffer; // The triangles' descriptions.
+	uint32_t level = 0; // Subdivision level of its entries, one per triangle.
+	RTSurfaceData surf_data; // The surface's static BLAS built with the micromap, once a static instance asks for it.
+	uint32_t first_seen_frame = 0; // Baked once the surface lasts: a mesh replaced every frame (sprites) is not.
+	uint32_t last_used_frame = 0;
+	bool failed = false;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -421,6 +473,12 @@ struct RTDeformedCacheEntry {
 	uint32_t displaced_instance_uniforms_hash = 0; // The instance uniforms vertex() was evaluated with.
 	bool displaced_deferred = false; // A change waits for the surface's next update frame (far from the camera).
 	Transform3D displaced_transform;
+
+	// The surface's cut-out baked into an opacity micromap (build_tlas() sets it, _omm_entry()), and the one the BLAS
+	// was built with: a change builds the BLAS again.
+	RID omm_micromap;
+	uint32_t omm_level = 0;
+	RID built_omm_micromap;
 };
 
 /// Cache entry for a per-(MultiMesh, surface) merged BLAS.
@@ -800,7 +858,38 @@ class RenderRaytracing {
 			bool p_allow_update,
 			uint32_t p_cache_key,
 			RTSurfaceData *r_surf_data,
-			LocalVector<RID> &r_dirty_blas_list);
+			LocalVector<RID> &r_dirty_blas_list,
+			RID p_opacity_micromap = RID(),
+			uint32_t p_opacity_micromap_level = 0);
+
+	// Opacity micromaps: the cut-outs the any-hit shaders test, baked per surface and material
+	// (rt_alpha_dependencies.h, raytracing_omm_bake.glsl), the surface's BLAS built again with them.
+	HashMap<RTOmmKey, RTOmmEntry, RTOmmKey> omm_entries;
+	struct PendingOmmBake {
+		RID shader;
+		RID pipeline;
+		RID material_buffer;
+		RID data_buffer;
+		RID desc_buffer;
+		RID micromap;
+		uint32_t data_size = 0;
+		uint32_t micro_triangles = 0; // Threads.
+		RT_OmmBakeJob job = {};
+	};
+	LocalVector<PendingOmmBake> pending_omm_bakes;
+	RID omm_job_buffer;
+	uint32_t omm_job_capacity = 0;
+	uint32_t omm_sweep_frame = 0;
+	// The surface's cut-out baked with the material into a micromap, when the material allows it and the surface lasted
+	// (the bake queued this frame if new), or null.
+	RTOmmEntry *_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh);
+	// The surface's static BLAS built again with the entry's micromap (built this frame if new), or invalid.
+	RID _omm_static_blas(RTOmmEntry *p_entry, void *p_mesh_surface, LocalVector<RID> &r_dirty_blas_list);
+	// Records the bakes and the micromap builds _omm_blas() queued, before the BLAS builds.
+	void _omm_dispatch_bakes();
+	void _omm_free_entry(RTOmmEntry &p_entry);
+	// Frees the entries no frame used for a while (all of them with p_all).
+	void _omm_evict(bool p_all);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
 	// The material a surface is traced with while its custom shader's hit group compiles, or null to leave it out.
 	RTMaterialData *_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out);

@@ -36,6 +36,7 @@
 #include "core/math/math_defs.h"
 #include "core/os/os.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
+#include "servers/rendering/renderer_rd/forward_clustered/rt_alpha_dependencies.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/storage/environment_storage.h"
@@ -362,6 +363,14 @@ SceneShaderRaytracing::~SceneShaderRaytracing() {
 	}
 	if (displace_shader_version.is_valid()) {
 		displace_shader.version_free(displace_shader_version);
+	}
+	for (const DisplaceProgram &program : omm_bake_programs) {
+		if (program.shader.is_valid()) {
+			RD::get_singleton()->free_rid(program.shader);
+		}
+	}
+	if (omm_bake_shader_version.is_valid()) {
+		omm_bake_shader.version_free(omm_bake_shader_version);
 	}
 
 	singleton = nullptr;
@@ -798,6 +807,11 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 
 	r_entry.is_procedural = p_is_procedural;
 	r_entry.uses_alpha_clip = detected_alpha_clip;
+	if (!p_is_procedural) {
+		const RTAlphaDependencies alpha_dependencies = rt_alpha_dependencies(compiler.get_parsed_shader());
+		r_entry.alpha_bakeable = alpha_dependencies.bakeable;
+		r_entry.alpha_reads_color = alpha_dependencies.reads_color;
+	}
 	r_entry.writes_vertex = (writes_vertex || writes_modelview) && !p_is_procedural;
 	r_entry.writes_modelview = writes_modelview && !p_is_procedural;
 	r_entry.uses_vertex_time = gen_code.uses_vertex_time;
@@ -916,6 +930,73 @@ RID SceneShaderRaytracing::get_displace_pipeline(uint32_t p_slot_index, RID &r_s
 	}
 	if (binary.is_empty()) {
 		WARN_PRINT(vformat("RT: the vertex() of hit group %d failed to compile for displacement; its surfaces are traced undisplaced.", p_slot_index));
+		return RID();
+	}
+	program.shader = RD::get_singleton()->shader_create_from_bytecode(binary);
+	ERR_FAIL_COND_V(!program.shader.is_valid(), RID());
+	program.pipeline = RD::get_singleton()->compute_pipeline_create(program.shader);
+	ERR_FAIL_COND_V(!program.pipeline.is_valid(), RID());
+	program.failed = false;
+	r_shader = program.shader;
+	return program.pipeline;
+}
+
+RID SceneShaderRaytracing::get_omm_bake_pipeline(uint32_t p_slot_index, RID &r_shader) {
+	if (omm_bake_template.is_empty()) {
+		return RID();
+	}
+	const CustomShaderEntry *entry = nullptr;
+	if (p_slot_index != 0) {
+		entry = get_custom_shader_entry(p_slot_index);
+		if (!entry || !entry->alpha_bakeable) {
+			return RID();
+		}
+	}
+	if (omm_bake_programs.size() < hit_group_slots.size()) {
+		omm_bake_programs.resize(hit_group_slots.size());
+	}
+	DisplaceProgram &program = omm_bake_programs[p_slot_index];
+	if (program.pipeline.is_valid() || program.failed) {
+		r_shader = program.shader;
+		return program.pipeline;
+	}
+	program.failed = true;
+
+	String source = omm_bake_template;
+	if (entry) {
+		String tex_defines;
+		for (const TextureUniformInfo &tui : entry->texture_uniforms) {
+			const String id = _uniform_identifier(tui.name);
+			tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
+		}
+		source = source.replace("/* RT_CUSTOM_DEFINES */", entry->defines);
+		source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry->fragment_globals);
+		source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", entry->uniform_members.is_empty() ? String("float _rt_pad;") : entry->uniform_members);
+		source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
+		source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + entry->vertex_code + "\n}\n");
+		source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
+		source = source.replace("/* RT_CUSTOM_FRAGMENT_CODE */", entry->fragment_code);
+		source = _apply_varying_code(source, entry->varyings);
+	} else {
+		// Hit group 0's alpha. The template's defines are expanded already: the define goes after #version.
+		const int version_end = source.find("\n", source.find("#version"));
+		source = source.insert(version_end + 1, "#define RT_OMM_BAKE_STANDARD\n");
+	}
+
+	Vector<String> sources;
+	sources.resize(RD::SHADER_STAGE_MAX);
+	sources.write[RD::SHADER_STAGE_COMPUTE] = source;
+	Vector<RD::ShaderStageSPIRVData> stages;
+	Vector<uint8_t> binary;
+	{
+		MutexLock lock(spirv_compile_mutex);
+		stages = ShaderRD::compile_stages(sources, {});
+		if (!stages.is_empty()) {
+			binary = RD::get_singleton()->shader_compile_binary_from_spirv(stages, "RT OMM bake");
+		}
+	}
+	if (binary.is_empty()) {
+		WARN_PRINT(vformat("RT: the opacity micromap bake of hit group %d failed to compile; its surfaces keep their any-hit tests.", p_slot_index));
 		return RID();
 	}
 	program.shader = RD::get_singleton()->shader_create_from_bytecode(binary);
@@ -1761,6 +1842,16 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		Vector<String> displace_sources = displace_shader.version_build_variant_stage_sources(displace_shader_version, 0);
 		if (displace_sources.size() > RD::SHADER_STAGE_COMPUTE) {
 			displace_template = displace_sources[RD::SHADER_STAGE_COMPUTE];
+		}
+	}
+
+	// Source template of the opacity micromap bakes, likewise.
+	omm_bake_shader.initialize({ "" }, p_defines);
+	omm_bake_shader_version = omm_bake_shader.version_create(false);
+	if (omm_bake_shader_version.is_valid()) {
+		Vector<String> omm_bake_sources = omm_bake_shader.version_build_variant_stage_sources(omm_bake_shader_version, 0);
+		if (omm_bake_sources.size() > RD::SHADER_STAGE_COMPUTE) {
+			omm_bake_template = omm_bake_sources[RD::SHADER_STAGE_COMPUTE];
 		}
 	}
 

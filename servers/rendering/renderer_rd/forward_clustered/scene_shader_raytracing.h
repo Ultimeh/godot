@@ -34,6 +34,7 @@
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h" // IWYU pragma: keep
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_displace.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_omm_bake.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
@@ -375,6 +376,9 @@ public:
 		Vector<ShaderCompiler::GeneratedCode::Varying> varyings; // Interpolated by the hit shaders on displaced geometry.
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
+		// Its cut-out can be baked into an opacity micromap per surface (rt_alpha_dependencies()); COLOR reaches it.
+		bool alpha_bakeable = false;
+		bool alpha_reads_color = false;
 	};
 
 	// 128-bit identity (dual hash64 with distinct salt). Treated as source equality.
@@ -451,6 +455,9 @@ public:
 	// Compute pipeline running the slot's vertex() on every vertex (raytracing_displace.glsl); invalid if the slot
 	// does not displace or failed to compile. Compiled on first use.
 	RID get_displace_pipeline(uint32_t p_slot_index, RID &r_shader);
+	// The program baking a slot's cut-out into opacity micromaps (raytracing_omm_bake.glsl); invalid when the slot's
+	// cut-out cannot be baked (CustomShaderEntry::alpha_bakeable) or failed to compile.
+	RID get_omm_bake_pipeline(uint32_t p_slot_index, RID &r_shader);
 	void drain_completed_compiles();
 	void finalize_custom_shaders();
 
@@ -507,6 +514,12 @@ private:
 		bool failed = false;
 	};
 	LocalVector<DisplaceProgram> displace_programs; // Parallel to hit_group_slots.
+
+	// Opacity micromap bakes: the template, and its program per hit group slot (slot 0: BaseMaterial3D's alpha).
+	RaytracingOmmBakeShaderRD omm_bake_shader;
+	RID omm_bake_shader_version;
+	String omm_bake_template;
+	LocalVector<DisplaceProgram> omm_bake_programs; // Parallel to hit_group_slots.
 
 	bool async_compilation_enabled = true;
 	Mutex spirv_compile_mutex; // Serialize glslang calls (RD::shader_compile_spirv_from_source).

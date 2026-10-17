@@ -423,6 +423,9 @@ uint64_t RenderRaytracing::mat_ubo_pool_get_address(uint32_t p_slot) const {
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::cleanup_caches() {
+	// Before the surfaces' BLASes, which free the micromap BLASes built from the same buffers.
+	_omm_evict(true);
+
 	for (uint32_t i = 0; i < surface_chunks.size(); i++) {
 		if (surface_chunks[i]) {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
@@ -985,9 +988,14 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	bool data_changed = layout_changed ||
 			entry.cached_change_stamp != p_source.change_stamp ||
 			entry.cached_buffer_id != buffer_id;
+	// A micromap freed (evicted) is no longer one to build with.
+	if (entry.omm_micromap.is_valid() && !rd->acceleration_structure_is_valid(entry.omm_micromap)) {
+		entry.omm_micromap = RID();
+	}
 	bool needs_full_rebuild = !entry.ptr || !entry.blas_built_once || layout_changed ||
 			entry.cached_key_version != p_source.cache_version ||
-			entry.cached_surface_counter != p_source.surface_counter;
+			entry.cached_surface_counter != p_source.surface_counter ||
+			entry.omm_micromap != entry.built_omm_micromap;
 
 	BitField<RD::BufferCreationBits> owned_full_flags = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT |
 			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
@@ -1047,12 +1055,16 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 			entry.ptr = memnew(RTSurfaceData);
 		}
 		if (entry.ptr->blas.is_valid()) {
-			rd->free_rid(entry.ptr->blas);
+			// Freed already with the micromap it was built with, when that one was evicted.
+			if (rd->acceleration_structure_is_valid(entry.ptr->blas)) {
+				rd->free_rid(entry.ptr->blas);
+			}
 			entry.ptr->blas = RID();
 		}
 		_populate_surface_blas(p_mesh_surface, entry.owned_vb_full, true, true, true,
-				static_cast<uint32_t>(p_source.cache_key), entry.ptr, r_dirty_blas_list);
+				static_cast<uint32_t>(p_source.cache_key), entry.ptr, r_dirty_blas_list, entry.omm_micromap, entry.omm_level);
 		entry.blas_built_once = entry.ptr->blas.is_valid();
+		entry.built_omm_micromap = entry.omm_micromap;
 	} else if (data_changed) {
 		cache_misses++;
 		if (p_source.force_rebuild) {
@@ -1254,7 +1266,9 @@ void RenderRaytracing::_populate_surface_blas(
 		bool p_allow_update,
 		uint32_t p_cache_key,
 		RTSurfaceData *r_surf_data,
-		LocalVector<RID> &r_dirty_blas_list) {
+		LocalVector<RID> &r_dirty_blas_list,
+		RID p_opacity_micromap,
+		uint32_t p_opacity_micromap_level) {
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, p_force_uncompressed, r_surf_data,
 			&vertex_buffer, &attribute_buffer, &index_buffer);
@@ -1314,12 +1328,22 @@ void RenderRaytracing::_populate_surface_blas(
 			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		}
 
+		if (p_opacity_micromap.is_valid()) {
+			// One entry per triangle, in triangle order (_omm_entry()): no index buffer.
+			as_geom.geometry.triangles.opacity_micromap = p_opacity_micromap;
+			RD::OpacityMicromapUsage usage;
+			usage.count = (index_count > 0 ? index_count : vertex_count) / 3;
+			usage.subdivision_level = p_opacity_micromap_level;
+			usage.format = RD::OPACITY_MICROMAP_FORMAT_4_STATE;
+			as_geom.geometry.triangles.opacity_micromap_usages.push_back(usage);
+		}
+
 		r_surf_data->blas = RD::get_singleton()->blas_create({ &as_geom, 1 }, as_flags);
 		if (!r_surf_data->blas.is_valid()) {
 			return;
 		}
 		RD::get_singleton()->set_resource_name(r_surf_data->blas,
-				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
+				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + (p_opacity_micromap.is_valid() ? "] OMM" : "]"));
 		r_dirty_blas_list.push_back(r_surf_data->blas);
 	}
 }
@@ -1583,6 +1607,270 @@ LocalVector<RD::Uniform> RenderRaytracing::_displace_frame_uniforms(RID p_job_bu
 		frame_uniforms.push_back(u);
 	}
 	return frame_uniforms;
+}
+
+// ---------------------------------------------------------------------------
+// Opacity micromaps
+// ---------------------------------------------------------------------------
+
+RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh) {
+	RD *rd = RD::get_singleton();
+	// GODOT_RT_OPACITY_MICROMAPS=0 turns them off without touching the project, for comparisons.
+	static const bool omm_enabled = GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && rd->has_feature(RD::SUPPORTS_OPACITY_MICROMAP) &&
+			OS::get_singleton()->get_environment("GODOT_RT_OPACITY_MICROMAPS") != "0";
+	if (!omm_enabled || !p_mat_data || !p_material.is_valid() || !p_mesh_surface || !p_mesh.is_valid()) {
+		return nullptr;
+	}
+
+	// The cut-out must be the same for every instance: a MultiMesh's instance colors multiply COLOR.
+	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	const uint32_t slot = p_mat_data->rt_sbt_offset;
+	if (slot != 0) {
+		const SceneShaderRaytracing::CustomShaderEntry *cse = rt_shader->get_custom_shader_entry(slot);
+		if (!cse || !cse->alpha_bakeable || (p_multimesh && cse->alpha_reads_color)) {
+			return nullptr;
+		}
+	} else if (p_multimesh && (p_mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR_ALBEDO)) {
+		return nullptr;
+	}
+
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	RTOmmKey key;
+	key.mesh = p_mesh;
+	key.surface_index = p_surface_index;
+	key.surface_counter = p_surface_counter;
+	key.material = p_material;
+	key.material_counter = p_material_counter;
+	// A surface baked once it lasts RT_OMM_STABLE_FRAMES: a sprite's mesh replaced every frame would be baked and its BLAS
+	// built again every frame.
+	static constexpr uint32_t RT_OMM_STABLE_FRAMES = 10;
+	RTOmmEntry *existing = omm_entries.getptr(key);
+	if (!existing) {
+		RTOmmEntry &waiting = omm_entries.insert(key, RTOmmEntry())->value;
+		waiting.first_seen_frame = current_frame;
+		waiting.last_used_frame = current_frame;
+		return nullptr;
+	}
+	existing->last_used_frame = current_frame;
+	if (existing->micromap.is_valid() || existing->failed) {
+		return existing->failed ? nullptr : existing;
+	}
+	if (current_frame - existing->first_seen_frame < RT_OMM_STABLE_FRAMES) {
+		return nullptr;
+	}
+
+	RTOmmEntry &entry = *existing;
+	entry.failed = true;
+
+	RID bake_shader;
+	const RID bake_pipeline = rt_shader->get_omm_bake_pipeline(slot, bake_shader);
+	if (!bake_pipeline.is_valid()) {
+		return nullptr;
+	}
+
+	// The surface at rest, as the mesh stores it: the micromap goes with its triangles, wherever they are moved.
+	RTSurfaceData rest;
+	RID vertex_buffer, attribute_buffer, index_buffer;
+	_fill_surface_geometry_data(p_mesh_surface, false, &rest, &vertex_buffer, &attribute_buffer, &index_buffer);
+	RT_GeometryData &geometry = rest.geometry;
+	if (vertex_buffer.is_valid()) {
+		geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+	}
+	if (attribute_buffer.is_valid()) {
+		geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+	}
+	if (index_buffer.is_valid() && geometry.index_format != RT_INDEX_FORMAT_NONE) {
+		geometry.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+	}
+	if (geometry.primitive_count == 0 || !vertex_buffer.is_valid()) {
+		return nullptr;
+	}
+
+	static const uint32_t max_level = CLAMP(uint32_t(int(GLOBAL_GET("rendering/pathtracing/opacity_micromap_subdivision_level"))), 1u, 8u);
+	// A surface of many triangles is subdivided less, to keep its micromap within RT_OMM_MAX_MICRO_TRIANGLES (16 MiB of
+	// states, one bake thread each); one too large even at level 1 goes without.
+	static constexpr uint64_t RT_OMM_MAX_MICRO_TRIANGLES = uint64_t(1) << 26;
+	const uint32_t triangle_count = geometry.primitive_count;
+	uint32_t level = max_level;
+	while (level > 1 && (uint64_t(triangle_count) << (level * 2)) > RT_OMM_MAX_MICRO_TRIANGLES) {
+		level--;
+	}
+	if ((uint64_t(triangle_count) << (level * 2)) > RT_OMM_MAX_MICRO_TRIANGLES) {
+		return nullptr;
+	}
+	const uint64_t bits_per_entry = (uint64_t(1) << (level * 2)) * 2;
+	const uint64_t data_size = STEPIFY((uint64_t(triangle_count) * bits_per_entry + 7) / 8, 4);
+	const uint64_t desc_size = uint64_t(triangle_count) * 8;
+	ERR_FAIL_COND_V(data_size > UINT32_MAX || desc_size > UINT32_MAX, nullptr);
+
+	const BitField<RD::BufferCreationBits> input_bits = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT;
+	entry.data_buffer = rd->storage_buffer_create(uint32_t(data_size), Span<uint8_t>(), 0, input_bits);
+	entry.desc_buffer = rd->storage_buffer_create(uint32_t(desc_size), Span<uint8_t>(), 0, input_bits);
+	ERR_FAIL_COND_V(!entry.data_buffer.is_valid() || !entry.desc_buffer.is_valid(), nullptr);
+	rd->set_resource_name(entry.data_buffer, "RT OMM data");
+	rd->set_resource_name(entry.desc_buffer, "RT OMM descriptions");
+
+	RD::OpacityMicromapUsage usage;
+	usage.count = triangle_count;
+	usage.subdivision_level = level;
+	usage.format = RD::OPACITY_MICROMAP_FORMAT_4_STATE;
+	entry.micromap = rd->opacity_micromap_create({ &usage, 1 }, entry.data_buffer, 0, entry.desc_buffer, 0);
+	ERR_FAIL_COND_V(!entry.micromap.is_valid(), nullptr);
+	rd->set_resource_name(entry.micromap, "RT OMM");
+	entry.level = level;
+
+	PendingOmmBake bake;
+	bake.shader = bake_shader;
+	bake.pipeline = bake_pipeline;
+	mat_ubo_pool_ensure_initialized();
+	bake.material_buffer = p_mat_data->uniform_buffer.is_valid() ? p_mat_data->uniform_buffer : mat_ubo_pool_buffer;
+	bake.data_buffer = entry.data_buffer;
+	bake.desc_buffer = entry.desc_buffer;
+	bake.micromap = entry.micromap;
+	bake.data_size = uint32_t(data_size);
+	bake.micro_triangles = triangle_count << (level * 2);
+	RT_OmmBakeJob &job = bake.job;
+	job.geometry = geometry;
+	job.material_address = p_mat_data->data.uniform_address;
+	job.triangle_count = triangle_count;
+	job.level = level;
+	job.data_offset = 0;
+	job.desc_offset = 0;
+	job.albedo_texture_idx = p_mat_data->data.albedo_texture_idx;
+	job.albedo_alpha = p_mat_data->data.albedo_color[3];
+	job.uv1_scale[0] = p_mat_data->data.uv1_scale[0];
+	job.uv1_scale[1] = p_mat_data->data.uv1_scale[1];
+	job.uv1_offset[0] = p_mat_data->data.uv1_offset[0];
+	job.uv1_offset[1] = p_mat_data->data.uv1_offset[1];
+	job.use_vertex_color = (p_mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR_ALBEDO) ? 1 : 0;
+	job.max_samples = 32;
+	pending_omm_bakes.push_back(bake);
+
+	entry.failed = false;
+	return &entry;
+}
+
+RID RenderRaytracing::_omm_static_blas(RTOmmEntry *p_entry, void *p_mesh_surface, LocalVector<RID> &r_dirty_blas_list) {
+	RD *rd = RD::get_singleton();
+	if (p_entry->surf_data.blas.is_valid() && rd->acceleration_structure_is_valid(p_entry->surf_data.blas)) {
+		return p_entry->surf_data.blas;
+	}
+	// The surface's BLAS again, as process_surface() builds it, with the micromap.
+	p_entry->surf_data = RTSurfaceData();
+	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, 0, &p_entry->surf_data, r_dirty_blas_list, p_entry->micromap, p_entry->level);
+	return p_entry->surf_data.blas;
+}
+
+void RenderRaytracing::_omm_dispatch_bakes() {
+	if (pending_omm_bakes.is_empty()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+
+	// The textures the materials registered are in the tables already.
+	const RID bindless_set = bindless_block->get_secondary_uniform_set(pending_omm_bakes[0].shader, 1);
+	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(pending_omm_bakes[0].shader, 2);
+	if (!bindless_set.is_valid() || !bindless_array_set.is_valid()) {
+		pending_omm_bakes.clear();
+		ERR_FAIL_MSG("RT: no bindless tables for the opacity micromap bakes.");
+	}
+
+	if (omm_job_capacity < pending_omm_bakes.size()) {
+		if (omm_job_buffer.is_valid()) {
+			rd->free_rid(omm_job_buffer);
+		}
+		omm_job_capacity = Math::next_power_of_2(pending_omm_bakes.size());
+		omm_job_buffer = rd->storage_buffer_create(omm_job_capacity * sizeof(RT_OmmBakeJob));
+		rd->set_resource_name(omm_job_buffer, "RT OMM bake jobs");
+	}
+	LocalVector<RT_OmmBakeJob> job_data;
+	job_data.resize(pending_omm_bakes.size());
+	for (uint32_t i = 0; i < pending_omm_bakes.size(); i++) {
+		job_data[i] = pending_omm_bakes[i].job;
+		// The bake ORs the states in.
+		rd->buffer_clear(pending_omm_bakes[i].data_buffer, 0, pending_omm_bakes[i].data_size);
+	}
+	rd->buffer_update(omm_job_buffer, 0, job_data.size() * sizeof(RT_OmmBakeJob), job_data.ptr());
+
+	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(omm_job_buffer);
+
+	rd->draw_command_begin_label("RT Bake Opacity Micromaps");
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	RID bound_pipeline;
+	LocalVector<RID> job_sets;
+	for (uint32_t i = 0; i < pending_omm_bakes.size(); i++) {
+		const PendingOmmBake &bake = pending_omm_bakes[i];
+		if (bake.pipeline != bound_pipeline) {
+			rd->compute_list_bind_compute_pipeline(compute_list, bake.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(bake.shader, 0, frame_uniforms), 0);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_set, 1);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_array_set, 2);
+			bound_pipeline = bake.pipeline;
+		}
+		RD::Uniform data(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, bake.data_buffer);
+		RD::Uniform descs(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, bake.desc_buffer);
+		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, bake.material_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ data, descs, material }, bake.shader, 3, /*p_linear_pool=*/true);
+		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
+		job_sets.push_back(job_set);
+
+		const uint32_t push_constant[4] = { i, 0, 0, 0 };
+		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
+		rd->compute_list_dispatch_threads(compute_list, bake.micro_triangles, 1, 1);
+	}
+	rd->compute_list_end();
+	for (const RID &job_set : job_sets) {
+		rd->free_rid(job_set);
+	}
+	// The micromaps, before the BLAS builds that read them.
+	for (const PendingOmmBake &bake : pending_omm_bakes) {
+		rd->opacity_micromap_build(bake.micromap);
+	}
+	rd->draw_command_end_label();
+	pending_omm_bakes.clear();
+}
+
+void RenderRaytracing::_omm_free_entry(RTOmmEntry &p_entry) {
+	RD *rd = RD::get_singleton();
+	// The BLAS goes with the mesh buffers it was built from, and with the micromap; the micromap with its buffers.
+	if (p_entry.surf_data.blas.is_valid() && rd->acceleration_structure_is_valid(p_entry.surf_data.blas)) {
+		rd->free_rid(p_entry.surf_data.blas);
+	}
+	if (p_entry.micromap.is_valid() && rd->acceleration_structure_is_valid(p_entry.micromap)) {
+		rd->free_rid(p_entry.micromap);
+	}
+	if (p_entry.data_buffer.is_valid()) {
+		rd->free_rid(p_entry.data_buffer);
+	}
+	if (p_entry.desc_buffer.is_valid()) {
+		rd->free_rid(p_entry.desc_buffer);
+	}
+	p_entry = RTOmmEntry();
+}
+
+void RenderRaytracing::_omm_evict(bool p_all) {
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	static const uint32_t ttl = uint32_t(int(GLOBAL_GET("rendering/pathtracing/static_cache_ttl_frames")));
+	LocalVector<RTOmmKey> expired;
+	for (KeyValue<RTOmmKey, RTOmmEntry> &E : omm_entries) {
+		// An entry still waiting to be baked holds nothing: one a second or two old is a surface that did not last.
+		const uint32_t entry_ttl = (E.value.micromap.is_valid() || E.value.failed) ? ttl : 120;
+		if (p_all || current_frame - E.value.last_used_frame > entry_ttl) {
+			_omm_free_entry(E.value);
+			expired.push_back(E.key);
+		}
+	}
+	for (const RTOmmKey &key : expired) {
+		omm_entries.erase(key);
+	}
+	if (p_all) {
+		pending_omm_bakes.clear();
+		if (omm_job_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(omm_job_buffer);
+			omm_job_buffer = RID();
+			omm_job_capacity = 0;
+		}
+	}
 }
 
 void RenderRaytracing::_displace_merged_multimeshes() {
@@ -3425,6 +3713,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
 	}
+	{
+		const uint32_t frame = RSG::rasterizer->get_frame_number();
+		if (frame - omm_sweep_frame >= 60) {
+			omm_sweep_frame = frame;
+			_omm_evict(false);
+		}
+	}
 
 	RTViewportState *state = _get_or_create_viewport_state(p_render_data);
 	if (!state) {
@@ -3490,6 +3785,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		Transform3D prev_instance_transform;
 		bool transform_moved;
 		RTMaterialData *mat_data;
+		RID material_rid;
+		bool material_ready; // Not the stand-in of a hit group still compiling.
 		uint32_t inst_flags;
 		bool per_instance; // One TLAS instance per instance (_build_tlas_with_expanded_multimeshes()), not a merged BLAS.
 	};
@@ -3639,8 +3936,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				RTMaterialData *mat_data = process_material(material_rid, material_counter);
 
+				bool mm_material_ready = true;
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+					mm_material_ready = false;
 					const SceneShaderForwardClustered::ShaderData *cut_shader = mm_surf->shader;
 					mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
 					if (!mat_data) {
@@ -3679,7 +3978,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 					}
 				}
-
 				// Near the camera, a material whose vertex() moves the MultiMesh (wind) is evaluated on it, as raster draws it.
 				bool displace = false;
 				bool reevaluate = false;
@@ -3782,6 +4080,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.prev_instance_transform = prev_instance_transform;
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
+				pending.material_rid = material_rid;
+				pending.material_ready = mm_material_ready;
 				pending.inst_flags = inst_flags;
 				pending.per_instance = per_instance;
 				pending_mm_surfaces.push_back(pending);
@@ -3876,9 +4176,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
+			// Not the stand-in of a hit group still compiling: its cut-out may be baked.
+			bool material_ready = true;
 
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+				material_ready = false;
 				const SceneShaderForwardClustered::ShaderData *cut_shader = surf->shader;
 				mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
 				if (!mat_data) {
@@ -3992,6 +4295,26 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
+			// A surface whose rays run an any-hit: its cut-out baked into an opacity micromap, when the material allows. A
+			// static surface's BLAS is built again with it; a deformed copy's is, the next frame (process_deformed_surface()).
+			{
+				RTOmmEntry *omm = nullptr;
+				if (material_ready && !front_layer && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
+					omm = _omm_entry(mesh_surface, surf->owner->data->base, surf->surface_index, surface_counter, material_rid, material_counter, mat_data, false);
+				}
+				if (surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED) {
+					RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(surf->rt_deformed_handle);
+					if (deformed) {
+						deformed->omm_micromap = omm ? omm->micromap : RID();
+						deformed->omm_level = omm ? omm->level : 0;
+					}
+				} else if (omm) {
+					const RID omm_blas = _omm_static_blas(omm, mesh_surface, dirty_blas_list);
+					if (omm_blas.is_valid()) {
+						blass[blass.size() - 1] = omm_blas;
+					}
+				}
+			}
 			if (front_layer) {
 				instance_masks.push_back(RT_INSTANCE_MASK_FRONT_LAYER);
 				front_layer_instance_count++;
@@ -4088,6 +4411,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			tlas_expand_geometry_templates.push_back(mm_geometry);
 			tlas_expand_material_templates.push_back(mm_material);
 			job.blas = surf_data->blas;
+			if (pending.material_ready && !(pending.inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
+				RTOmmEntry *omm = _omm_entry(pending.mesh_surface, mesh_storage->multimesh_get_mesh(pending.mm_rid), pending.surface_index, pending.surface_counter, pending.material_rid, pending.material_counter, pending.mat_data, true);
+				const RID omm_blas = omm ? _omm_static_blas(omm, pending.mesh_surface, dirty_blas_list) : RID();
+				if (omm_blas.is_valid()) {
+					job.blas = omm_blas;
+				}
+			}
 			job.mm_gpu_buffer = pending.mm_gpu_buffer;
 			job.count = pending.mm_count;
 			job.sbt_offset = pending.mat_data->rt_sbt_offset;
@@ -4311,6 +4641,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	// The records first: the instances written on the GPU add theirs after these.
 	finalize_buffers(state);
+	// The cut-outs baked into opacity micromaps and the micromaps built, before the BLASes that use them.
+	_omm_dispatch_bakes();
 	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 
 	return state;

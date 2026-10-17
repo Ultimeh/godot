@@ -3292,6 +3292,14 @@
 			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. The path tracer traces a MultiMesh as one TLAS instance per instance, sharing its mesh's BLAS, the instances written on the GPU from the MultiMesh's buffer; it merges only a MultiMesh whose material moves its vertices within [member rendering/pathtracing/multimesh_displacement_distance], since only a merged BLAS holds displaced vertices. Beyond this triangle count, such a MultiMesh is traced as one TLAS instance per instance too, at its rest positions. Lower this value to reduce peak GPU memory for large displaced MultiMeshes.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/opacity_micromap_subdivision_level" type="int" setter="" getter="" default="6">
+			Subdivision level of the opacity micromaps the path tracer bakes (see [member rendering/pathtracing/opacity_micromaps]): each triangle is divided into [code]4^level[/code] micro-triangles, each known opaque, known transparent or left to the material's alpha test. Higher levels skip more alpha tests along detailed cut-outs, at [code]4^level / 4[/code] bytes per alpha-tested triangle (1 KiB at the default of 6) and a longer bake. A surface of many triangles is subdivided less, so that its micromap stays within 16 MiB.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/opacity_micromaps" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the path tracer bakes the cut-out of alpha-tested surfaces (alpha scissor, [code]discard[/code]) into opacity micromaps when the rendering device supports them, so that rays skip the alpha test wherever a part of a triangle is known to be opaque or transparent. A material's cut-out is baked only when it depends on nothing but the surface's vertex attributes, the material's parameters and textures, and constants: not on time, the camera, the instance or global shader parameters. The decision is taken at the textures' full resolution: a distant ray reading a smaller mipmap may see the edges of a cut-out slightly differently than without micromaps.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/static_cache_ttl_frames" type="int" setter="" getter="" default="3600">
 			Number of frames the path tracer keeps the BLAS of a static mesh surface, and the data of a material, after the last frame it traced them. At 60 fps, the default of 3600 corresponds to approximately one minute. A level left behind, or meshes and materials a game rebuilds, are freed after that instead of staying until no view path traces anymore. Decrease this value to reclaim GPU memory sooner; increase it to avoid rebuilding acceleration structures when returning to a place.
 			[b]Note:[/b] Requires a restart to take effect.
