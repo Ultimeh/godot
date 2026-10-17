@@ -90,6 +90,8 @@ vec2 read_viewport_size = vec2(1.0);
 bool rt_front_facing = true;
 vec2 rt_screen_uv = vec2(0.0);
 vec4 rt_frag_coord = vec4(0.0);
+vec2 rt_point_coord = vec2(0.5); // A ray hits no point sprite: its center.
+vec3 eye_offset = vec3(0.0); // One view.
 float alpha_antialiasing_edge = 0.0;
 vec2 alpha_texture_coordinate = vec2(0.0);
 

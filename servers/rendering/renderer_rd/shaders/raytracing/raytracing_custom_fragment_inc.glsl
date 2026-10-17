@@ -194,6 +194,17 @@ float alpha_scissor_threshold = 0.0;
 float alpha_hash_scale = 1.0;
 float alpha_antialiasing_edge = 0.0;
 vec2 alpha_texture_coordinate = vec2(0.0);
+// Outputs of raster's the path tracer has no use for, declared so that a shader writing them is still traced (it did not
+// compile): premultiplied alpha and depth change raster's blending and depth buffer, the custom radiance and
+// irradiance its ambient light, the transmittance its subsurface scattering, LIGHT_VERTEX the point its lights shade.
+float premul_alpha = 1.0;
+float rt_depth = 0.0;
+vec4 custom_radiance = vec4(0.0);
+vec4 custom_irradiance = vec4(0.0);
+vec4 transmittance_color = vec4(0.0);
+float transmittance_depth = 0.0;
+float transmittance_boost = 0.0;
+vec3 light_vertex = vertex;
 
 {
 	/* RT_CUSTOM_FRAGMENT_CODE */
