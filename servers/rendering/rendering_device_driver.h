@@ -75,6 +75,8 @@ struct VersatileResourceTemplate {
 
 	template <typename T>
 	static T *allocate(PagedAllocator<VersatileResourceTemplate, true> &p_allocator) {
+		// A type left out of RESOURCE_TYPES and larger than all of them would overwrite its neighbors in the page.
+		static_assert(sizeof(T) <= MAX_RESOURCE_SIZE, "Add this type to the driver's VersatileResource list.");
 		T *obj = (T *)p_allocator.alloc();
 		memnew_placement(obj, T);
 		return obj;
