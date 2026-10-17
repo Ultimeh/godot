@@ -55,6 +55,13 @@ namespace Godot
                     self.Dispose();
             }
 
+            // An instance already collected but not yet finalized has a cleared weak reference, so the loops above
+            // skip it. The .NET runtime is never shut down: its finalizer would run later on the finalizer thread,
+            // while the engine is being torn down (e.g. a typed Array releasing the last reference to a CSharpScript
+            // after CSharpLanguage is deleted). Run those finalizers now, while everything they release still exists.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+
             if (isStdoutVerbose)
                 GD.Print("Unloading: Finished disposing tracked instances.");
         }
