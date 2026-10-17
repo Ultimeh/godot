@@ -946,6 +946,8 @@ public:
 		BUFFER_CREATION_AS_STORAGE_BIT = (1 << 1),
 		BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT = (1 << 2),
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 3),
+		// Read by an opacity micromap build (opacity_micromap_create()), storage buffers only. Not exposed to scripts.
+		BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT = (1 << 4),
 	};
 
 	enum StorageBufferUsage {
@@ -1484,6 +1486,16 @@ public:
 			RID index_buffer;
 			uint32_t index_offset = 0;
 			uint32_t index_count = 0;
+			// An opacity micromap (opacity_micromap_create()), or none. Each triangle's entry index (or
+			// OpacityMicromapSpecialIndex), plus opacity_micromap_base_triangle, in a storage buffer made with
+			// BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT; how
+			// many triangles reference entries of each subdivision level and format (the special indices not counted).
+			RID opacity_micromap;
+			RID opacity_micromap_index_buffer;
+			uint32_t opacity_micromap_index_offset = 0;
+			IndexBufferFormat opacity_micromap_index_format = INDEX_BUFFER_FORMAT_UINT32;
+			uint32_t opacity_micromap_base_triangle = 0;
+			Vector<OpacityMicromapUsage> opacity_micromap_usages;
 		};
 
 		// Procedural geometry: buffer of float3 (min, max) AABB pairs.
@@ -1511,6 +1523,14 @@ public:
 
 	RID blas_create(Span<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags);
 	RID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags);
+
+	// An opacity micromap (SUPPORTS_OPACITY_MICROMAP): the entries p_usages counts, each described by 8 bytes in
+	// p_triangle_buffer (see OpacityMicromapFormat), their states in p_data_buffer; both storage buffers made with
+	// BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT, both offsets
+	// multiples of OPACITY_MICROMAP_INPUT_ALIGNMENT. Build it (opacity_micromap_build()) before the BLASes that
+	// reference it; freeing it (or one of its buffers) frees them.
+	RID opacity_micromap_create(Span<OpacityMicromapUsage> p_usages, RID p_data_buffer, uint32_t p_data_offset, RID p_triangle_buffer, uint32_t p_triangle_offset);
+	Error opacity_micromap_build(RID p_opacity_micromap);
 
 	typedef int64_t HitShaderBindingTableRange;
 

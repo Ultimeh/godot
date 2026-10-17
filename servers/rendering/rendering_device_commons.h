@@ -913,6 +913,36 @@ public:
 	enum AccelerationStructureType {
 		ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
 		ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+		// Not an acceleration structure, but built and tracked as one (D3D12 builds it with the same call).
+		ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP,
+	};
+
+	// Opacity micromaps (VK_EXT_opacity_micromap, D3D12 opacity micromap arrays): the opacity of the micro-triangles of
+	// each triangle that references an entry, so that traversal runs no alpha test where they are known opaque or
+	// transparent. Both APIs share the layouts and values below: an entry is described by 8 bytes (the byte offset of its
+	// states in the data, u32; its subdivision level, u16; its format, u16), a triangle references one by a u16 or u32
+	// index, or by a special index.
+	enum OpacityMicromapFormat {
+		OPACITY_MICROMAP_FORMAT_2_STATE = 1, // 1 bit per micro-triangle: transparent, opaque.
+		OPACITY_MICROMAP_FORMAT_4_STATE = 2, // 2 bits: transparent, opaque, unknown transparent, unknown opaque.
+	};
+
+	enum OpacityMicromapSpecialIndex {
+		OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT = -1,
+		OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE = -2,
+		OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT = -3,
+		OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE = -4,
+	};
+
+	// The data and the entries' descriptions start at addresses aligned to this (both APIs).
+	static constexpr uint32_t OPACITY_MICROMAP_INPUT_ALIGNMENT = 256;
+
+	// How many entries (or triangles referencing entries) have a subdivision level and a format. Same layout as
+	// VkMicromapUsageEXT and D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY.
+	struct OpacityMicromapUsage {
+		uint32_t count = 0;
+		uint32_t subdivision_level = 0;
+		OpacityMicromapFormat format = OPACITY_MICROMAP_FORMAT_2_STATE;
 	};
 
 	enum AccelerationStructureFlagBits {
@@ -1042,6 +1072,8 @@ public:
 		SUPPORTS_SHADER_OUTPUT_LAYER,
 		// Ray tracing shaders may reorder invocations (hit objects; VK_EXT_ray_tracing_invocation_reorder). Not exposed to scripts.
 		SUPPORTS_SHADER_EXECUTION_REORDERING,
+		// Opacity micromaps (RenderingDevice::opacity_micromap_create()), honored by every ray. Not exposed to scripts.
+		SUPPORTS_OPACITY_MICROMAP,
 	};
 
 	enum SubgroupOperations {

@@ -1110,6 +1110,10 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				const RecordedBottomLevelAccelerationStructureBuildCommand *blas_update_command = reinterpret_cast<const RecordedBottomLevelAccelerationStructureBuildCommand *>(command);
 				driver->command_update_blas(r_command_buffer, blas_update_command->acceleration_structure, blas_update_command->scratch_buffer, blas_update_command->scratch_offset);
 			} break;
+			case RecordedCommand::TYPE_OPACITY_MICROMAP_BUILD: {
+				const RecordedBottomLevelAccelerationStructureBuildCommand *micromap_build_command = reinterpret_cast<const RecordedBottomLevelAccelerationStructureBuildCommand *>(command);
+				driver->command_build_opacity_micromap(r_command_buffer, micromap_build_command->acceleration_structure, micromap_build_command->scratch_buffer, micromap_build_command->scratch_offset);
+			} break;
 			case RecordedCommand::TYPE_TOP_LEVEL_ACCELERATION_STRUCTURE_BUILD: {
 				const RecordedTopLevelAccelerationStructureBuildCommand *tlas_build_command = reinterpret_cast<const RecordedTopLevelAccelerationStructureBuildCommand *>(command);
 				driver->command_build_tlas(r_command_buffer, tlas_build_command->acceleration_structure, tlas_build_command->scratch_buffer, tlas_build_command->instance_buffer, tlas_build_command->instance_offset, tlas_build_command->instance_count, VectorView<RDD::AccelerationStructureID>(tlas_build_command->blases(), tlas_build_command->blas_count));
@@ -2419,6 +2423,36 @@ void RenderingDeviceGraph::add_blas_build(RDD::AccelerationStructureID p_acceler
 
 	for (uint32_t i = 0; i < p_src_trackers.size(); ++i) {
 		trackers[i] = p_src_trackers[i];
+		// Buffers, and the opacity micromaps the geometries reference.
+		usages[i] = p_src_trackers[i]->buffer_driver_id.id != 0 ? RESOURCE_USAGE_STORAGE_BUFFER_READ : RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ;
+	}
+
+	trackers[resource_count - 1] = p_dst_tracker;
+	usages[resource_count - 1] = RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
+
+	_add_command_to_graph(trackers.ptr(), usages.ptr(), usages.size(), command_index, command);
+}
+
+void RenderingDeviceGraph::add_opacity_micromap_build(RDD::AccelerationStructureID p_opacity_micromap, RDD::BufferID p_scratch_buffer, uint64_t p_scratch_offset, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers) {
+	int32_t command_index;
+	RecordedBottomLevelAccelerationStructureBuildCommand *command = static_cast<RecordedBottomLevelAccelerationStructureBuildCommand *>(_allocate_command(sizeof(RecordedBottomLevelAccelerationStructureBuildCommand), command_index));
+	command->type = RecordedCommand::TYPE_OPACITY_MICROMAP_BUILD;
+	// D3D12 builds it as an acceleration structure. Vulkan's micromap build stage and accesses exist only in
+	// synchronization2: its driver adds barriers around the build.
+	command->self_stages = RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT;
+	command->acceleration_structure = p_opacity_micromap;
+	command->scratch_buffer = p_scratch_buffer;
+	command->scratch_offset = p_scratch_offset;
+
+	thread_local LocalVector<ResourceTracker *> trackers;
+	thread_local LocalVector<ResourceUsage> usages;
+
+	uint32_t resource_count = p_src_trackers.size() + 1;
+	trackers.resize(resource_count);
+	usages.resize(resource_count);
+
+	for (uint32_t i = 0; i < p_src_trackers.size(); ++i) {
+		trackers[i] = p_src_trackers[i];
 		usages[i] = RESOURCE_USAGE_STORAGE_BUFFER_READ;
 	}
 
@@ -2446,7 +2480,7 @@ void RenderingDeviceGraph::add_blas_update(RDD::AccelerationStructureID p_accele
 
 	for (uint32_t i = 0; i < p_src_trackers.size(); ++i) {
 		trackers[i] = p_src_trackers[i];
-		usages[i] = RESOURCE_USAGE_STORAGE_BUFFER_READ;
+		usages[i] = p_src_trackers[i]->buffer_driver_id.id != 0 ? RESOURCE_USAGE_STORAGE_BUFFER_READ : RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ;
 	}
 
 	trackers[resource_count - 1] = p_dst_tracker;
@@ -3421,6 +3455,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 			2, // TYPE_CAPTURE_TIMESTAMP
 			5, // TYPE_DRIVER_CALLBACK
 			6, // TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE
+			6, // TYPE_OPACITY_MICROMAP_BUILD
 		};
 		static_assert(std_size(PriorityTable) == RecordedCommand::TYPE_MAX, "PriorityTable must have one entry per RecordedCommand::Type");
 

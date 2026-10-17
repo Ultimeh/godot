@@ -451,6 +451,43 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 					t_out.index_count = 0;
 					t_out.index_format = {};
 				}
+
+				t_out.opacity_micromap = RDD::AccelerationStructureID();
+				t_out.opacity_micromap_index_buffer = RDD::BufferID();
+				t_out.opacity_micromap_index_offset = 0;
+				t_out.opacity_micromap_index_format = INDEX_BUFFER_FORMAT_UINT32;
+				t_out.opacity_micromap_base_triangle = 0;
+				t_out.opacity_micromap_usages = nullptr;
+				t_out.opacity_micromap_usage_count = 0;
+				if (t_in.opacity_micromap.is_valid()) {
+					ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The current rendering device has no opacity micromap support.");
+					AccelerationStructure *micromap = acceleration_structure_owner.get_or_null(t_in.opacity_micromap);
+					ERR_FAIL_COND_V_MSG(micromap == nullptr || micromap->type != RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP, RID(), "The opacity micromap is not valid.");
+					Buffer *micromap_index_buffer = storage_buffer_owner.get_or_null(t_in.opacity_micromap_index_buffer);
+					ERR_FAIL_NULL_V_MSG(micromap_index_buffer, RID(), "The opacity micromap index buffer must be a valid storage buffer.");
+					ERR_FAIL_COND_V_MSG(!micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT), RID(),
+							"The opacity micromap index buffer must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT.");
+					const uint32_t triangle_count = t_in.index_buffer.is_valid() ? t_in.index_count / 3 : t_in.vertex_count / 3;
+					const uint32_t micromap_index_stride = t_in.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+					ERR_FAIL_COND_V_MSG(t_in.opacity_micromap_index_offset + uint64_t(triangle_count) * micromap_index_stride > micromap_index_buffer->size, RID(), "The opacity micromap index buffer is smaller than the triangles' indices.");
+
+					t_out.opacity_micromap = micromap->driver_id;
+					t_out.opacity_micromap_index_buffer = micromap_index_buffer->driver_id;
+					t_out.opacity_micromap_index_offset = t_in.opacity_micromap_index_offset;
+					t_out.opacity_micromap_index_format = t_in.opacity_micromap_index_format;
+					t_out.opacity_micromap_base_triangle = t_in.opacity_micromap_base_triangle;
+					t_out.opacity_micromap_usages = t_in.opacity_micromap_usages.ptr();
+					t_out.opacity_micromap_usage_count = t_in.opacity_micromap_usages.size();
+
+					// The BLAS build reads both.
+					draw_trackers.push_back(micromap->draw_tracker);
+					if (micromap_index_buffer->draw_tracker != nullptr) {
+						draw_trackers.push_back(micromap_index_buffer->draw_tracker);
+					} else {
+						untracked_buffers.insert(t_in.opacity_micromap_index_buffer);
+					}
+					_check_transfer_worker_buffer(micromap_index_buffer);
+				}
 			} break;
 
 			case AccelerationStructureGeometry::TYPE_AABBS: {
@@ -506,6 +543,10 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 				_add_dependency(id, geometry.geometry.triangles.vertex_buffer);
 				if (geometry.geometry.triangles.index_buffer.is_valid()) {
 					_add_dependency(id, geometry.geometry.triangles.index_buffer);
+				}
+				if (geometry.geometry.triangles.opacity_micromap.is_valid()) {
+					_add_dependency(id, geometry.geometry.triangles.opacity_micromap);
+					_add_dependency(id, geometry.geometry.triangles.opacity_micromap_index_buffer);
 				}
 			} break;
 			case AccelerationStructureGeometry::TYPE_AABBS: {
@@ -563,6 +604,77 @@ RID RenderingDevice::tlas_create(uint32_t p_max_instance_count, BitField<Acceler
 	set_resource_name(id, "RID:" + itos(id.get_id()));
 #endif
 	return id;
+}
+
+RID RenderingDevice::opacity_micromap_create(Span<OpacityMicromapUsage> p_usages, RID p_data_buffer, uint32_t p_data_offset, RID p_triangle_buffer, uint32_t p_triangle_offset) {
+	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The current rendering device has no opacity micromap support.");
+	ERR_FAIL_COND_V_MSG(p_usages.is_empty(), RID(), "An opacity micromap needs at least one entry.");
+
+	uint64_t entry_count = 0;
+	for (const OpacityMicromapUsage &usage : p_usages) {
+		entry_count += usage.count;
+	}
+	Buffer *data_buffer = storage_buffer_owner.get_or_null(p_data_buffer);
+	ERR_FAIL_NULL_V_MSG(data_buffer, RID(), "The opacity micromap data buffer must be a valid storage buffer.");
+	ERR_FAIL_COND_V_MSG(p_data_offset >= data_buffer->size, RID(), "The opacity micromap data offset is outside its buffer.");
+	Buffer *triangle_buffer = storage_buffer_owner.get_or_null(p_triangle_buffer);
+	ERR_FAIL_NULL_V_MSG(triangle_buffer, RID(), "The opacity micromap triangle buffer must be a valid storage buffer.");
+	ERR_FAIL_COND_V_MSG(p_triangle_offset + entry_count * 8 > triangle_buffer->size, RID(), "The opacity micromap triangle buffer is smaller than its entries' descriptions (8 bytes each).");
+	for (const Buffer *buffer : { data_buffer, triangle_buffer }) {
+		ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !buffer->usage.has_flag(RDD::BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT), RID(),
+				"The opacity micromap buffers must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT.");
+	}
+	ERR_FAIL_COND_V_MSG((p_data_offset % OPACITY_MICROMAP_INPUT_ALIGNMENT) != 0 || (p_triangle_offset % OPACITY_MICROMAP_INPUT_ALIGNMENT) != 0, RID(),
+			vformat("The opacity micromap data and triangle offsets must be multiples of %d bytes.", OPACITY_MICROMAP_INPUT_ALIGNMENT));
+
+	AccelerationStructure micromap;
+	micromap.type = RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP;
+	micromap.driver_id = driver->opacity_micromap_create(VectorView<OpacityMicromapUsage>(p_usages.ptr(), p_usages.size()), data_buffer->driver_id, p_data_offset, triangle_buffer->driver_id, p_triangle_offset);
+	ERR_FAIL_COND_V_MSG(!micromap.driver_id, RID(), "Failed to create the opacity micromap.");
+
+	micromap.draw_tracker = RDG::resource_tracker_create();
+	micromap.draw_tracker->acceleration_structure_driver_id = micromap.driver_id;
+	micromap.draw_tracker->usage = RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
+	for (Buffer *buffer : { data_buffer, triangle_buffer }) {
+		if (buffer->draw_tracker != nullptr) {
+			micromap.draw_trackers.push_back(buffer->draw_tracker);
+		}
+		_check_transfer_worker_buffer(buffer);
+	}
+	if (data_buffer->draw_tracker == nullptr) {
+		micromap.untracked_buffers.insert(p_data_buffer);
+	}
+	if (triangle_buffer->draw_tracker == nullptr) {
+		micromap.untracked_buffers.insert(p_triangle_buffer);
+	}
+
+	RID id = acceleration_structure_owner.make_rid(micromap);
+#ifdef DEV_ENABLED
+	set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+	_add_dependency(id, p_data_buffer);
+	_add_dependency(id, p_triangle_buffer);
+	return id;
+}
+
+Error RenderingDevice::opacity_micromap_build(RID p_opacity_micromap) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building an opacity micromap is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building an opacity micromap is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building an opacity micromap is forbidden during creation of a raytracing list.");
+
+	AccelerationStructure *micromap = acceleration_structure_owner.get_or_null(p_opacity_micromap);
+	ERR_FAIL_COND_V_MSG(micromap == nullptr || micromap->type != RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP, ERR_INVALID_PARAMETER, "Opacity micromap argument is not valid.");
+
+	RDD::BufferID scratch_buffer;
+	uint64_t scratch_offset = 0;
+	Error err = _acceleration_structure_scratch_allocate(driver->acceleration_structure_get_scratch_size_bytes(micromap->driver_id), scratch_buffer, scratch_offset);
+	ERR_FAIL_COND_V(err != OK, err);
+
+	draw_graph->add_opacity_micromap_build(micromap->driver_id, scratch_buffer, scratch_offset, micromap->draw_tracker, micromap->draw_trackers);
+	micromap->invalidated = false;
+	return OK;
 }
 
 bool RenderingDevice::acceleration_structure_is_valid(RID p_acceleration_structure) {
@@ -1782,6 +1894,10 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 				"The GPU doesn't support acceleration structure build input flag.");
 #endif
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	}
+	if (p_creation_bits.has_flag(BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT)) {
+		ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The GPU doesn't support opacity micromaps.");
+		buffer.usage.set_flag(RDD::BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT);
 	}
 
 	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);

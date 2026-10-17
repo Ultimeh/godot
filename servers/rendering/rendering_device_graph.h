@@ -121,6 +121,7 @@ public:
 			TYPE_CAPTURE_TIMESTAMP,
 			TYPE_DRIVER_CALLBACK,
 			TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE,
+			TYPE_OPACITY_MICROMAP_BUILD,
 			TYPE_MAX
 		};
 
@@ -1056,6 +1057,7 @@ public:
 	void begin();
 	void add_blas_build(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, uint64_t p_scratch_offset, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_blas_update(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, uint64_t p_scratch_offset, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
+	void add_opacity_micromap_build(RDD::AccelerationStructureID p_opacity_micromap, RDD::BufferID p_scratch_buffer, uint64_t p_scratch_offset, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_tlas_build(RDD::AccelerationStructureID p_tlas, RDD::BufferID p_scratch_buffer, RDD::BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, VectorView<RDD::AccelerationStructureID> p_blases, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size);
 	void add_buffer_copy(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, RDD::BufferCopyRegion p_region);
