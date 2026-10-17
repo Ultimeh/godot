@@ -2346,15 +2346,33 @@ void main() {
 	hvec4 out_color = hvec4(emission + ambient_light + diffuse_light + direct_specular_light + indirect_specular_light, alpha);
 #endif // MODE_UNSHADED
 
+#if defined(PREMUL_ALPHA_USED) && defined(BLEND_PREMUL_ALPHA_USED)
+	// Before the fog, which adds alpha of its own color whatever this factor.
+	out_color.rgb *= premul_alpha;
+#endif
+
 #ifndef FOG_DISABLED
 	// Draw "fixed" fog before volumetric fog to ensure volumetric fog can appear in front of the sky.
+	// Only the mix blend mode scales the surface and its fog by alpha: the others see through the surface what is behind
+	// it, already fogged, so the surface may only add the fog of what it covers (premultiplied alpha), none of it (add and
+	// subtract), or fade its effect as the fog hides it (multiply).
+#if defined(BLEND_PREMUL_ALPHA_USED)
+	out_color.rgb = out_color.rgb * (half(1.0) - fog.a) + fog.rgb * (fog.a * out_color.a);
+#elif defined(BLEND_ADD_USED) || defined(BLEND_SUB_USED)
+	out_color.rgb *= half(1.0) - fog.a;
+#elif defined(BLEND_MUL_USED)
+	out_color.rgb = mix(out_color.rgb, hvec3(1.0), fog.a);
+#else
 	out_color.rgb = mix(out_color.rgb, fog.rgb, fog.a);
+#endif
 #endif // !FOG_DISABLED
 
 	// On mobile we use a UNORM buffer with 10bpp which results in a range from 0.0 - 1.0 resulting in HDR breaking
 	// We divide by sc_luminance_multiplier to support a range from 0.0 - 2.0 both increasing precision on bright and darker images
+#ifndef BLEND_MUL_USED
 	out_color.rgb = out_color.rgb / sc_luminance_multiplier();
-#ifdef PREMUL_ALPHA_USED
+#endif // A multiplication factor is not light: dividing it would darken what is behind.
+#if defined(PREMUL_ALPHA_USED) && !defined(BLEND_PREMUL_ALPHA_USED)
 	out_color.rgb *= premul_alpha;
 #endif
 

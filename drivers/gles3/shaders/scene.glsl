@@ -2787,7 +2787,24 @@ void main() {
 	fog.xy = unpackHalf2x16(fog_rg);
 	fog.zw = unpackHalf2x16(fog_ba);
 
+	// Only the mix blend mode scales the surface and its fog by alpha: the others see through the surface what is behind
+	// it, already fogged, so the surface may only add the fog of what it covers (premultiplied alpha), none of it (add and
+	// subtract), or fade its effect as the fog hides it (multiply).
+#if defined(BLEND_PREMUL_ALPHA_USED)
+#ifdef PREMUL_ALPHA_USED
+	// PREMUL_ALPHA_FACTOR scales the whole color at the end, after the conversion to the framebuffer's encoding.
+	float fog_coverage = alpha / max(premul_alpha, 0.0001);
+#else
+	float fog_coverage = alpha;
+#endif
+	frag_color.rgb = frag_color.rgb * (1.0 - fog.a) + fog.rgb * (fog.a * fog_coverage);
+#elif defined(BLEND_ADD_USED) || defined(BLEND_SUB_USED)
+	frag_color.rgb *= 1.0 - fog.a;
+#elif defined(BLEND_MUL_USED)
+	frag_color.rgb = mix(frag_color.rgb, vec3(1.0), fog.a);
+#else
 	frag_color.rgb = mix(frag_color.rgb, fog.rgb, fog.a);
+#endif
 #endif // !FOG_DISABLED
 
 	// Tonemap before writing as we are writing to an sRGB framebuffer

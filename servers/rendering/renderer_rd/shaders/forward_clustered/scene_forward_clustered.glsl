@@ -3188,11 +3188,28 @@ void fragment_shader(in SceneData scene_data) {
 //frag_color = vec4(1.0);
 #endif //USE_NO_SHADING
 
+#if defined(PREMUL_ALPHA_USED) && defined(BLEND_PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
+	// Before the fog, which adds alpha of its own light whatever this factor.
+	frag_color.rgb *= premul_alpha;
+#endif
+
 #ifndef FOG_DISABLED
+	// fog.a is the transmittance to the camera, fog.rgb the light the fog adds in front of the surface. Only the mix blend
+	// mode scales them both by alpha: the others see through the surface what is behind it, already fogged, so the
+	// surface may only add the fog of what it covers (premultiplied alpha), none of it (add and subtract), or fade its
+	// effect as the fog hides it (multiply).
+#if defined(BLEND_PREMUL_ALPHA_USED)
+	frag_color.rgb = frag_color.rgb * fog.a + fog.rgb * alpha;
+#elif defined(BLEND_ADD_USED) || defined(BLEND_SUB_USED)
+	frag_color.rgb *= fog.a;
+#elif defined(BLEND_MUL_USED)
+	frag_color.rgb = mix(vec3(1.0), frag_color.rgb, fog.a);
+#else
 	frag_color.rgb = frag_color.rgb * fog.a + fog.rgb;
+#endif
 #endif //!FOG_DISABLED
 
-#if defined(PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
+#if defined(PREMUL_ALPHA_USED) && !defined(BLEND_PREMUL_ALPHA_USED) && !defined(MODE_RENDER_DEPTH)
 	frag_color.rgb *= premul_alpha;
 #endif //PREMUL_ALPHA_USED
 
