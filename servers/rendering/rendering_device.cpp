@@ -8435,6 +8435,10 @@ void RenderingDevice::_free_internal(RID p_id) {
 		acceleration_structure_owner.free(p_id);
 	} else if (raytracing_pipeline_owner.owns(p_id)) {
 		RaytracingPipeline *pipeline = raytracing_pipeline_owner.get_or_null(p_id);
+		// The SBT's upload goes through a transfer worker that is only submitted once a frame uses it. A pipeline freed
+		// before it was ever bound would otherwise have its buffer destroyed while the copy into it is still recorded.
+		_check_transfer_worker_buffer(&pipeline->sbt_buffer);
+
 		frames[frame].raytracing_pipelines_to_dispose_of.push_back(*pipeline);
 		raytracing_pipeline_owner.free(p_id);
 	} else if (hit_sbt_owner.owns(p_id)) {
