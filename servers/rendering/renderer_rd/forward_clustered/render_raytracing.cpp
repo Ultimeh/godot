@@ -102,13 +102,6 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	sky_guide_shader.version = sky_guide_shader.shader.version_create();
 	sky_guide_shader.version_shader = sky_guide_shader.shader.version_get_shader(sky_guide_shader.version, 0);
 	sky_guide_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_guide_shader.version_shader);
-
-	Vector<String> background_output_modes;
-	background_output_modes.push_back("\n");
-	background_output_shader.shader.initialize(background_output_modes);
-	background_output_shader.version = background_output_shader.shader.version_create();
-	background_output_shader.version_shader = background_output_shader.shader.version_get_shader(background_output_shader.version, 0);
-	background_output_shader.pipeline = RD::get_singleton()->compute_pipeline_create(background_output_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -158,7 +151,6 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 	sky_guide_shader.shader.version_free(sky_guide_shader.version);
-	background_output_shader.shader.version_free(background_output_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -5647,60 +5639,6 @@ void RenderRaytracing::dlss_rr_write_background_albedo(const RenderDataRD *p_ren
 	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_guide_shader.version_shader, 0, color, depth, albedo), 0);
 	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SkyGuideShader::PushConstant));
 	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
-	rd->compute_list_end();
-}
-
-RID RenderRaytracing::dlss_rr_get_background_output(RenderSceneBuffersRD *p_render_buffers) {
-	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	// The composition writes Ray Reconstruction's output as an rgba16f image; a single view only, as the background
-	// is drawn once.
-	if (!dlss_rr_has_buffers(p_render_buffers) || !rt_has_depth_texture(p_render_buffers) || !p_render_buffers->has_upscaled_texture() ||
-			p_render_buffers->get_view_count() != 1 || p_render_buffers->get_base_data_format() != RD::DATA_FORMAT_R16G16B16A16_SFLOAT) {
-		return RID();
-	}
-	const Size2i size = p_render_buffers->get_target_size();
-	if (p_render_buffers->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND) && p_render_buffers->get_texture_slice_size(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND, 0) == size) {
-		return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND);
-	}
-	return p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
-			RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT, RD::TEXTURE_SAMPLES_1, size);
-}
-
-RID RenderRaytracing::dlss_rr_get_color_before_effects(RenderSceneBuffersRD *p_render_buffers) {
-	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	if (p_render_buffers->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS)) {
-		return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS);
-	}
-	// As the color before transparency, which it stands for: the composition compares it with the internal color.
-	return p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_EFFECTS, p_render_buffers->get_base_data_format(),
-			RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT, RD::TEXTURE_SAMPLES_1);
-}
-
-void RenderRaytracing::dlss_rr_composite_background(const RenderDataRD *p_render_data, RID p_unchanged_reference) {
-	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
-	ERR_FAIL_COND(rb.is_null());
-	ERR_FAIL_COND(!rb->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND));
-
-	BackgroundOutputShader::PushConstant push_constant = {};
-	const Size2i output_size = rb->get_target_size();
-	const Size2i internal_size = rb->get_internal_size();
-	push_constant.output_size[0] = output_size.width;
-	push_constant.output_size[1] = output_size.height;
-	push_constant.internal_size[0] = internal_size.width;
-	push_constant.internal_size[1] = internal_size.height;
-
-	RD::Uniform background(RD::UNIFORM_TYPE_TEXTURE, 0, rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_BACKGROUND));
-	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
-	RD::Uniform color(RD::UNIFORM_TYPE_TEXTURE, 2, rb->get_internal_texture());
-	RD::Uniform color_before_transparency(RD::UNIFORM_TYPE_TEXTURE, 3, p_unchanged_reference);
-	RD::Uniform output(RD::UNIFORM_TYPE_IMAGE, 4, rb->get_upscaled_texture());
-
-	RD *rd = RD::get_singleton();
-	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, background_output_shader.pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(background_output_shader.version_shader, 0, background, depth, color, color_before_transparency, output), 0);
-	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(BackgroundOutputShader::PushConstant));
-	rd->compute_list_dispatch_threads(compute_list, output_size.width, output_size.height, 1);
 	rd->compute_list_end();
 }
 

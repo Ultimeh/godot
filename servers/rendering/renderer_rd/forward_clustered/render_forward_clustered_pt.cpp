@@ -32,7 +32,6 @@
 
 #include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
-#include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
@@ -422,18 +421,6 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		RD::get_singleton()->draw_command_end_label();
 	}
 
-	// Ray Reconstruction's background is drawn again at the output resolution, and replaces its output where nothing was
-	// drawn over it (dlss_rr_composite_background()). What the compositor effects draw over it from here on (a sky's
-	// volumetric clouds) must be kept as the transparent pass's is: the reference is the color before them.
-	RID background_reference;
-	if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr()) &&
-			(_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_OPAQUE, p_render_data) ||
-					_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_POST_SKY, p_render_data) ||
-					_has_compositor_effect(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data))) {
-		background_reference = raytracing->dlss_rr_get_color_before_effects(rb.ptr());
-		copy_effects->copy_to_rect(rb->get_internal_texture(), background_reference, Rect2i(Point2i(), rb->get_internal_size()));
-	}
-
 	{
 		// RT output is already in internal_texture, so the color MSAA resolve is
 		// skipped; only depth is resolved for compositor effects that need it.
@@ -586,27 +573,6 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			dlss_rr_guides.color_before_transparency = raytracing->dlss_rr_get_color_before_transparency(rb.ptr());
 		}
 		_render_3d_upscaling(p_render_data, scale_type, using_taa, time_step, dlss_rr_guides);
-
-		// Ray Reconstruction denoises the background too, and smears what is smaller than an internal pixel (stars
-		// behind moving clouds). The sky shader draws it again at the output resolution, without the jitter, and it
-		// replaces the denoiser's output where the camera rays missed.
-		RID background = (dlss_rr_guides.active && draw_sky) ? raytracing->dlss_rr_get_background_output(rb.ptr()) : RID();
-		if (background.is_valid()) {
-			RD::get_singleton()->draw_command_begin_label("Draw Sky At Output Resolution");
-			const Projection jittered_projection = sky.sky_scene_state.cam_projection;
-			Projection remove_jitter;
-			remove_jitter.add_jitter_offset(-p_render_data->scene_data->taa_jitter);
-			sky.sky_scene_state.cam_projection = remove_jitter * jittered_projection;
-
-			RID background_framebuffer = FramebufferCacheRD::get_singleton()->get_cache(background);
-			RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(background_framebuffer, RD::DRAW_DEFAULT_ALL);
-			sky.draw_sky(draw_list, rb, p_render_data->environment, background_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier);
-			RD::get_singleton()->draw_list_end();
-
-			sky.sky_scene_state.cam_projection = jittered_projection;
-			raytracing->dlss_rr_composite_background(p_render_data, background_reference.is_valid() ? background_reference : raytracing->dlss_rr_get_color_before_transparency(rb.ptr()));
-			RD::get_singleton()->draw_command_end_label();
-		}
 	}
 
 	if (scale_type != SCALE_3D_DLSS) {
