@@ -479,7 +479,8 @@ Light3D::Light3D(RSE::LightType p_type) {
 		};
 	}
 
-	RS::get_singleton()->instance_set_base(get_instance(), light);
+	// Through VisualInstance3D, so that get_base() returns the light (RenderingServer's light_* functions take it).
+	set_base(light);
 
 	set_color(Color(1, 1, 1, 1));
 	set_shadow(false);
@@ -519,7 +520,7 @@ Light3D::Light3D() {
 
 Light3D::~Light3D() {
 	ERR_FAIL_NULL(RenderingServer::get_singleton());
-	RS::get_singleton()->instance_set_base(get_instance(), RID());
+	set_base(RID());
 
 	if (light.is_valid()) {
 		RenderingServer::get_singleton()->free_rid(light);
