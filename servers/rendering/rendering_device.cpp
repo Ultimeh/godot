@@ -463,16 +463,20 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 					ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The current rendering device has no opacity micromap support.");
 					AccelerationStructure *micromap = acceleration_structure_owner.get_or_null(t_in.opacity_micromap);
 					ERR_FAIL_COND_V_MSG(micromap == nullptr || micromap->type != RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP, RID(), "The opacity micromap is not valid.");
-					Buffer *micromap_index_buffer = storage_buffer_owner.get_or_null(t_in.opacity_micromap_index_buffer);
-					ERR_FAIL_NULL_V_MSG(micromap_index_buffer, RID(), "The opacity micromap index buffer must be a valid storage buffer.");
-					ERR_FAIL_COND_V_MSG(!micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT), RID(),
-							"The opacity micromap index buffer must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT.");
-					const uint32_t triangle_count = t_in.index_buffer.is_valid() ? t_in.index_count / 3 : t_in.vertex_count / 3;
-					const uint32_t micromap_index_stride = t_in.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
-					ERR_FAIL_COND_V_MSG(t_in.opacity_micromap_index_offset + uint64_t(triangle_count) * micromap_index_stride > micromap_index_buffer->size, RID(), "The opacity micromap index buffer is smaller than the triangles' indices.");
+					// Without an index buffer, each triangle uses the entry of its own index (plus the base triangle).
+					Buffer *micromap_index_buffer = nullptr;
+					if (t_in.opacity_micromap_index_buffer.is_valid()) {
+						micromap_index_buffer = storage_buffer_owner.get_or_null(t_in.opacity_micromap_index_buffer);
+						ERR_FAIL_NULL_V_MSG(micromap_index_buffer, RID(), "The opacity micromap index buffer must be a valid storage buffer.");
+						ERR_FAIL_COND_V_MSG(!micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT), RID(),
+								"The opacity micromap index buffer must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT.");
+						const uint32_t triangle_count = t_in.index_buffer.is_valid() ? t_in.index_count / 3 : t_in.vertex_count / 3;
+						const uint32_t micromap_index_stride = t_in.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+						ERR_FAIL_COND_V_MSG(t_in.opacity_micromap_index_offset + uint64_t(triangle_count) * micromap_index_stride > micromap_index_buffer->size, RID(), "The opacity micromap index buffer is smaller than the triangles' indices.");
+					}
 
 					t_out.opacity_micromap = micromap->driver_id;
-					t_out.opacity_micromap_index_buffer = micromap_index_buffer->driver_id;
+					t_out.opacity_micromap_index_buffer = micromap_index_buffer ? micromap_index_buffer->driver_id : RDD::BufferID();
 					t_out.opacity_micromap_index_offset = t_in.opacity_micromap_index_offset;
 					t_out.opacity_micromap_index_format = t_in.opacity_micromap_index_format;
 					t_out.opacity_micromap_base_triangle = t_in.opacity_micromap_base_triangle;
@@ -481,12 +485,14 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 
 					// The BLAS build reads both.
 					draw_trackers.push_back(micromap->draw_tracker);
-					if (micromap_index_buffer->draw_tracker != nullptr) {
-						draw_trackers.push_back(micromap_index_buffer->draw_tracker);
-					} else {
-						untracked_buffers.insert(t_in.opacity_micromap_index_buffer);
+					if (micromap_index_buffer) {
+						if (micromap_index_buffer->draw_tracker != nullptr) {
+							draw_trackers.push_back(micromap_index_buffer->draw_tracker);
+						} else {
+							untracked_buffers.insert(t_in.opacity_micromap_index_buffer);
+						}
+						_check_transfer_worker_buffer(micromap_index_buffer);
 					}
-					_check_transfer_worker_buffer(micromap_index_buffer);
 				}
 			} break;
 
@@ -546,7 +552,9 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 				}
 				if (geometry.geometry.triangles.opacity_micromap.is_valid()) {
 					_add_dependency(id, geometry.geometry.triangles.opacity_micromap);
-					_add_dependency(id, geometry.geometry.triangles.opacity_micromap_index_buffer);
+					if (geometry.geometry.triangles.opacity_micromap_index_buffer.is_valid()) {
+						_add_dependency(id, geometry.geometry.triangles.opacity_micromap_index_buffer);
+					}
 				}
 			} break;
 			case AccelerationStructureGeometry::TYPE_AABBS: {

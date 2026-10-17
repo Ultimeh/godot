@@ -6677,9 +6677,14 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView
 					const AccelerationStructureInfo *micromap_info = (const AccelerationStructureInfo *)t.opacity_micromap.id;
 					VkAccelerationStructureTrianglesOpacityMicromapEXT &link = accel_info->micromap_links[i];
 					link.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
-					link.indexType = t.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-					link.indexBuffer.deviceAddress = buffer_get_device_address(t.opacity_micromap_index_buffer) + t.opacity_micromap_index_offset;
-					link.indexStride = t.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+					if (t.opacity_micromap_index_buffer) {
+						link.indexType = t.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+						link.indexBuffer.deviceAddress = buffer_get_device_address(t.opacity_micromap_index_buffer) + t.opacity_micromap_index_offset;
+						link.indexStride = t.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+					} else {
+						// Each triangle uses the entry of its index.
+						link.indexType = VK_INDEX_TYPE_NONE_KHR;
+					}
 					link.baseTriangle = t.opacity_micromap_base_triangle;
 					link.usageCountsCount = t.opacity_micromap_usage_count;
 					link.pUsageCounts = accel_info->micromap_usages.ptr() + micromap_usage_index;

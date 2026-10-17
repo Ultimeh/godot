@@ -6354,9 +6354,14 @@ RDD::AccelerationStructureID RenderingDeviceDriverD3D12::blas_create(VectorView<
 			blas_info.omm_triangles[i] = d3d12_geometry.Triangles;
 
 			D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC &linkage = blas_info.omm_linkages[i];
-			linkage.OpacityMicromapIndexFormat = triangles.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
-			linkage.OpacityMicromapIndexBuffer.StartAddress = micromap_index_buffer->gpu_virtual_address + triangles.opacity_micromap_index_offset;
-			linkage.OpacityMicromapIndexBuffer.StrideInBytes = triangles.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+			if (micromap_index_buffer) {
+				linkage.OpacityMicromapIndexFormat = triangles.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+				linkage.OpacityMicromapIndexBuffer.StartAddress = micromap_index_buffer->gpu_virtual_address + triangles.opacity_micromap_index_offset;
+				linkage.OpacityMicromapIndexBuffer.StrideInBytes = triangles.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+			} else {
+				// Each triangle uses the entry of its index (plus the base location).
+				linkage.OpacityMicromapIndexFormat = DXGI_FORMAT_UNKNOWN;
+			}
 			linkage.OpacityMicromapBaseLocation = triangles.opacity_micromap_base_triangle;
 			linkage.OpacityMicromapArray = micromap_info->build_desc.DestAccelerationStructureData;
 
@@ -6364,7 +6369,7 @@ RDD::AccelerationStructureID RenderingDeviceDriverD3D12::blas_create(VectorView<
 			d3d12_geometry.OmmTriangles.pTriangles = &blas_info.omm_triangles[i];
 			d3d12_geometry.OmmTriangles.pOmmLinkage = &linkage;
 
-			if (!barrier_capabilities.enhanced_barriers_supported) {
+			if (!barrier_capabilities.enhanced_barriers_supported && micromap_index_buffer) {
 				blas_info.input_buffer_infos.push_back(micromap_index_buffer);
 			}
 		}

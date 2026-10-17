@@ -1488,8 +1488,9 @@ public:
 			uint32_t index_count = 0;
 			// An opacity micromap (opacity_micromap_create()), or none. Each triangle's entry index (or
 			// OpacityMicromapSpecialIndex), plus opacity_micromap_base_triangle, in a storage buffer made with
-			// BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT; how
-			// many triangles reference entries of each subdivision level and format (the special indices not counted).
+			// BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT, or
+			// without one the triangle's own index; how many triangles reference entries of each subdivision level and
+			// format (the special indices not counted).
 			RID opacity_micromap;
 			RID opacity_micromap_index_buffer;
 			uint32_t opacity_micromap_index_offset = 0;
