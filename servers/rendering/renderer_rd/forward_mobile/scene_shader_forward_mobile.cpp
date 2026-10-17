@@ -834,6 +834,11 @@ void SceneShaderForwardMobile::init(const String p_defines) {
 
 		actions.render_mode_defines["debug_shadow_splits"] = "#define DEBUG_DRAW_PSSM_SPLITS\n";
 		actions.render_mode_defines["fog_disabled"] = "#define FOG_DISABLED\n";
+		// The blend modes that do not mix by alpha apply the fog their own way.
+		actions.render_mode_defines["blend_add"] = "#define BLEND_ADD_USED\n";
+		actions.render_mode_defines["blend_sub"] = "#define BLEND_SUB_USED\n";
+		actions.render_mode_defines["blend_mul"] = "#define BLEND_MUL_USED\n";
+		actions.render_mode_defines["blend_premul_alpha"] = "#define BLEND_PREMUL_ALPHA_USED\n";
 
 		actions.render_mode_defines["specular_occlusion_disabled"] = "#define SPECULAR_OCCLUSION_DISABLED\n";
 

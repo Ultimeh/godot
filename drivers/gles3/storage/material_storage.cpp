@@ -1397,7 +1397,7 @@ MaterialStorage::MaterialStorage() {
 		actions.usage_defines["ALPHA_HASH_SCALE"] = "#define ALPHA_HASH_USED\n";
 		actions.usage_defines["ALPHA_ANTIALIASING_EDGE"] = "#define ALPHA_ANTIALIASING_EDGE_USED\n";
 		actions.usage_defines["ALPHA_TEXTURE_COORDINATE"] = "@ALPHA_ANTIALIASING_EDGE";
-		actions.usage_defines["PREMULT_ALPHA_FACTOR"] = "#define PREMULT_ALPHA_USED";
+		actions.usage_defines["PREMUL_ALPHA_FACTOR"] = "#define PREMUL_ALPHA_USED\n";
 
 		actions.usage_defines["SSS_STRENGTH"] = "#define ENABLE_SSS\n";
 		actions.usage_defines["SSS_TRANSMITTANCE_DEPTH"] = "#define ENABLE_TRANSMITTANCE\n";
@@ -1439,6 +1439,11 @@ MaterialStorage::MaterialStorage() {
 			actions.render_mode_defines["vertex_lighting"] = "#define USE_VERTEX_LIGHTING\n";
 		}
 		actions.render_mode_defines["fog_disabled"] = "#define FOG_DISABLED\n";
+		// The blend modes that do not mix by alpha apply the fog their own way.
+		actions.render_mode_defines["blend_add"] = "#define BLEND_ADD_USED\n";
+		actions.render_mode_defines["blend_sub"] = "#define BLEND_SUB_USED\n";
+		actions.render_mode_defines["blend_mul"] = "#define BLEND_MUL_USED\n";
+		actions.render_mode_defines["blend_premul_alpha"] = "#define BLEND_PREMUL_ALPHA_USED\n";
 
 		actions.render_mode_defines["specular_occlusion_disabled"] = "#define SPECULAR_OCCLUSION_DISABLED\n";
 
