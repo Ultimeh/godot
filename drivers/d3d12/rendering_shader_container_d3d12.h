@@ -172,6 +172,10 @@ protected:
 	static bool _uses_ray_queries(nir_shader *p_shader);
 	// Hit objects (shader execution reordering) need Shader Model 6.9.
 	static bool _uses_hit_objects(nir_shader *p_shader);
+	// The stages whose SPIR-V declares RayTracingOpacityMicromapEXT (GL_EXT_opacity_micromap): their ray queries are
+	// allocated with opacity micromaps allowed (AllocateRayQuery2, Shader Model 6.9). Compilation only.
+	BitField<RenderingDeviceCommons::ShaderStage> opacity_micromap_stages = {};
+	static bool _declares_opacity_micromaps(Span<uint32_t> p_spirv);
 	uint32_t dxil_binding_slots_end = 0;
 	void _assign_dxil_slots();
 	uint32_t _find_binding(uint32_t p_set, uint32_t p_binding) const;

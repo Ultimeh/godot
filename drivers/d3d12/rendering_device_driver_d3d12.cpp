@@ -1058,7 +1058,7 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 	const bool device_address_view = p_usage.has_flag(BUFFER_USAGE_DEVICE_ADDRESS_BIT) && p_allocation_type == MEMORY_ALLOCATION_TYPE_GPU && !p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 	if (p_usage.has_flag(RDD::BUFFER_USAGE_STORAGE_BIT) || device_address_view) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-	} else if (!p_usage.has_flag(BUFFER_USAGE_SHADER_BINDING_TABLE_BIT) && !p_usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT)) {
+	} else if (!p_usage.has_flag(BUFFER_USAGE_SHADER_BINDING_TABLE_BIT) && !p_usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) && !p_usage.has_flag(RDD::BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT)) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
 	}
 
@@ -6295,6 +6295,14 @@ RDD::AccelerationStructureID RenderingDeviceDriverD3D12::blas_create(VectorView<
 	AccelerationStructureInfo blas_info;
 
 	blas_info.geometries.resize_initialized(p_geometries.size());
+	// Sized once: the geometries point into them until the BLAS is freed.
+	for (uint32_t i = 0; i < p_geometries.size(); i++) {
+		if (p_geometries[i].type == AccelerationStructureGeometry::TYPE_TRIANGLES && p_geometries[i].geometry.triangles.opacity_micromap) {
+			blas_info.omm_triangles.resize_initialized(p_geometries.size());
+			blas_info.omm_linkages.resize_initialized(p_geometries.size());
+			break;
+		}
+	}
 	for (uint32_t i = 0; i < p_geometries.size(); i++) {
 		const AccelerationStructureGeometry &geometry = p_geometries[i];
 
@@ -6336,6 +6344,28 @@ RDD::AccelerationStructureID RenderingDeviceDriverD3D12::blas_create(VectorView<
 
 			if (!barrier_capabilities.enhanced_barriers_supported) {
 				blas_info.input_buffer_infos.push_back(index_buffer);
+			}
+		}
+
+		if (triangles.opacity_micromap) {
+			// The triangles move out of the union into the OMM triangles' own description.
+			const AccelerationStructureInfo *micromap_info = (const AccelerationStructureInfo *)triangles.opacity_micromap.id;
+			BufferInfo *micromap_index_buffer = (BufferInfo *)triangles.opacity_micromap_index_buffer.id;
+			blas_info.omm_triangles[i] = d3d12_geometry.Triangles;
+
+			D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC &linkage = blas_info.omm_linkages[i];
+			linkage.OpacityMicromapIndexFormat = triangles.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+			linkage.OpacityMicromapIndexBuffer.StartAddress = micromap_index_buffer->gpu_virtual_address + triangles.opacity_micromap_index_offset;
+			linkage.OpacityMicromapIndexBuffer.StrideInBytes = triangles.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+			linkage.OpacityMicromapBaseLocation = triangles.opacity_micromap_base_triangle;
+			linkage.OpacityMicromapArray = micromap_info->build_desc.DestAccelerationStructureData;
+
+			d3d12_geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_OMM_TRIANGLES;
+			d3d12_geometry.OmmTriangles.pTriangles = &blas_info.omm_triangles[i];
+			d3d12_geometry.OmmTriangles.pOmmLinkage = &linkage;
+
+			if (!barrier_capabilities.enhanced_barriers_supported) {
+				blas_info.input_buffer_infos.push_back(micromap_index_buffer);
 			}
 		}
 	}
@@ -6412,6 +6442,55 @@ void RenderingDeviceDriverD3D12::acceleration_structure_free(AccelerationStructu
 uint32_t RenderingDeviceDriverD3D12::acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) {
 	AccelerationStructureInfo *acceleration_structure_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 	return acceleration_structure_info->scratch_buffer_size;
+}
+
+// RDD's opacity micromap values are D3D12's (and Vulkan's).
+static_assert(ENUM_MEMBERS_EQUAL(RDD::OPACITY_MICROMAP_FORMAT_2_STATE, D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_2_STATE));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::OPACITY_MICROMAP_FORMAT_4_STATE, D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT_OC1_4_STATE));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT, D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE, D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT, D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE, D3D12_RAYTRACING_OPACITY_MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE));
+static_assert(sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC) == 8, "An entry's description is 8 bytes in RD's layout.");
+
+RDD::AccelerationStructureID RenderingDeviceDriverD3D12::opacity_micromap_create(VectorView<OpacityMicromapUsage> p_usages, BufferID p_data_buffer, uint64_t p_data_offset, BufferID p_triangle_buffer, uint64_t p_triangle_offset) {
+	ERR_FAIL_COND_V_MSG(!raytracing_capabilities.opacity_micromap_supported, AccelerationStructureID(), "Opacity micromaps are not supported.");
+
+	// Made in place: its build inputs point to its own description.
+	AccelerationStructureInfo *omm_info = VersatileResource::allocate<AccelerationStructureInfo>(resources_allocator);
+
+	omm_info->omm_histogram.resize_initialized(p_usages.size());
+	for (uint32_t i = 0; i < p_usages.size(); i++) {
+		D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY &entry = omm_info->omm_histogram[i];
+		entry.Count = p_usages[i].count;
+		entry.SubdivisionLevel = p_usages[i].subdivision_level;
+		entry.Format = (D3D12_RAYTRACING_OPACITY_MICROMAP_FORMAT)p_usages[i].format;
+	}
+
+	BufferInfo *data_buffer = (BufferInfo *)p_data_buffer.id;
+	BufferInfo *triangle_buffer = (BufferInfo *)p_triangle_buffer.id;
+	D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC &array_desc = omm_info->omm_array_desc;
+	array_desc.NumOmmHistogramEntries = p_usages.size();
+	array_desc.pOmmHistogram = omm_info->omm_histogram.ptr();
+	array_desc.InputBuffer = data_buffer->gpu_virtual_address + p_data_offset;
+	array_desc.PerOmmDescs.StartAddress = triangle_buffer->gpu_virtual_address + p_triangle_offset;
+	array_desc.PerOmmDescs.StrideInBytes = sizeof(D3D12_RAYTRACING_OPACITY_MICROMAP_DESC);
+
+	omm_info->build_desc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
+	omm_info->build_desc.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+	omm_info->build_desc.Inputs.NumDescs = 1;
+	omm_info->build_desc.Inputs.pOpacityMicromapArrayDesc = &array_desc;
+
+	if (!barrier_capabilities.enhanced_barriers_supported) {
+		omm_info->input_buffer_infos.push_back(data_buffer);
+		omm_info->input_buffer_infos.push_back(triangle_buffer);
+	}
+
+	if (!_acceleration_structure_create(omm_info)) {
+		VersatileResource::free(resources_allocator, omm_info);
+		ERR_FAIL_V_MSG(AccelerationStructureID(), "Couldn't create the D3D12 opacity micromap array.");
+	}
+	return AccelerationStructureID(omm_info);
 }
 
 // ----- PIPELINE -----
@@ -6501,8 +6580,14 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 	CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT shader_config_subobject(state_object_desc);
 	shader_config_subobject.Config(max_payload_size_in_bytes, max_attribute_size_in_bytes);
 
-	CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT pipeline_config_subobject(state_object_desc);
-	pipeline_config_subobject.Config(p_max_trace_recursion_depth);
+	if (raytracing_capabilities.opacity_micromap_supported) {
+		// Without it, the pipeline's rays must not meet a geometry that references an opacity micromap array.
+		CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT pipeline_config_subobject(state_object_desc);
+		pipeline_config_subobject.Config(p_max_trace_recursion_depth, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS);
+	} else {
+		CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT pipeline_config_subobject(state_object_desc);
+		pipeline_config_subobject.Config(p_max_trace_recursion_depth);
+	}
 
 	const ShaderInfo *layout_defining_shader_info = (const ShaderInfo *)p_layout_defining_shader.id;
 	CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT root_signature_subobject(state_object_desc);
@@ -6576,6 +6661,11 @@ void RenderingDeviceDriverD3D12::command_build_blas(CommandBufferID p_cmd_buffer
 	}
 
 	cmd_buffer_info->cmd_list_4->BuildRaytracingAccelerationStructure(&acceleration_structure_info->build_desc, 0, nullptr);
+}
+
+void RenderingDeviceDriverD3D12::command_build_opacity_micromap(CommandBufferID p_cmd_buffer, AccelerationStructureID p_opacity_micromap, BufferID p_scratch_buffer, uint64_t p_scratch_offset) {
+	// The same call, stage and accesses as an acceleration structure's build (the graph's barriers cover it as one).
+	command_build_blas(p_cmd_buffer, p_opacity_micromap, p_scratch_buffer, p_scratch_offset);
 }
 
 void RenderingDeviceDriverD3D12::command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) {
@@ -7071,6 +7161,8 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 			return raytracing_capabilities.raytracing_pipeline_supported;
 		case SUPPORTS_SHADER_EXECUTION_REORDERING:
 			return raytracing_capabilities.shader_execution_reordering_supported;
+		case SUPPORTS_OPACITY_MICROMAP:
+			return raytracing_capabilities.opacity_micromap_supported;
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
 		case SUPPORTS_SHADER_OUTPUT_LAYER:
@@ -7409,6 +7501,9 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 		raytracing_capabilities.raytracing_pipeline_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0;
 		// Every device with ray tracing and Shader Model 6.9 accepts hit objects; reordering itself may do nothing.
 		raytracing_capabilities.shader_execution_reordering_supported = raytracing_capabilities.raytracing_pipeline_supported && shader_capabilities.shader_model >= D3D_SHADER_MODEL_6_9;
+		// Opacity micromap arrays need tier 1.2; Shader Model 6.9 for the ray queries that may meet them (AllocateRayQuery2).
+		raytracing_capabilities.opacity_micromap_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2 && shader_capabilities.shader_model >= D3D_SHADER_MODEL_6_9;
+		print_verbose(vformat("D3D12: ray tracing tier %d.%d, opacity micromaps %s.", options5.RaytracingTier / 10, options5.RaytracingTier % 10, raytracing_capabilities.opacity_micromap_supported ? "supported" : "unsupported"));
 	}
 
 	D3D12_FEATURE_DATA_D3D12_OPTIONS6 options6 = {};

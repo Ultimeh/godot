@@ -3524,6 +3524,12 @@ bool TGlslangToSpvTraverser::visitAggregate(glslang::TVisit visit, glslang::TInt
     case glslang::EOpRayQueryConfirmIntersection:
         builder.addExtension("SPV_KHR_ray_query");
         builder.addCapability(spv::Capability::RayQueryKHR);
+        // Godot: a stage that requests GL_EXT_opacity_micromap declares it for its ray queries too, not only in the ray
+        // tracing stages, so that a SPIR-V consumer (Mesa's nir_to_dxil) knows they may meet opacity micromaps.
+        if (glslangIntermediate->getRequestedExtensions().count("GL_EXT_opacity_micromap") != 0) {
+            builder.addExtension("SPV_EXT_opacity_micromap");
+            builder.addCapability(spv::Capability::RayTracingOpacityMicromapEXT);
+        }
         noReturnValue = true;
         break;
     case glslang::EOpRayQueryProceed:

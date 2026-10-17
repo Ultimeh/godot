@@ -784,7 +784,9 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 			"\n#define USE_LIGHTMAP\n", // SHADER_COLOR_PASS_FLAG_LIGHTMAP
 			"\n#define USE_MULTIVIEW\n", // SHADER_COLOR_PASS_FLAG_MULTIVIEW
 			"\n#define MOTION_VECTORS\n", // SHADER_COLOR_PASS_FLAG_MOTION_VECTORS
-			"\n#define USE_RT_SHADOWS\n", // SHADER_COLOR_PASS_FLAG_RT_SHADOWS
+			// Its ray queries may meet opacity micromaps where the device has them (D3D12 then allocates them with
+			// AllocateRayQuery2).
+			RD::get_singleton()->has_feature(RD::SUPPORTS_OPACITY_MICROMAP) ? "\n#define USE_RT_SHADOWS\n#define RT_OPACITY_MICROMAPS\n" : "\n#define USE_RT_SHADOWS\n", // SHADER_COLOR_PASS_FLAG_RT_SHADOWS
 		};
 
 		for (int i = 0; i < SHADER_COLOR_PASS_FLAG_COUNT; i++) {

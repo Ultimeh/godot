@@ -673,6 +673,9 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 		};
 
 		const Vector<uint32_t> code = _remap_spirv_bindings(p_spirv[i].spirv());
+		if (_declares_opacity_micromaps(code)) {
+			opacity_micromap_stages.set_flag(stage_flag);
+		}
 		nir_shader *shader = spirv_to_nir(
 				code.ptr(),
 				code.size(),
@@ -895,6 +898,12 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 			// Shader execution reordering: only compiled when the device has Shader Model 6.9.
 			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_9);
 		}
+		if (opacity_micromap_stages.has_flag((RenderingDeviceCommons::ShaderStage)(1 << stage)) && _uses_ray_queries(it.value)) {
+			// Ray queries that may meet opacity micromaps (AllocateRayQuery2): only compiled when the device has them, which
+			// implies Shader Model 6.9.
+			nir_to_dxil_options.ray_query_allow_opacity_micromaps = true;
+			nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_9);
+		}
 
 		blob dxil_blob = {};
 		bool ok = nir_to_dxil(it.value, &nir_to_dxil_options, &logger, &dxil_blob);
@@ -1006,6 +1015,25 @@ bool RenderingShaderContainerD3D12::_uses_ray_queries(nir_shader *p_shader) {
 				}
 			}
 		}
+	}
+	return false;
+}
+
+bool RenderingShaderContainerD3D12::_declares_opacity_micromaps(Span<uint32_t> p_spirv) {
+	// The capabilities come first, after the 5-word header: stop at the first other instruction.
+	const uint32_t OP_CAPABILITY = 17;
+	const uint32_t CAPABILITY_RAY_TRACING_OPACITY_MICROMAP_EXT = 5381;
+	uint32_t i = 5;
+	while (i < p_spirv.size()) {
+		const uint32_t word_count = p_spirv[i] >> 16;
+		const uint32_t opcode = p_spirv[i] & 0xffff;
+		if (word_count == 0 || opcode != OP_CAPABILITY) {
+			return false;
+		}
+		if (word_count >= 2 && i + 1 < p_spirv.size() && p_spirv[i + 1] == CAPABILITY_RAY_TRACING_OPACITY_MICROMAP_EXT) {
+			return true;
+		}
+		i += word_count;
 	}
 	return false;
 }

@@ -655,6 +655,10 @@ bool RenderForwardClusteredPT::_setup_rt() {
 		if (is_using_radiance_octmap_array()) {
 			rt_defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
+		if (RD::get_singleton()->has_feature(RD::SUPPORTS_OPACITY_MICROMAP)) {
+			// The ray queries may meet opacity micromaps (D3D12 then allocates them with AllocateRayQuery2).
+			rt_defines += "\n#define RT_OPACITY_MICROMAPS\n";
+		}
 		raytracing->shader->init(rt_defines);
 		if (!raytracing->shader->is_usable()) {
 			// Nothing else of the path tracer is compiled or run: a driver whose shader translation cannot handle its

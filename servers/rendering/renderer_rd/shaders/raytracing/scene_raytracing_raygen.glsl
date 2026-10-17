@@ -319,6 +319,9 @@ void main() {
 #pragma shader_stage(closest_hit)
 #extension GL_EXT_ray_tracing : enable
 #extension GL_EXT_ray_query : enable
+#ifdef RT_OPACITY_MICROMAPS
+#extension GL_EXT_opacity_micromap : require
+#endif
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_ARB_gpu_shader_int64 : require
