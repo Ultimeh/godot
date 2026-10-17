@@ -7453,6 +7453,11 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 
 		print_verbose("- Shader:");
 		print_verbose("  model: " + D3D_SHADER_MODEL_TO_STRING(shader_capabilities.shader_model));
+		if (shader_capabilities.shader_model < D3D_SHADER_MODEL_6_9) {
+			// Not an error, but a path traced frame several times slower: without 6.9, no shader execution reordering
+			// nor opacity micromaps. The usual cause is an Agility SDK older than 1.619 next to the executable.
+			print_line(vformat("Direct3D 12: shader model %s. Path tracing runs without shader execution reordering and opacity micromaps, which need 6.9 (Agility SDK 1.619 or later, and a recent driver).", D3D_SHADER_MODEL_TO_STRING(shader_capabilities.shader_model)));
+		}
 	}
 
 	shader_container_format.set_lib_d3d12(context_driver->lib_d3d12);
