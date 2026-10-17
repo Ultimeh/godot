@@ -795,10 +795,17 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		RD::get_singleton()->compute_list_end();
 	}
 
-	bool gi_dependent_sets_valid = fog->sync_gi_dependent_sets_validity();
+	// A new directional light projector (another texture, or one appearing or going away): every process set binds it.
+	const bool projector_changed = fog->bound_directional_projector != p_settings.directional_light_projector;
+	bool gi_dependent_sets_valid = fog->sync_gi_dependent_sets_validity(projector_changed);
 	if (!fog->copy_uniform_set.is_null() && !RD::get_singleton()->uniform_set_is_valid(fog->copy_uniform_set)) {
 		fog->copy_uniform_set = RID();
 	}
+	if (projector_changed && fog->copy_uniform_set.is_valid()) {
+		RD::get_singleton()->free_rid(fog->copy_uniform_set);
+		fog->copy_uniform_set = RID();
+	}
+	fog->bound_directional_projector = p_settings.directional_light_projector;
 	if (!gi_dependent_sets_valid || fog->copy_uniform_set.is_null()) {
 		//re create uniform set if needed
 		Vector<RD::Uniform> uniforms;
@@ -1002,6 +1009,24 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 				u.append_id(p_settings.area_light_atlas);
 			}
 
+			uniforms.push_back(u);
+			copy_uniforms.push_back(u);
+		}
+
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			u.binding = 22;
+			u.append_id(p_settings.directional_light_projector.is_valid() ? p_settings.directional_light_projector : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE));
+			uniforms.push_back(u);
+			copy_uniforms.push_back(u);
+		}
+
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+			u.binding = 23;
+			u.append_id(material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_ENABLED));
 			uniforms.push_back(u);
 			copy_uniforms.push_back(u);
 		}

@@ -4659,6 +4659,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights) {
 	uint32_t rt_light_count = 0;
+	rt_directional_projector = RID();
 
 	if (!p_render_data || !p_render_data->lights) {
 		return rt_light_count;
@@ -4771,6 +4772,30 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.spot_direction[2] = 0.0f;
 		ld.cull_mask = ls->light_get_cull_mask(base);
 		ld.shadow_opacity = ls->light_has_shadow(base) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_OPACITY) : 0.0f;
+
+		// The projector, as raster's update_light_buffers() maps it (in view space there): the first directional light
+		// with one has the texture binding.
+		memset(ld.projector_uv_x, 0, sizeof(ld.projector_uv_x));
+		memset(ld.projector_uv_y, 0, sizeof(ld.projector_uv_y));
+		ld.projector_enabled = 0;
+		ld.pad[0] = ld.pad[1] = ld.pad[2] = 0;
+		const RID projector = ls->light_get_projector(base);
+		if (projector.is_valid() && rt_directional_projector.is_null()) {
+			const RID projector_texture = RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(projector, true);
+			if (projector_texture.is_valid()) {
+				const Transform3D world_to_light = xform.orthonormalized().affine_inverse();
+				const Vector2 size = ls->light_directional_get_projector_size(base);
+				const Vector2 offset = ls->light_directional_get_projector_offset(base);
+				for (int k = 0; k < 3; k++) {
+					ld.projector_uv_x[k] = world_to_light.basis.rows[0][k] / size.x;
+					ld.projector_uv_y[k] = -world_to_light.basis.rows[1][k] / size.y;
+				}
+				ld.projector_uv_x[3] = (world_to_light.origin.x - offset.x) / size.x + 0.5f;
+				ld.projector_uv_y[3] = 0.5f - (world_to_light.origin.y - offset.y) / size.y;
+				ld.projector_enabled = 1;
+				rt_directional_projector = projector_texture;
+			}
+		}
 		rt_light_count++;
 	}
 
@@ -4838,6 +4863,10 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			ld.spot_direction[1] = 0.0f;
 			ld.spot_direction[2] = 0.0f;
 		}
+		memset(ld.projector_uv_x, 0, sizeof(ld.projector_uv_x));
+		memset(ld.projector_uv_y, 0, sizeof(ld.projector_uv_y));
+		ld.projector_enabled = 0;
+		ld.pad[0] = ld.pad[1] = ld.pad[2] = 0;
 		rt_light_count++;
 	}
 
@@ -5466,6 +5495,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			} break;
 		}
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 37, rb->get_samplers().get_sampler(decal_filter, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED)));
+
+		// Binding 38: the directional light projector (gather_lights()), white when none.
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 38, rt_directional_projector.is_valid() ? rt_directional_projector : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE)));
 	}
 
 	RID shader_rd = shader ? shader->get_pipeline_shader_rd(p_rt_flags) : RID();

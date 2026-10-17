@@ -418,6 +418,11 @@ layout(set = 1, binding = 13 + 9) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_RE
 layout(set = 1, binding = 13 + 10) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
 layout(set = 1, binding = 13 + 11) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
 
+// The projector of the directional light whose projector_enabled is set (white when none).
+layout(set = 1, binding = 25) uniform texture2D directional_light_projector;
+#define USE_DIRECTIONAL_LIGHT_PROJECTOR
+#include "../directional_light_projector_inc.glsl"
+
 /* Set 2 Skeleton & Instancing (can change per item) */
 
 layout(set = 2, binding = 0, std430) restrict readonly buffer Transforms {

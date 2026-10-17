@@ -277,11 +277,16 @@ void LightStorage::light_set_projector(RID p_light, RID p_texture) {
 
 	light->projector = p_texture;
 
+	// A directional light's projector is bound as a texture of its own (directional_light_projector), not through the
+	// decal atlas: the atlas copies a texture once, a directional projector may be drawn every frame (cloud shadows).
 	if (light->type != RSE::LIGHT_DIRECTIONAL) {
 		if (light->projector.is_valid()) {
 			texture_storage->texture_add_to_decal_atlas(light->projector, light->type == RSE::LIGHT_OMNI);
 		}
 		light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT_SOFT_SHADOW_AND_PROJECTOR);
+	} else {
+		light->version++;
+		light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
 	}
 }
 
@@ -419,6 +424,21 @@ RSE::LightDirectionalSkyMode LightStorage::light_directional_get_sky_mode(RID p_
 	ERR_FAIL_NULL_V(light, RSE::LIGHT_DIRECTIONAL_SKY_MODE_LIGHT_AND_SKY);
 
 	return light->directional_sky_mode;
+}
+
+void LightStorage::light_directional_set_projector_size(RID p_light, const Vector2 &p_size) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	ERR_FAIL_COND_MSG(p_size.x <= 0.0 || p_size.y <= 0.0, "The projector size of a directional light must be positive.");
+
+	light->directional_projector_size = p_size;
+}
+
+void LightStorage::light_directional_set_projector_offset(RID p_light, const Vector2 &p_offset) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+
+	light->directional_projector_offset = p_offset;
 }
 
 RSE::LightDirectionalShadowMode LightStorage::light_directional_get_shadow_mode(RID p_light) {
@@ -711,6 +731,16 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 	directional_light_buffer = RD::get_singleton()->uniform_buffer_create(directional_light_buffer_size);
 }
 
+RID LightStorage::get_directional_projector_texture() const {
+	// Looked up at each call: the light's projector may have been taken back since update_light_buffers(). Its
+	// DirectionalLightData then still has projector_enabled for this frame, and multiplies by white.
+	const Light *light = light_owner.get_or_null(directional_projector_light);
+	if (light == nullptr || light->projector.is_null()) {
+		return RID();
+	}
+	return RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(light->projector, true);
+}
+
 void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows) {
 	ForwardIDStorage *forward_id_storage = ForwardIDStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -725,6 +755,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	area_light_count = 0;
 
 	r_directional_light_soft_shadows = false;
+	directional_projector_light = RID();
 
 	for (int i = 0; i < (int)p_lights.size(); i++) {
 		LightInstance *light_instance = light_instance_owner.get_or_null(p_lights[i]);
@@ -798,6 +829,27 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				}
 
 				light_data.bake_mode = light->bake_mode;
+
+				// The projector, shadows or not: the light's XY plane, projector_size meters wide, its +Y up in the image.
+				// One texture binding: the first directional light with a projector has it.
+				light_data.projector_enabled = 0;
+				light_data.pad = 0;
+				if (light->projector.is_valid() && directional_projector_light.is_null()) {
+					const RID projector_texture = texture_storage->texture_get_rd_texture(light->projector, true);
+					if (projector_texture.is_valid()) {
+						const Transform3D view_to_light = (inverse_transform * light_transform.orthonormalized()).affine_inverse();
+						const Vector2 size = light->directional_projector_size;
+						const Vector2 offset = light->directional_projector_offset;
+						for (int k = 0; k < 3; k++) {
+							light_data.projector_uv_x[k] = view_to_light.basis.rows[0][k] / size.x;
+							light_data.projector_uv_y[k] = -view_to_light.basis.rows[1][k] / size.y;
+						}
+						light_data.projector_uv_x[3] = (view_to_light.origin.x - offset.x) / size.x + 0.5;
+						light_data.projector_uv_y[3] = 0.5 - (view_to_light.origin.y - offset.y) / size.y;
+						light_data.projector_enabled = 1;
+						directional_projector_light = light_instance->light;
+					}
+				}
 
 				if (light_data.shadow_opacity > 0.001) {
 					RSE::LightDirectionalShadowMode smode = light->directional_shadow_mode;

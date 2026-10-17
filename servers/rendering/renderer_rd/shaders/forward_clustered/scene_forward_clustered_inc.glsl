@@ -565,6 +565,11 @@ layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #endif // USE_MULTIVIEW
 
+// The projector of the directional light whose projector_enabled is set (white when none).
+layout(set = 1, binding = 42) uniform texture2D directional_light_projector;
+#define USE_DIRECTIONAL_LIGHT_PROJECTOR
+#include "../directional_light_projector_inc.glsl"
+
 #endif
 
 vec4 normal_roughness_compatibility(vec4 p_normal_roughness) {

@@ -182,7 +182,7 @@ enum RTLightType : uint32_t {
 	RT_LIGHT_TYPE_SPOT = 3,
 };
 
-// Must match GLSL RTLightData (std430, 80 bytes).
+// Must match GLSL RTLightData (std430, 128 bytes).
 struct alignas(16) RT_LightData {
 	float position[3]; // World position (omni/spot) or direction (directional, normalized).
 	uint32_t type;
@@ -198,8 +198,14 @@ struct alignas(16) RT_LightData {
 	uint32_t cull_mask; // Light3D.light_cull_mask: the layers this light lights.
 	float spot_direction[3];
 	float shadow_opacity; // 0 without shadows: no shadow ray, as raster.
+	// Directional: world position (w = 1) to the UV of rt_directional_light_projector, when projector_enabled (as raster's
+	// DirectionalLightData, in world space).
+	float projector_uv_x[4];
+	float projector_uv_y[4];
+	uint32_t projector_enabled;
+	uint32_t pad[3];
 };
-static_assert(sizeof(RT_LightData) == 80, "RT_LightData must be 80 bytes for std430");
+static_assert(sizeof(RT_LightData) == 128, "RT_LightData must be 128 bytes for std430");
 
 // Must match GLSL RTDecalData (raytracing_decals_inc.glsl, std430, 224 bytes). What raster's DecalData holds in view space
 // (TextureStorage::update_decal_buffer()), in world space.
@@ -915,6 +921,8 @@ public:
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
+	// The RD texture of the directional light projector gather_lights() found (binding 38), or invalid.
+	RID rt_directional_projector;
 	// The decals around the camera, in world space, and a hashed grid of them for the hit shaders; uploads them to
 	// p_state's buffers. Returns their number.
 	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);

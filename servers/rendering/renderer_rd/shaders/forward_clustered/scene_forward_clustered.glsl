@@ -654,15 +654,21 @@ void vertex_shader(vec3 vertex_input,
 			if (directional_lights.data[i].bake_mode == LIGHT_BAKE_STATIC && bool(instance_flags & INSTANCE_FLAGS_USE_LIGHTMAP)) {
 				continue; // Statically baked light and object uses lightmap, skip.
 			}
+			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
+#ifdef USE_DIRECTIONAL_LIGHT_PROJECTOR
+			if (directional_lights.data[i].projector_enabled != 0u) {
+				directional_color *= directional_light_projector_color_lod(directional_lights.data[i].projector_uv_x, directional_lights.data[i].projector_uv_y, vertex);
+			}
+#endif
 			if (i == 0) {
 				light_compute_vertex(normal, directional_lights.data[0].direction, view,
-						directional_lights.data[0].color * directional_lights.data[0].energy,
+						directional_color,
 						true, roughness,
 						directional_diffuse,
 						directional_specular);
 			} else {
 				light_compute_vertex(normal, directional_lights.data[i].direction, view,
-						directional_lights.data[i].color * directional_lights.data[i].energy,
+						directional_color,
 						true, roughness,
 						diffuse_light_interp.rgb,
 						specular_light_interp.rgb);
@@ -2762,11 +2768,18 @@ void fragment_shader(in SceneData scene_data) {
 
 			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
 
+			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
+#ifdef USE_DIRECTIONAL_LIGHT_PROJECTOR
+			if (directional_lights.data[i].projector_enabled != 0u) {
+				directional_color *= directional_light_projector_color(directional_lights.data[i].projector_uv_x, directional_lights.data[i].projector_uv_y, vertex, vertex_ddx, vertex_ddy);
+			}
+#endif
+
 			light_compute(normal, directional_lights.data[i].direction, normalize(view), size_A,
 #ifndef DEBUG_DRAW_PSSM_SPLITS
-					directional_lights.data[i].color * directional_lights.data[i].energy,
+					directional_color,
 #else
-					directional_lights.data[i].color * directional_lights.data[i].energy * tint,
+					directional_color * tint,
 #endif
 					true, shadow, f0, roughness, metallic, directional_lights.data[i].specular, albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED

@@ -78,6 +78,10 @@ private:
 		RSE::LightDirectionalShadowMode directional_shadow_mode = RSE::LIGHT_DIRECTIONAL_SHADOW_ORTHOGONAL;
 		bool directional_blend_splits = false;
 		RSE::LightDirectionalSkyMode directional_sky_mode = RSE::LIGHT_DIRECTIONAL_SKY_MODE_LIGHT_AND_SKY;
+		// The projector of a directional light covers projector_size meters of the light's XY plane, centered at its origin
+		// plus projector_offset (in the light's X and Y), and repeats beyond.
+		Vector2 directional_projector_size = Vector2(100, 100);
+		Vector2 directional_projector_offset;
 		Vector2 area_size = Vector2(1, 1);
 		bool area_normalize_energy = true;
 		RID area_texture;
@@ -208,7 +212,8 @@ private:
 		float shadow_opacity;
 		float fade_from;
 		float fade_to;
-		uint32_t pad[2];
+		uint32_t projector_enabled; // directional_light_projector, sampled at (dot(projector_uv_x, vertex), dot(projector_uv_y, vertex)).
+		uint32_t pad;
 		uint32_t bake_mode;
 		float volumetric_fog_energy;
 		float shadow_bias[4];
@@ -222,11 +227,19 @@ private:
 		float uv_scale2[2];
 		float uv_scale3[2];
 		float uv_scale4[2];
+		// View space position (w = 1) to the projector's UV.
+		float projector_uv_x[4];
+		float projector_uv_y[4];
 	};
+	static_assert(sizeof(DirectionalLightData) % 16 == 0, "DirectionalLightData is an array element of a std140 uniform buffer.");
 
 	uint32_t max_directional_lights;
 	DirectionalLightData *directional_lights = nullptr;
 	RID directional_light_buffer;
+	// The one directional light whose projector the scene uses this frame (the first with one), whose texture its uniform
+	// sets bind as directional_light_projector. Invalid when none. The light and not its RD texture: a projector can be
+	// taken back and freed during the frame (a compositor effect that draws it), and later passes must not bind it.
+	RID directional_projector_light;
 
 	/* REFLECTION PROBE */
 
@@ -522,6 +535,8 @@ public:
 	virtual bool light_directional_get_blend_splits(RID p_light) const override;
 	virtual void light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) override;
 	virtual RSE::LightDirectionalSkyMode light_directional_get_sky_mode(RID p_light) const override;
+	virtual void light_directional_set_projector_size(RID p_light, const Vector2 &p_size) override;
+	virtual void light_directional_set_projector_offset(RID p_light, const Vector2 &p_offset) override;
 
 	virtual RSE::LightDirectionalShadowMode light_directional_get_shadow_mode(RID p_light) override;
 	virtual RSE::LightOmniShadowMode light_omni_get_shadow_mode(RID p_light) override;
@@ -552,6 +567,21 @@ public:
 		ERR_FAIL_NULL_V(light, RID());
 
 		return light->projector;
+	}
+
+	// A directional light's projector placement (Light::directional_projector_size and _offset).
+	_FORCE_INLINE_ Vector2 light_directional_get_projector_size(RID p_light) const {
+		const Light *light = light_owner.get_or_null(p_light);
+		ERR_FAIL_NULL_V(light, Vector2(1, 1));
+
+		return light->directional_projector_size;
+	}
+
+	_FORCE_INLINE_ Vector2 light_directional_get_projector_offset(RID p_light) const {
+		const Light *light = light_owner.get_or_null(p_light);
+		ERR_FAIL_NULL_V(light, Vector2());
+
+		return light->directional_projector_offset;
 	}
 
 	virtual Color light_get_color(RID p_light) override {
@@ -834,6 +864,8 @@ public:
 	RID get_spot_light_buffer() { return spot_light_buffer; }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_directional_light_buffer() { return directional_light_buffer; }
+	// The RD texture to bind as directional_light_projector (update_light_buffers() picks the light), or invalid.
+	RID get_directional_projector_texture() const;
 	uint32_t get_max_directional_lights() { return max_directional_lights; }
 	uint32_t get_directional_light_blend_splits(uint32_t p_directional_light_count) const {
 		uint32_t blend_splits = 0;

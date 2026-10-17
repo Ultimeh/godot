@@ -16,7 +16,7 @@
 #endif
 
 // ============================================================================
-// Light Data (matches C++ RT_LightData, 80 bytes, std430)
+// Light Data (matches C++ RT_LightData, 128 bytes, std430)
 // ============================================================================
 
 struct RTLightData {
@@ -34,6 +34,13 @@ struct RTLightData {
 	uint cull_mask; // Layers this light lights (Light3D.light_cull_mask).
 	vec3 spot_direction; // Spot direction (normalized, world space).
 	float shadow_opacity; // 0 when the light casts no shadow (no shadow ray), as raster.
+	// Directional: world position (w = 1) to the UV of rt_directional_light_projector (raster's projector).
+	vec4 projector_uv_x;
+	vec4 projector_uv_y;
+	uint projector_enabled;
+	uint pad0;
+	uint pad1;
+	uint pad2;
 };
 
 // Light buffer SSBO (binding provided by the including shader via RT_LIGHT_BUFFER_BINDING).
@@ -44,6 +51,19 @@ struct RTLightData {
 layout(set = 0, binding = RT_LIGHT_BUFFER_BINDING, std430) readonly buffer LightBuffer {
 	RTLightData rt_lights[];
 };
+
+// The projector of the directional light whose projector_enabled is set (white when none): it multiplies the light,
+// rgb * a, repeated beyond its size, as raster's directional_light_projector.
+layout(set = 0, binding = 38) uniform texture2D rt_directional_light_projector;
+
+vec3 lights_directional_projector(RTLightData light, vec3 hit_pos) {
+	if (light.projector_enabled == 0u) {
+		return vec3(1.0);
+	}
+	vec2 uv = vec2(dot(light.projector_uv_x, vec4(hit_pos, 1.0)), dot(light.projector_uv_y, vec4(hit_pos, 1.0)));
+	vec4 color = textureLod(sampler2D(rt_directional_light_projector, SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0);
+	return color.rgb * color.a;
+}
 
 // ============================================================================
 // Unified Cone Sampling (for sphere, directional, spot lights)
@@ -393,6 +413,12 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
+		// Before the shadow ray: where the projector is black (a cloud's full shadow) there is nothing to trace.
+		vec3 projector = lights_directional_projector(light, hit_pos);
+		if (all(lessThanEqual(projector, vec3(0.0)))) {
+			return vec3(0.0);
+		}
+
 		bool through = has_backlight && dot(geometry_normal, L) < 0.0;
 		float visibility = lights_shadow_visibility(light, through ? hit_pos_back : hit_pos, L, ls.max_distance, rng_state);
 		if (visibility <= 0.0) {
@@ -410,6 +436,6 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * indirect_mul * visibility / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * projector * indirect_mul * visibility / max(light_select_pdf, 1e-10);
 	}
 }
