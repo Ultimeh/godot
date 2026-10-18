@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_lod_compact.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_output_copy.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_sky_guide.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_tlas_expand.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
@@ -746,6 +747,19 @@ class RenderRaytracing {
 		RID pipeline;
 	} sky_guide_shader;
 
+	// The path traced color into the scene's color buffer, with the raster's background where the camera rays missed.
+	struct OutputCopyShader {
+		struct PushConstant {
+			int32_t size[2];
+			uint32_t keep_background;
+			uint32_t pad;
+		};
+		RaytracingOutputCopyShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} output_copy_shader;
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.
@@ -941,11 +955,13 @@ public:
 	// The decals around the camera, in world space, and a hashed grid of them for the hit shaders; uploads them to
 	// p_state's buffers. Returns their number.
 	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);
-	// `p_background_color` (linear) is what the camera rays that miss see when the background is a color; with
-	// `p_background_is_color` false they see the sky, as the light of any other ray.
+	// `p_background_color` (linear) is what the camera rays that miss see where the raster clears to it (no sky drawn);
+	// with `p_background_is_color` false they see the sky, as the light of any other ray.
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_background_is_color, const Color &p_background_color);
 
-	void copy_output_texture(const RenderDataRD *p_render_data);
+	// Where the camera rays missed, `p_keep_background` keeps the color buffer's pixels (BG_CANVAS, BG_KEEP), else the
+	// miss color goes there with an alpha of 0, as the raster's clear color.
+	void copy_output_texture(const RenderDataRD *p_render_data, bool p_keep_background);
 	void apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending);
 	void dlss_rr_write_background_albedo(const RenderDataRD *p_render_data);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);

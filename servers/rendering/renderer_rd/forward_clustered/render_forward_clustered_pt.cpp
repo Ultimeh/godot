@@ -248,8 +248,8 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	float sky_brightness_multiplier = 1.0;
 
 	Color clear_color;
-	// Where raster clears to clear_color, the camera rays that miss show it.
-	bool background_is_color = true;
+	// As raster's load_color: BG_CANVAS and BG_KEEP keep the color buffer's pixels where the camera rays missed.
+	bool keep_background = false;
 
 	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW) {
 		clear_color = Color(0, 0, 0, 1); //in overdraw mode, BG should always be black
@@ -258,7 +258,6 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		float bg_energy_multiplier = environment_get_bg_energy_multiplier(p_render_data->environment);
 		bg_energy_multiplier *= environment_get_bg_intensity(p_render_data->environment);
 		RSE::EnvironmentReflectionSource reflection_source = environment_get_reflection_source(p_render_data->environment);
-		background_is_color = bg_mode == RSE::ENV_BG_CLEAR_COLOR || bg_mode == RSE::ENV_BG_COLOR;
 
 		if (p_render_data->camera_attributes.is_valid()) {
 			bg_energy_multiplier *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
@@ -286,8 +285,10 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 				RID texture = RendererRD::TextureStorage::get_singleton()->render_target_get_rd_texture(rb->get_render_target());
 				bool convert_to_linear = !RendererRD::TextureStorage::get_singleton()->render_target_is_using_hdr(rb->get_render_target());
 				copy_effects->copy_to_fb_rect(texture, color_only_framebuffer, Rect2i(), false, false, false, false, RID(), false, false, convert_to_linear);
+				keep_background = true;
 			} break;
 			case RSE::ENV_BG_KEEP: {
+				keep_background = true;
 			} break;
 			case RSE::ENV_BG_CAMERA_FEED: {
 			} break;
@@ -356,6 +357,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// and freeing the previous one freed a set made with it ("uniform_set is null" on the first frames).
 	if (rt_state) {
 		raytracing->rt_ensure_textures(rb.ptr());
+		// Where raster doesn't draw the sky it clears to clear_color: the camera rays that miss show it (black for
+		// BG_SKY in a transparent viewport and for BG_CAMERA_FEED; unused where the background is kept).
+		const bool background_is_color = !draw_sky;
 		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, background_is_color, clear_color);
 	}
 
@@ -407,7 +411,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		}
 
 		raytracing->apply_volumetric_fog(p_render_data, fog_use_legacy_blending_get());
-		raytracing->copy_output_texture(p_render_data);
+		raytracing->copy_output_texture(p_render_data, keep_background);
 	}
 
 	// The sky where the camera rays missed (their depth is the far plane), drawn as raster draws it: the miss shader only

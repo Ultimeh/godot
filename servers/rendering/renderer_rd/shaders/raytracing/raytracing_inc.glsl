@@ -23,7 +23,7 @@
 #define RT_PARAM_DECAL_COUNT 5 // rt_params[1].y - Decals in the decal buffer (raytracing_decals_inc.glsl)
 // Indices 6-7 reserved for future use
 #define RT_PARAM_BACKGROUND_COLOR 8 // rt_params[2].xyz - Background color seen by camera rays (linear, with its energy)
-#define RT_PARAM_BACKGROUND_COLOR_USED 11 // rt_params[2].w - 1 when the background is a color (BG_COLOR, BG_CLEAR_COLOR)
+#define RT_PARAM_BACKGROUND_COLOR_USED 11 // rt_params[2].w - 1 where the raster clears to the background color (no sky drawn)
 // Indices 12-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation

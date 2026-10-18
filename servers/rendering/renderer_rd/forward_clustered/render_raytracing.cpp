@@ -102,6 +102,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	sky_guide_shader.version = sky_guide_shader.shader.version_create();
 	sky_guide_shader.version_shader = sky_guide_shader.shader.version_get_shader(sky_guide_shader.version, 0);
 	sky_guide_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_guide_shader.version_shader);
+
+	Vector<String> output_copy_modes;
+	output_copy_modes.push_back("\n");
+	output_copy_shader.shader.initialize(output_copy_modes);
+	output_copy_shader.version = output_copy_shader.shader.version_create();
+	output_copy_shader.version_shader = output_copy_shader.shader.version_get_shader(output_copy_shader.version, 0);
+	output_copy_shader.pipeline = RD::get_singleton()->compute_pipeline_create(output_copy_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -151,6 +158,7 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 	sky_guide_shader.shader.version_free(sky_guide_shader.version);
+	output_copy_shader.shader.version_free(output_copy_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -5789,18 +5797,31 @@ void RenderRaytracing::dlss_rr_write_background_albedo(const RenderDataRD *p_ren
 	rd->compute_list_end();
 }
 
-void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data) {
+void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data, bool p_keep_background) {
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
 
-	if (!rt_has_texture(rb.ptr())) {
+	if (!rt_has_texture(rb.ptr()) || !rt_has_depth_texture(rb.ptr())) {
 		return;
 	}
 
-	// Copy raytracing output to main color buffer
+	OutputCopyShader::PushConstant push_constant = {};
+	const Size2i size = rb->get_internal_size();
+	push_constant.size[0] = size.width;
+	push_constant.size[1] = size.height;
+	push_constant.keep_background = p_keep_background ? 1 : 0;
+
+	RD::Uniform source(RD::UNIFORM_TYPE_TEXTURE, 0, rt_get_texture(rb.ptr()));
+	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
+
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, output_copy_shader.pipeline);
 	for (uint32_t v = 0; v < rb->get_view_count(); v++) {
-		RID src = rt_get_texture(rb.ptr());
-		RID dst = rb->get_internal_texture(v);
-		owner->copy_effects->copy_to_rect(src, dst, Rect2i(0, 0, rb->get_internal_size().x, rb->get_internal_size().y), false, false, false, false, false, true);
+		RD::Uniform dest(RD::UNIFORM_TYPE_IMAGE, 2, rb->get_internal_texture(v));
+		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(output_copy_shader.version_shader, 0, source, depth, dest), 0);
+		rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(OutputCopyShader::PushConstant));
+		rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
 	}
+	rd->compute_list_end();
 }
