@@ -12,7 +12,7 @@ layout(buffer_reference, std430) readonly buffer Uint32Buffer {
 };
 
 // ============================================================================
-// GEOMETRY DATA (matches C++ RT_GeometryData, 128 bytes)
+// GEOMETRY DATA (matches C++ RT_GeometryData, 176 bytes)
 // ============================================================================
 struct GeometryData {
 	uint64_t vertex_address;
@@ -48,7 +48,32 @@ struct GeometryData {
 	uint prev_vertex_address_lo;
 	uint prev_vertex_address_hi;
 
-	uint _pad[5];
+	// For displaced geometry: positions before vertex() moved them (float3 packed).
+	uint rest_vertex_address_lo;
+	uint rest_vertex_address_hi;
+
+	uint layer_mask; // The instance's layers, against each light's cull mask.
+	uint uv2_byte_offset;
+	uint uv2_scale_packed; // fp16 x, fp16 y
+
+	// CUSTOM0-3: byte offset in an attribute (8 bits each, CUSTOM0 lowest), and 4 bits each of CUSTOM_FORMAT_PRESENT
+	// | the mesh's custom format. 0: none.
+	uint custom_byte_offsets;
+	uint custom_formats;
+
+	// The MultiMesh buffer whose instances this geometry draws, for COLOR and INSTANCE_CUSTOM (0: not a MultiMesh).
+	uint multimesh_address_lo;
+	uint multimesh_address_hi;
+	uint multimesh_stride; // In floats.
+	uint multimesh_offset; // The geometry's first instance in the buffer.
+	uint multimesh_vertex_count; // A merged BLAS's vertices per instance; 0xFFFFFFFF: one instance, at multimesh_offset.
+	uint multimesh_data_offsets; // In floats in an instance: the color (low 16 bits), the custom data (high), 0xFFFF: none.
+	// A merged BLAS's first instance in the buffer's previous transforms (motion vectors); multimesh_offset when its instances
+	// did not move, and for one instance, whose motion is the TLAS instance's.
+	uint multimesh_previous_offset;
+	uint multimesh_pad0;
+	uint multimesh_pad1;
+	uint multimesh_pad2;
 };
 
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {
@@ -103,4 +128,37 @@ struct MaterialData {
 	float normal_map_depth; // Normal map strength (default 1.0)
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none)
+
+	float uv1_scale_z; // Triplanar only.
+	float uv1_offset_z;
+	float uv1_blend_sharpness;
+	uint instance_uniforms_ofs; // The instance's `instance uniform` values in the global shader uniform buffer.
+	vec3 backlight; // BaseMaterial3D's backlight color (MAT_FLAG_BACKLIGHT).
+	uint backlight_texture_idx; // Added to it (MAT_FLAG_HAS_BACKLIGHT_TEX).
+	uint ao_texture_idx; // BaseMaterial3D's ambient occlusion texture (MAT_FLAG_AO_TEXTURE).
+	uint ao_channel; // Its channel, 0-3.
+	float ao_light_affect; // With MAT_FLAG_AO_TEXTURE or MAT_FLAG_AO_ORM.
+	uint ao_pad;
 };
+
+#define MAT_FLAG_UV1_TRIPLANAR 8u
+#define MAT_FLAG_UV1_WORLD_TRIPLANAR 16u
+#define MAT_FLAG_EMISSION 32u
+#define MAT_FLAG_EMISSION_ADD 64u
+#define MAT_FLAG_UNSHADED 128u
+#define MAT_FLAG_VERTEX_COLOR_ALBEDO 256u
+#define MAT_FLAG_VERTEX_COLOR_SRGB 512u
+#define MAT_FLAG_SPECULAR_DISABLED 1024u
+#define MAT_FLAG_BACKLIGHT 2048u
+#define MAT_FLAG_HAS_BACKLIGHT_TEX 4096u
+#define MAT_FLAG_ANISOTROPIC_FILTER 8192u
+#define MAT_FLAG_AO_TEXTURE 16384u
+#define MAT_FLAG_AO_ORM 32768u
+
+/// BaseMaterial3D's vertex color, as its albedo_tex *= COLOR reads it.
+vec4 material_vertex_color(vec4 p_color, uint p_flags) {
+	if ((p_flags & MAT_FLAG_VERTEX_COLOR_SRGB) != 0u) {
+		p_color.rgb = mix(pow((p_color.rgb + vec3(0.055)) * (1.0 / (1.0 + 0.055)), vec3(2.4)), p_color.rgb * (1.0 / 12.92), lessThan(p_color.rgb, vec3(0.04045)));
+	}
+	return p_color;
+}

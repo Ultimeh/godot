@@ -46,6 +46,10 @@ namespace RendererRD {
 
 class MaterialStorage : public RendererMaterialStorage {
 public:
+	// Writes one regular material uniform as material uniform buffers lay it out (std140, arrays padded to 16 bytes per
+	// element): p_value if given, else the shader's default, else zero (identity for matrices, opaque black for colors).
+	static void fill_std140_uniform(const ShaderLanguage::ShaderNode::Uniform &p_uniform, const Variant *p_value, uint8_t *r_data, bool p_use_linear_color);
+
 	enum ShaderType {
 		SHADER_TYPE_2D,
 		SHADER_TYPE_3D,
@@ -465,6 +469,9 @@ public:
 	virtual void global_shader_parameters_instance_update(RID p_instance, int p_index, const Variant &p_value, int p_flags_count = 0) override;
 
 	RID global_shader_uniforms_get_storage_buffer() const;
+	/// Hash of the values of the instance uniforms allocated at p_offset (0 if none): tells the path tracer when the
+	/// geometry an instance's vertex() moves must be evaluated again.
+	uint32_t global_shader_parameters_instance_hash(int32_t p_offset) const;
 	/// Returns the override (or value) RID for a global texture parameter, or RID() if not found.
 	RID global_shader_uniform_get_texture(const StringName &p_name) const;
 	/// Returns the buffer index for a scalar/vector global shader parameter, or -1 if not found.
@@ -512,6 +519,8 @@ public:
 	String material_get_shader_code(RID p_material) const;
 	// Falls back to raster code when no RT variant is set.
 	String material_get_shader_code_rt(RID p_material) const;
+	// The resource path of the material's Shader: empty for the shaders BaseMaterial3D generates.
+	String material_get_shader_path_hint(RID p_material) const;
 	uint64_t material_get_shader_code_rt_hash(RID p_material) const;
 	uint64_t material_get_shader_code_rt_hash_b(RID p_material) const;
 

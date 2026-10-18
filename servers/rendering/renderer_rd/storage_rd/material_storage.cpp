@@ -554,6 +554,28 @@ _FORCE_INLINE_ static void _fill_std140_ubo_empty(ShaderLanguage::DataType type,
 	}
 }
 
+void MaterialStorage::fill_std140_uniform(const ShaderLanguage::ShaderNode::Uniform &p_uniform, const Variant *p_value, uint8_t *r_data, bool p_use_linear_color) {
+	if (p_value) {
+		_fill_std140_variant_ubo_value(p_uniform.type, p_uniform.array_size, *p_value, r_data, p_uniform.hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED ? false : p_use_linear_color);
+	} else if (p_uniform.default_value.size()) {
+		_fill_std140_ubo_value(p_uniform.type, p_uniform.default_value, r_data, p_uniform.hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR && p_use_linear_color);
+	} else if ((p_uniform.type == ShaderLanguage::TYPE_VEC3 || p_uniform.type == ShaderLanguage::TYPE_VEC4) && p_uniform.hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
+		// Colors default to black with alpha 1.0.
+		_fill_std140_variant_ubo_value(p_uniform.type, p_uniform.array_size, Color(0, 0, 0, 1), r_data, p_use_linear_color);
+	} else if ((p_uniform.type == ShaderLanguage::TYPE_VEC3 || p_uniform.type == ShaderLanguage::TYPE_VEC4) && p_uniform.hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED) {
+		_fill_std140_variant_ubo_value(p_uniform.type, p_uniform.array_size, Color(0, 0, 0, 1), r_data, false);
+	} else if (p_uniform.type == ShaderLanguage::TYPE_MAT2) {
+		// Matrices default to identity.
+		_fill_std140_variant_ubo_value(p_uniform.type, p_uniform.array_size, Transform2D(), r_data, false);
+	} else if (p_uniform.type == ShaderLanguage::TYPE_MAT3) {
+		_fill_std140_variant_ubo_value(p_uniform.type, p_uniform.array_size, Basis(), r_data, false);
+	} else if (p_uniform.type == ShaderLanguage::TYPE_MAT4) {
+		_fill_std140_variant_ubo_value(p_uniform.type, p_uniform.array_size, Projection(), r_data, false);
+	} else {
+		_fill_std140_ubo_empty(p_uniform.type, p_uniform.array_size, r_data);
+	}
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // MaterialStorage::ShaderData
 
@@ -790,40 +812,8 @@ void MaterialStorage::MaterialData::update_uniform_buffer(const HashMap<StringNa
 		}
 		ERR_CONTINUE(offset + size > p_buffer_size);
 #endif
-		uint8_t *data = &p_buffer[offset];
 		HashMap<StringName, Variant>::ConstIterator V = p_parameters.find(E.key);
-
-		if (V) {
-			//user provided
-			if (E.value.hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED) {
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, V->value, data, false);
-			} else {
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, V->value, data, p_use_linear_color);
-			}
-
-		} else if (E.value.default_value.size()) {
-			//default value
-			_fill_std140_ubo_value(E.value.type, E.value.default_value, data, E.value.hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR && p_use_linear_color);
-			//value=E.value.default_value;
-		} else {
-			//zero because it was not provided
-			if ((E.value.type == ShaderLanguage::TYPE_VEC3 || E.value.type == ShaderLanguage::TYPE_VEC4) && E.value.hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-				//colors must be set as black, with alpha as 1.0
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, Color(0, 0, 0, 1), data, p_use_linear_color);
-			} else if ((E.value.type == ShaderLanguage::TYPE_VEC3 || E.value.type == ShaderLanguage::TYPE_VEC4) && E.value.hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED) {
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, Color(0, 0, 0, 1), data, false);
-			} else if (E.value.type == ShaderLanguage::TYPE_MAT2) {
-				// mat uniforms are identity matrix by default.
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, Transform2D(), data, false);
-			} else if (E.value.type == ShaderLanguage::TYPE_MAT3) {
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, Basis(), data, false);
-			} else if (E.value.type == ShaderLanguage::TYPE_MAT4) {
-				_fill_std140_variant_ubo_value(E.value.type, E.value.array_size, Projection(), data, false);
-			} else {
-				//else just zero it out
-				_fill_std140_ubo_empty(E.value.type, E.value.array_size, data);
-			}
-		}
+		fill_std140_uniform(E.value, V ? &V->value : nullptr, &p_buffer[offset], p_use_linear_color);
 	}
 
 	if (uses_global_buffer != (global_buffer_E != nullptr)) {
@@ -2024,6 +2014,14 @@ RID MaterialStorage::global_shader_uniforms_get_storage_buffer() const {
 	return global_shader_uniforms.buffer;
 }
 
+uint32_t MaterialStorage::global_shader_parameters_instance_hash(int32_t p_offset) const {
+	// Every instance gets MAX_INSTANCE_UNIFORM_INDICES values (global_shader_parameters_instance_allocate()).
+	if (p_offset < 0 || uint32_t(p_offset) + ShaderLanguage::MAX_INSTANCE_UNIFORM_INDICES > global_shader_uniforms.buffer_size) {
+		return 0;
+	}
+	return hash_murmur3_buffer(global_shader_uniforms.buffer_values + p_offset, ShaderLanguage::MAX_INSTANCE_UNIFORM_INDICES * sizeof(GlobalShaderUniforms::Value));
+}
+
 RID MaterialStorage::global_shader_uniform_get_texture(const StringName &p_name) const {
 	const GlobalShaderUniforms::Variable *v = global_shader_uniforms.variables.getptr(p_name);
 	if (!v || v->buffer_index >= 0) {
@@ -2613,6 +2611,14 @@ String MaterialStorage::material_get_shader_code_rt(RID p_material) const {
 			return material->shader->code_rt;
 		}
 		return material->shader->code;
+	}
+	return String();
+}
+
+String MaterialStorage::material_get_shader_path_hint(RID p_material) const {
+	const Material *material = material_owner.get_or_null(p_material);
+	if (material && material->shader) {
+		return material->shader->path_hint;
 	}
 	return String();
 }

@@ -40,7 +40,7 @@
 
 #include "drivers/d3d12/d3d12_godot_nir_bridge.h"
 
-#define D3D12_BITCODE_OFFSETS_NUM_STAGES 3
+#define D3D12_BITCODE_OFFSETS_NUM_STAGES 8
 
 #if NIR_ENABLED
 struct nir_shader;
@@ -60,6 +60,13 @@ enum ResourceClass {
 };
 
 struct RenderingDXIL {
+	static void patch_specialization_constant(
+			RenderingDeviceCommons::PipelineSpecializationConstantType p_type,
+			const void *p_value,
+			const uint64_t p_bit_offset,
+			Vector<uint8_t> &r_bytecode,
+			bool p_is_first_patch);
+
 	static uint32_t patch_specialization_constant(
 			RenderingDeviceCommons::PipelineSpecializationConstantType p_type,
 			const void *p_value,
@@ -80,8 +87,12 @@ public:
 	static constexpr uint32_t ROOT_CONSTANT_SPACE = 1;
 	static constexpr uint32_t ROOT_CONSTANT_REGISTER = 0;
 	static constexpr uint32_t RUNTIME_DATA_REGISTER = 1;
-	// Register slots reserved for an unbounded (runtime-sized) array: room for 200000 descriptors.
-	static constexpr uint32_t UNBOUNDED_ARRAY_SLOTS = 2;
+	// An unbounded (runtime-sized) array has a register space of its own, from this one up (Mesa keeps 5 bits of space),
+	// at register 0, declared with this many elements; its root signature range has no bound. It keeps a slot in space 0
+	// only so that no other uniform shares its slot number.
+	static constexpr uint32_t UNBOUNDED_ARRAY_SPACE_BASE = 2;
+	static constexpr uint32_t UNBOUNDED_ARRAY_SPACE_MAX = 31;
+	static constexpr uint32_t UNBOUNDED_ARRAY_DECLARED_LENGTH = 1000000;
 	static constexpr uint32_t FORMAT_VERSION = 2;
 	static constexpr uint32_t SHADER_STAGES_BIT_OFFSET_INDICES[RenderingDeviceCommons::SHADER_STAGE_MAX] = {
 		0, // SHADER_STAGE_VERTEX
@@ -89,6 +100,11 @@ public:
 		UINT32_MAX, // SHADER_STAGE_TESSELATION_CONTROL
 		UINT32_MAX, // SHADER_STAGE_TESSELATION_EVALUATION
 		2, // SHADER_STAGE_COMPUTE
+		3, // SHADER_STAGE_RAYGEN,
+		4, // SHADER_STAGE_ANY_HIT
+		5, // SHADER_STAGE_CLOSEST_HIT
+		6, // SHADER_STAGE_MISS
+		7, // SHADER_STAGE_INTERSECTION
 	};
 
 	struct ReflectionBindingSetDataD3D12 {
@@ -111,6 +127,11 @@ public:
 		uint64_t stages_bit_offsets[D3D12_BITCODE_OFFSETS_NUM_STAGES] = {};
 	};
 
+	struct ShaderConfigDataD3D12 {
+		uint32_t payload_size_in_bytes = 0;
+		uint32_t attribute_size_in_bytes = 0;
+	};
+
 protected:
 	struct ReflectionDataD3D12 {
 		uint32_t spirv_specialization_constants_ids_mask = 0;
@@ -130,16 +151,31 @@ protected:
 	Vector<ReflectionSpecializationDataD3D12> reflection_specialization_data_d3d12;
 	Vector<uint8_t> root_signature_bytes;
 	uint32_t root_signature_crc = 0;
+	Vector<ShaderConfigDataD3D12> shader_config_data_d3d12;
 
 #if NIR_ENABLED
-	bool _convert_spirv_to_nir(Span<ReflectShaderStage> p_spirv, const nir_shader_compiler_options *p_compiler_options, HashMap<int, nir_shader *> &r_stages_nir_shaders, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed);
+	bool _convert_spirv_to_nir(Span<ReflectShaderStage> p_spirv, const nir_shader_compiler_options *p_compiler_options, HashMap<int, nir_shader *> &r_stages_nir_shaders, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed, Vector<ShaderConfigDataD3D12> &r_shader_configs);
 	bool _convert_nir_to_dxil(const HashMap<int, nir_shader *> &p_stages_nir_shaders, BitField<RenderingDeviceCommons::ShaderStage> p_stages_processed, HashMap<RenderingDeviceCommons::ShaderStage, Vector<uint8_t>> &r_dxil_blobs);
-	bool _convert_spirv_to_dxil(Span<ReflectShaderStage> p_spirv, HashMap<RenderingDeviceCommons::ShaderStage, Vector<uint8_t>> &r_dxil_blobs, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed);
+	bool _convert_spirv_to_dxil(Span<ReflectShaderStage> p_spirv, HashMap<RenderingDeviceCommons::ShaderStage, Vector<uint8_t>> &r_dxil_blobs, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed, Vector<ShaderConfigDataD3D12> &r_shader_configs);
 	bool _generate_root_signature(BitField<RenderingDeviceCommons::ShaderStage> p_stages_processed);
 
 	// The register slot of each binding (parallel to reflection_binding_set_uniforms_data), compilation only. Dynamic
 	// buffers, which become root descriptors, come first so their registers stay small.
 	LocalVector<uint32_t> dxil_binding_slots;
+	LocalVector<uint32_t> dxil_binding_spaces; // Register space of each uniform: 0, or its own for an unbounded array.
+	void _place_unbounded_arrays(nir_shader *p_shader) const;
+	// A stage reads a GPU pointer: Mesa reaches the buffer through the descriptor heap (SM 6.6), which the root signature
+	// must allow. Only such shaders get the flag, which needs dynamic resources on the device.
+	bool uses_descriptor_heap_indexing = false;
+	static bool _uses_descriptor_heap_indexing(nir_shader *p_shader);
+	// Ray queries need Shader Model 6.5.
+	static bool _uses_ray_queries(nir_shader *p_shader);
+	// Hit objects (shader execution reordering) need Shader Model 6.9.
+	static bool _uses_hit_objects(nir_shader *p_shader);
+	// The stages whose SPIR-V declares RayTracingOpacityMicromapEXT (GL_EXT_opacity_micromap): their ray queries are
+	// allocated with opacity micromaps allowed (AllocateRayQuery2, Shader Model 6.9). Compilation only.
+	BitField<RenderingDeviceCommons::ShaderStage> opacity_micromap_stages = {};
+	static bool _declares_opacity_micromaps(Span<uint32_t> p_spirv);
 	uint32_t dxil_binding_slots_end = 0;
 	void _assign_dxil_slots();
 	uint32_t _find_binding(uint32_t p_set, uint32_t p_binding) const;
@@ -177,6 +213,7 @@ public:
 		Vector<ReflectionSpecializationDataD3D12> reflection_specialization_data_d3d12;
 		Vector<uint8_t> root_signature_bytes;
 		uint32_t root_signature_crc = 0;
+		Vector<ShaderConfigDataD3D12> shader_config_data_d3d12;
 	};
 
 	RenderingShaderContainerD3D12();

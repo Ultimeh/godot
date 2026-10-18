@@ -18,6 +18,8 @@ struct HitData {
 	vec3 geometry_normal; // World space, flipped for back-face hits.
 	vec3 tangent; // World space.
 	vec3 bitangent; // World space.
+	vec3 mesh_pos; // Mesh space: the instance transform of a compressed mesh also scales by its AABB.
+	vec3 mesh_normal; // Mesh space, not flipped.
 	vec2 uv; // Raw UV (no material scale/offset applied).
 	vec4 color; // Vertex color (white if not present).
 	bool is_front_face;
@@ -51,6 +53,7 @@ HitData compute_hit_data() {
 	if ((geom.flags & FLAG_PROCEDURAL) != 0u) {
 		h.uv = hit_attribs.bary_or_uv;
 		vec3 obj_normal = normalize(unpackSnorm4x8(hit_attribs.packed_normal).xyz);
+		h.mesh_normal = obj_normal;
 		vec3 obj_tangent = normalize(unpackSnorm4x8(hit_attribs.packed_tangent).xyz);
 		h.geometry_normal = normalize(normal_matrix * obj_normal);
 		h.tangent = normalize(normal_matrix * obj_tangent);
@@ -65,6 +68,7 @@ HitData compute_hit_data() {
 	{
 		// Triangle hit: reuse `attrs` from the top-level fetch (already has
 		// UV / TBN from FETCH_UV | FETCH_TBN or FETCH_ALL).
+		h.mesh_normal = attrs.normal;
 		h.geometry_normal = normalize(normal_matrix * attrs.normal);
 		h.tangent = normalize(normal_matrix * attrs.tangent);
 		h.bitangent = cross(h.geometry_normal, h.tangent) * attrs.bitangent_sign;
@@ -76,6 +80,25 @@ HitData compute_hit_data() {
 	}
 
 	h.hit_pos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+	h.mesh_pos = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT;
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		h.mesh_pos = h.mesh_pos * vec3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z) + vec3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z);
+	}
+
+	if ((geom.flags & FLAG_DISPLACED) != 0u) {
+		// The TBN block holds the rest frame (vertex()'s input); the geometric normal comes from the displaced triangle.
+		uint i0, i1, i2;
+		get_triangle_indices(geom, i0, i1, i2);
+		FloatBuffer vb = FloatBuffer(geom.vertex_address);
+		vec3 p0 = vec3(vb.v[i0 * 3u], vb.v[i0 * 3u + 1u], vb.v[i0 * 3u + 2u]);
+		vec3 p1 = vec3(vb.v[i1 * 3u], vb.v[i1 * 3u + 1u], vb.v[i1 * 3u + 2u]);
+		vec3 p2 = vec3(vb.v[i2 * 3u], vb.v[i2 * 3u + 1u], vb.v[i2 * 3u + 2u]);
+		vec3 face_normal = transpose(mat3(gl_WorldToObjectEXT)) * cross(p1 - p0, p2 - p0);
+		if (dot(face_normal, face_normal) > 1e-20) {
+			face_normal = normalize(face_normal);
+			h.geometry_normal = dot(face_normal, gl_WorldRayDirectionEXT) > 0.0 ? -face_normal : face_normal;
+		}
+	}
 
 	return h;
 }
@@ -99,6 +122,25 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 		return sample_bindless_texture_point(tex_idx, uv);
 	}
 	return sample_bindless_texture(tex_idx, uv);
+}
+
+/// With the screen derivatives of the coordinates, for the mip level raster picks.
+vec4 sample_material_texture_grad(uint tex_idx, vec2 uv, vec2 uv_ddx, vec2 uv_ddy, uint mat_flags) {
+	if ((mat_flags & 4u) != 0u) {
+		return sample_bindless_texture_point(tex_idx, uv);
+	}
+	if ((mat_flags & MAT_FLAG_ANISOTROPIC_FILTER) != 0u) {
+		return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT), uv, uv_ddx, uv_ddy);
+	}
+	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, uv_ddx, uv_ddy);
+}
+
+/// BaseMaterial3D's triplanar_texture().
+vec4 sample_material_triplanar(uint tex_idx, vec3 weights, vec3 triplanar_pos, vec3 pos_ddx, vec3 pos_ddy, uint mat_flags) {
+	vec4 samp = sample_material_texture_grad(tex_idx, triplanar_pos.xy, pos_ddx.xy, pos_ddy.xy, mat_flags) * weights.z;
+	samp += sample_material_texture_grad(tex_idx, triplanar_pos.xz, pos_ddx.xz, pos_ddy.xz, mat_flags) * weights.y;
+	samp += sample_material_texture_grad(tex_idx, triplanar_pos.zy * vec2(-1.0, 1.0), pos_ddx.zy * vec2(-1.0, 1.0), pos_ddy.zy * vec2(-1.0, 1.0), mat_flags) * weights.x;
+	return samp;
 }
 
 /// Apply tangent-space normal map to geometry normal.
@@ -194,6 +236,11 @@ void write_primary_hit_velocity(vec3 hit_pos) {
 					prev_vb.v[i2 * stride_floats + 2u]);
 			prev_obj_pos = bary.x * p0 + bary.y * p1 + bary.z * p2;
 		}
+	} else if (geom.multimesh_previous_offset != geom.multimesh_offset) {
+		// A merged MultiMesh whose instances moved, as raster's motion vectors see them.
+		uint i0, i1, i2;
+		get_triangle_indices(geom, i0, i1, i2);
+		prev_obj_pos = multimesh_previous_position(geom, i0, obj_pos);
 	}
 #endif
 
@@ -449,14 +496,57 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec3 N = clampShadingNormal(m.normal, h.geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 	float NdotV = max(dot(N, V), 0.0001);
 
+	// A front layer ray (raygen): a direction in this transparent surface's specular lobe, for its reflection. The raster
+	// transparent pass shades the surface.
+	if (is_front_layer_ray(ps.packed_bounces_flags)) {
+		MaterialProperties front_mat;
+		front_mat.baseColor = m.albedo;
+		front_mat.metalness = m.metalness;
+		front_mat.roughness = m.roughness;
+		front_mat.dielectricF0 = specular_to_f0(m.specular);
+		front_mat.emissive = vec3(0.0);
+		front_mat.transmissivness = 0.0;
+		front_mat.opacity = 1.0;
+		// The material's normal as raster reflects on it: clamping it toward the faceted geometry at grazing angles
+		// would reflect the triangles of a displaced surface (waves) instead of its smooth normal.
+		vec3 front_dir;
+		vec3 front_weight;
+		if (!evalIndirectCombinedBRDF(rand2(ps.rng_state), m.normal, m.normal, V, front_mat, SPECULAR_TYPE, front_dir, front_weight, vec4(0.0))) {
+			front_dir = reflect(-V, m.normal);
+		}
+		// Below the surface, the ray would cross it: mirror it back above.
+		front_dir -= 2.0 * min(dot(front_dir, h.geometry_normal), 0.0) * h.geometry_normal;
+		ps.hit_t = gl_HitTEXT;
+		ps.offset_normal = h.geometry_normal;
+		ps.next_ray_dir = front_dir;
+#ifdef DLSS_RR_ENABLED
+		// For the raygen, which blends Ray Reconstruction's albedo and roughness guides toward this surface where its
+		// reflection dominates (DLSS-RR Integration Guide, 3.4.1): its specular albedo (with the geometry normal, so the
+		// waves of a normal map do not make the guides noisy) and roughness in the radiance, its diffuse albedo in the
+		// throughput. Neither is read again for this ray.
+		const float front_NdotV = max(dot(h.geometry_normal, V), 0.0001);
+		const vec3 front_specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, front_mat.dielectricF0, m.roughness, front_NdotV);
+		ps.radiance = vec3(dot(front_specular_albedo, vec3(1.0 / 3.0)), m.roughness, 0.0);
+		ps.throughput = DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness);
+#endif
+		path_pack(payload, ps);
+		return;
+	}
+
 	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
 	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
 
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
-	// Emissive contribution.
-	ps.radiance += ps.throughput * m.emissive;
+	// Emissive contribution; raster's unshaded output is the albedo alone. An unshaded surface is seen, in reflections too,
+	// but lights nothing, as in raster: its albedo after a diffuse bounce made small unshaded shapes (candle flames) into
+	// lights only rare paths reach, noise the denoiser turned into a shimmer.
+	ps.radiance += ps.throughput * (m.unshaded ? (diffuse_bounces == 0u ? m.albedo : vec3(0.0)) : m.emissive);
+	if (m.unshaded) {
+		m.metalness = 0.0;
+		m.roughness = 1.0;
+	}
 
 	// Bounce limit check.
 	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
@@ -501,7 +591,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 			rayQueryEXT spec_rq;
 			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
+					RT_MASK_CAMERA, spec_origin, 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(
@@ -520,6 +610,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	}
 #endif
 
+	if (m.unshaded) {
+		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+		path_pack(payload, ps);
+		return;
+	}
+
 	// =================================================================
 	// NEE: Next Event Estimation (direct light sampling)
 	// =================================================================
@@ -528,10 +624,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	if (rt_light_count > 0u) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
+		vec3 hit_pos_back = offset_ray_origin(h.hit_pos, -h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
-		ps.radiance += ps.throughput * direct_light;
+				hit_pos_offset, hit_pos_back, h.geometry_normal, N, V, brdf_mat, m.backlight, m.specular_disabled, ps.rng_state, is_indirect, rt_light_count, geometries[h.geometry_idx].layer_mask);
+		ps.radiance += ps.throughput * direct_light * mix(1.0, m.ao, m.ao_light_affect);
 	}
 
 	// =================================================================
@@ -577,6 +674,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	}
 
 	ps.throughput *= brdf_weight;
+	if (brdfType == DIFFUSE_TYPE) {
+		ps.throughput *= m.ao; // As raster's AO on the ambient (indirect diffuse) light.
+	}
 
 	if (brdfType == DIFFUSE_TYPE) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);

@@ -106,8 +106,11 @@ Error RenderingContextDriverD3D12::_init_device_factory() {
 	ERR_FAIL_NULL_V(lib_dcomp, ERR_CANT_CREATE);
 #endif
 
-	// Streamline doesn't currently support device factories, so fall back to default D3D12CreateDevice
-	if (Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12GetInterface)) {
+	// Streamline only sees the devices it creates. A device from the Agility SDK's factory is handed to it with
+	// slUpgradeInterface() (RenderingDeviceDriverD3D12::_initialize_device()); without that function, Streamline must
+	// create the device, with the system's D3D12 runtime.
+	if (Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12GetInterface) &&
+			!Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_slUpgradeInterface)) {
 		return OK;
 	}
 
@@ -122,9 +125,14 @@ Error RenderingContextDriverD3D12::_init_device_factory() {
 	if (SUCCEEDED(hr)) {
 		hr = sdk_config->CreateDeviceFactory(agility_sdk_version, agility_sdk_path.ascii().get_data(), IID_PPV_ARGS(device_factory.GetAddressOf()));
 		if (FAILED(hr)) {
-			sdk_config->CreateDeviceFactory(agility_sdk_version, ".\\", IID_PPV_ARGS(device_factory.GetAddressOf()));
+			hr = sdk_config->CreateDeviceFactory(agility_sdk_version, ".\\", IID_PPV_ARGS(device_factory.GetAddressOf()));
 		}
 		// If both calls failed, device factory is going to be nullptr, and D3D12CreateDevice is going to be used as fallback.
+		// The runtime then is the system's, silently: no shader model it lacks (6.9: shader execution reordering, opacity
+		// micromaps), so say why.
+		if (FAILED(hr)) {
+			WARN_PRINT(vformat("Direct3D 12: the Agility SDK %d (D3D12Core.dll of that version, in %s or next to the executable) could not be loaded (0x%08ux). The system's Direct3D 12 runtime is used instead, and the shader models it lacks are unavailable.", agility_sdk_version, agility_sdk_path, (uint64_t)hr));
+		}
 	}
 	return OK;
 }

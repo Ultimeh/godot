@@ -178,12 +178,22 @@ private:
 	bool blend_splits;
 	ShadowMode shadow_mode;
 	SkyMode sky_mode = SKY_MODE_LIGHT_AND_SKY;
+	Vector2 projector_size = Vector2(100, 100);
+	Vector2 projector_offset;
 
 protected:
 	static void _bind_methods();
 	void _validate_property(PropertyInfo &p_property) const;
 
 public:
+	virtual PackedStringArray get_configuration_warnings() const override;
+
+	void set_projector_size(const Vector2 &p_size);
+	Vector2 get_projector_size() const;
+
+	void set_projector_offset(const Vector2 &p_offset);
+	Vector2 get_projector_offset() const;
+
 	void set_shadow_mode(ShadowMode p_mode);
 	ShadowMode get_shadow_mode() const;
 

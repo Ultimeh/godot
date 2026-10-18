@@ -19,7 +19,9 @@
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
 #define RT_PARAM_MAX_BOUNCES 2 // rt_params[0].z - Maximum ray bounces
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
-// Indices 4-13 reserved for future use
+#define RT_PARAM_FRONT_LAYER_COUNT 4 // rt_params[1].x - Transparent surfaces in the TLAS (front layer reflections)
+#define RT_PARAM_DECAL_COUNT 5 // rt_params[1].y - Decals in the decal buffer (raytracing_decals_inc.glsl)
+// Indices 6-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
@@ -119,6 +121,15 @@ bool is_shadow_ray(uint packed) {
 	return (packed & SHADOW_RAY_FLAG) != 0u;
 }
 
+// Front layer ray flag (bit 27): the closest hit returns the transparent surface's reflection direction, unshaded.
+const uint FRONT_LAYER_RAY_FLAG = (1u << 27);
+uint set_front_layer_ray(uint packed) {
+	return packed | FRONT_LAYER_RAY_FLAG;
+}
+bool is_front_layer_ray(uint packed) {
+	return (packed & FRONT_LAYER_RAY_FLAG) != 0u;
+}
+
 const uint PATH_TERMINATED_FLAG = (1u << 26);
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
@@ -137,11 +148,7 @@ bool is_path_terminated(uint packed) {
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-const uint OFFSET_NONE = 0xFFFFFFFFu;
-const uint FLAG_COMPRESSED = 1u;
-const uint FLAG_PROCEDURAL = 2u;
-// Set when the BLAS uses a per-frame-deformed vertex buffer.
-const uint FLAG_DEFORMED = 4u;
+#include "raytracing_geometry_consts_inc.glsl"
 
 // ============================================================================
 // RANDOM NUMBER GENERATION - PCG (Permuted Congruential Generator)

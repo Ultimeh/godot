@@ -654,15 +654,21 @@ void vertex_shader(vec3 vertex_input,
 			if (directional_lights.data[i].bake_mode == LIGHT_BAKE_STATIC && bool(instance_flags & INSTANCE_FLAGS_USE_LIGHTMAP)) {
 				continue; // Statically baked light and object uses lightmap, skip.
 			}
+			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
+#ifdef USE_DIRECTIONAL_LIGHT_PROJECTOR
+			if (directional_lights.data[i].projector_enabled != 0u) {
+				directional_color *= directional_light_projector_color_lod(directional_lights.data[i].projector_uv_x, directional_lights.data[i].projector_uv_y, vertex);
+			}
+#endif
 			if (i == 0) {
 				light_compute_vertex(normal, directional_lights.data[0].direction, view,
-						directional_lights.data[0].color * directional_lights.data[0].energy,
+						directional_color,
 						true, roughness,
 						directional_diffuse,
 						directional_specular);
 			} else {
 				light_compute_vertex(normal, directional_lights.data[i].direction, view,
-						directional_lights.data[i].color * directional_lights.data[i].energy,
+						directional_color,
 						true, roughness,
 						diffuse_light_interp.rgb,
 						specular_light_interp.rgb);
@@ -886,9 +892,21 @@ void main() {
 
 #[fragment]
 
-#version 450
+// 460: glslang declares rayQueryEXT from it on (USE_RT_SHADOWS).
+#version 460
 
 #VERSION_DEFINES
+
+#ifdef USE_RT_SHADOWS
+#extension GL_EXT_ray_query : require
+#ifdef RT_OPACITY_MICROMAPS
+#extension GL_EXT_opacity_micromap : require
+#endif
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
 
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
@@ -903,6 +921,32 @@ void main() {
 #include "../half_inc.glsl"
 
 #include "scene_forward_clustered_inc.glsl"
+
+#ifdef USE_RT_SHADOWS
+// The path tracer's TLAS, in its transparent pass: the lights shadow the transparent surfaces with rays through it.
+layout(set = 1, binding = 39) uniform accelerationStructureEXT rt_shadow_tlas;
+
+// What its alpha test reads of the alpha clipped surfaces the rays meet: their geometry, material and textures.
+#define RT_NO_HIT_BUILTINS
+#define PI M_PI
+#include "../raytracing/raytracing_geometry_consts_inc.glsl"
+#include "../raytracing/raytracing_hit_inc.glsl"
+#undef PI
+
+// clang-format off
+layout(set = 1, binding = 40, std430) readonly buffer RTShadowGeometryBuffer {
+	GeometryData geometries[];
+};
+
+layout(set = 1, binding = 41, std430) readonly buffer RTShadowMaterialBuffer {
+	MaterialData materials[];
+};
+// clang-format on
+
+layout(set = 4, binding = 0) uniform texture2D bindless_textures[];
+
+#include "../raytracing/raytracing_alpha_test_inc.glsl"
+#endif
 
 /* Varyings */
 
@@ -1105,6 +1149,45 @@ layout(location = 2) out vec2 motion_vector;
 #if !defined(SPECULAR_DISABLED) && !defined(SPECULAR_SCHLICK_GGX) && !defined(SPECULAR_TOON)
 #define SPECULAR_SCHLICK_GGX
 #endif
+
+#ifdef USE_RT_SHADOWS
+// The instance mask of the path tracer's shadow rays (RT_MASK_SHADOW), and their flags (RT_SHADOW_RAY_FLAGS): the faces
+// turned away from the light do not shadow, as raster's shadow pass culls them.
+#define RT_SHADOWS_MASK 0x02
+#define RT_SHADOWS_RAY_FLAGS (gl_RayFlagsCullFrontFacingTrianglesEXT | gl_RayFlagsTerminateOnFirstHitEXT)
+
+// 1.0 when nothing the path tracer's shadow rays see lies within p_max_dist of the point towards the light, else 0.0.
+// The point and the directions are in view space. The ray leaves the surface on the light's side, far enough for the
+// interpolated position's error, which grows with the distance to the camera.
+float rt_shadow_visibility(vec3 p_vertex, vec3 p_geo_normal, vec3 p_light_dir, float p_max_dist) {
+	vec4 row0 = scene_data_block.data.inv_view_matrix[0];
+	vec4 row1 = scene_data_block.data.inv_view_matrix[1];
+	vec4 row2 = scene_data_block.data.inv_view_matrix[2];
+	vec3 offset = p_geo_normal * ((dot(p_geo_normal, p_light_dir) >= 0.0 ? 1.0 : -1.0) * (0.002 + 0.0002 * length(p_vertex)));
+	vec4 origin = vec4(p_vertex + offset, 1.0);
+	vec4 direction = vec4(p_light_dir, 0.0);
+	vec3 world_origin = vec3(dot(row0, origin), dot(row1, origin), dot(row2, origin));
+	vec3 world_direction = normalize(vec3(dot(row0, direction), dot(row1, direction), dot(row2, direction)));
+	float t_max = p_max_dist - length(offset);
+	if (!(t_max > 0.002)) {
+		return 1.0;
+	}
+
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, rt_shadow_tlas, RT_SHADOWS_RAY_FLAGS, RT_SHADOWS_MASK, world_origin, 0.001, world_direction, t_max - 0.001);
+	// The instances that are not opaque (alpha clip) are tested as the path tracer's ray queries test them.
+	while (rayQueryProceedEXT(rq)) {
+		if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+				ray_query_alpha_test(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false), rayQueryGetIntersectionPrimitiveIndexEXT(rq, false), rayQueryGetIntersectionBarycentricsEXT(rq, false))) {
+			rayQueryConfirmIntersectionEXT(rq);
+		}
+	}
+	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+
+// The distance a directional light's shadow rays go, as the path tracer's.
+#define RT_SHADOWS_DIRECTIONAL_DISTANCE 10000.0
+#endif // USE_RT_SHADOWS
 
 #include "../scene_forward_lights_inc.glsl"
 
@@ -2225,6 +2308,17 @@ void fragment_shader(in SceneData scene_data) {
 			// Alpha is premultiplied.
 			indirect_specular_light = indirect_specular_light * (1.0 - ssr.a) + ssr.rgb;
 		}
+
+#ifndef USE_MULTIVIEW
+		// The path tracer's reflection of the first transparent surface in front of the opaque ones, in place of the
+		// probes and sky where this fragment is that surface (alpha: its view depth).
+		if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_FRONT_LAYER_REFLECTION)) {
+			vec4 front_layer = texelFetch(sampler2D(ssr_buffer, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0);
+			if (front_layer.a > 0.0 && abs(front_layer.a + vertex.z) < 0.05 + front_layer.a * 0.01) {
+				indirect_specular_light = front_layer.rgb;
+			}
+		}
+#endif
 	}
 #endif // AMBIENT_LIGHT_DISABLED
 
@@ -2340,6 +2434,18 @@ void fragment_shader(in SceneData scene_data) {
 
 				float shadow = 1.0;
 
+#ifdef USE_RT_SHADOWS
+				if (directional_lights.data[i].shadow_opacity > 0.001) {
+					// As the path traced surfaces: at every distance, without the shadow maps' fade.
+					shadow = rt_shadow_visibility(vertex, geo_normal, directional_lights.data[i].direction, RT_SHADOWS_DIRECTIONAL_DISTANCE);
+#ifdef USE_VERTEX_LIGHTING
+					diffuse_light *= mix(1.0, shadow, diffuse_light_interp.a);
+					direct_specular_light *= mix(1.0, shadow, specular_light_interp.a);
+#endif
+				}
+#endif // USE_RT_SHADOWS
+
+#ifndef USE_RT_SHADOWS
 				if (directional_lights.data[i].shadow_opacity > 0.001) {
 					float depth_z = -vertex.z;
 					vec3 light_dir = directional_lights.data[i].direction;
@@ -2543,6 +2649,7 @@ void fragment_shader(in SceneData scene_data) {
 
 #undef BIAS_FUNC
 				} // shadows
+#endif // !USE_RT_SHADOWS
 
 				if (i < 4) {
 					shadow0 |= uint(clamp(shadow * 255.0, 0.0, 255.0)) << (i * 8);
@@ -2582,7 +2689,7 @@ void fragment_shader(in SceneData scene_data) {
 
 #ifdef LIGHT_TRANSMITTANCE_USED
 			float transmittance_z = transmittance_depth;
-#ifndef SHADOWS_DISABLED
+#if !defined(SHADOWS_DISABLED) && !defined(USE_RT_SHADOWS) // The path tracer's transparent pass reads no shadow map.
 			if (directional_lights.data[i].shadow_opacity > 0.001) {
 				float depth_z = -vertex.z;
 
@@ -2661,11 +2768,18 @@ void fragment_shader(in SceneData scene_data) {
 
 			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
 
+			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
+#ifdef USE_DIRECTIONAL_LIGHT_PROJECTOR
+			if (directional_lights.data[i].projector_enabled != 0u) {
+				directional_color *= directional_light_projector_color(directional_lights.data[i].projector_uv_x, directional_lights.data[i].projector_uv_y, vertex, vertex_ddx, vertex_ddy);
+			}
+#endif
+
 			light_compute(normal, directional_lights.data[i].direction, normalize(view), size_A,
 #ifndef DEBUG_DRAW_PSSM_SPLITS
-					directional_lights.data[i].color * directional_lights.data[i].energy,
+					directional_color,
 #else
-					directional_lights.data[i].color * directional_lights.data[i].energy * tint,
+					directional_color * tint,
 #endif
 					true, shadow, f0, roughness, metallic, directional_lights.data[i].specular, albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED

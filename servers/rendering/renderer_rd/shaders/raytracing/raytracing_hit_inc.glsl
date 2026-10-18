@@ -1,5 +1,7 @@
 // Shared utilities for hit shaders (closest_hit, any_hit)
 // Requires: GL_EXT_buffer_reference, GL_ARB_gpu_shader_int64, oct_inc.glsl, raytracing_inc.glsl
+// (or raytracing_geometry_consts_inc.glsl). RT_NO_HIT_BUILTINS leaves out what reads the hit shaders' built-ins, for
+// the other stages.
 
 #include "raytracing_data_inc.glsl"
 
@@ -60,22 +62,121 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 	}
 }
 
+#ifndef RT_NO_HIT_BUILTINS
 /// Convenience wrapper using gl_PrimitiveID (hit shaders only).
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
 	get_triangle_indices_ex(geom, gl_PrimitiveID, i0, i1, i2);
 }
+#endif
+
+/// Displaced geometry: a vertex's position before vertex() moved it (mesh space).
+vec3 fetch_rest_vertex(in GeometryData geom, uint index) {
+	FloatBuffer rest = FloatBuffer(uint64_t(geom.rest_vertex_address_lo) | (uint64_t(geom.rest_vertex_address_hi) << 32));
+	return vec3(rest.v[index * 3u], rest.v[index * 3u + 1u], rest.v[index * 3u + 2u]);
+}
+
+/// A vertex position as the BLAS has it: normalized to the surface AABB for a compressed mesh, whose instance
+/// transform also scales by that AABB.
+vec3 fetch_blas_position(in GeometryData geom, uint index) {
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		Uint32Buffer vb = Uint32Buffer(geom.vertex_address);
+		uint w0 = vb.v[index * 2u];
+		uint w1 = vb.v[index * 2u + 1u];
+		return vec3(float(w0 & 0xFFFFu), float(w0 >> 16), float(w1 & 0xFFFFu)) / 65535.0;
+	}
+	FloatBuffer vb = FloatBuffer(geom.vertex_address);
+	uint stride = geom.position_stride >> 2;
+	return vec3(vb.v[index * stride], vb.v[index * stride + 1u], stride > 2u ? vb.v[index * stride + 2u] : 0.0);
+}
+
+/// A vertex position in mesh space, as vertex() receives it.
+vec3 fetch_mesh_position(in GeometryData geom, uint index) {
+	vec3 p = fetch_blas_position(geom, index);
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		p = p * vec3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z) + vec3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z);
+	}
+	return p;
+}
+
+#ifndef RT_NO_HIT_BUILTINS
+/// The barycentrics of the point where the ray p_origin + t * p_direction meets the triangle's plane.
+vec3 ray_plane_barycentrics(vec3 p_origin, vec3 p_direction, vec3 p0, vec3 e1, vec3 e2, vec3 n) {
+	float denom = dot(p_direction, n);
+	if (abs(denom) < 1e-12) {
+		return vec3(-1.0);
+	}
+	vec3 p = p_origin + p_direction * (dot(p0 - p_origin, n) / denom);
+	vec3 d = p - p0;
+	float d00 = dot(e1, e1);
+	float d01 = dot(e1, e2);
+	float d11 = dot(e2, e2);
+	float d20 = dot(d, e1);
+	float d21 = dot(d, e2);
+	float inv = 1.0 / (d00 * d11 - d01 * d01);
+	float v = (d11 * d20 - d01 * d21) * inv;
+	float w = (d00 * d21 - d01 * d20) * inv;
+	return vec3(1.0 - v - w, v, w);
+}
+
+/// The world direction of the camera ray through a pixel (as the raygen shader builds it, without jitter).
+vec3 camera_ray_direction(vec2 p_pixel) {
+	vec2 d = (p_pixel + 0.5) / vec2(gl_LaunchSizeEXT.xy) * 2.0 - 1.0;
+	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(d, 1.0, 1.0);
+	mat3 inv_view = transpose(mat3(scene_data_block.data.inv_view_matrix[0].xyz, scene_data_block.data.inv_view_matrix[1].xyz, scene_data_block.data.inv_view_matrix[2].xyz));
+	return normalize(inv_view * normalize(target.xyz));
+}
+
+/// Screen derivatives of the hit's barycentrics, what raster's dFdx()/dFdy() see on interpolated values. A camera ray
+/// is differentiated against its neighboring pixels' rays; any other ray as a cone of one pixel's angle from its origin.
+void hit_barycentric_derivatives(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary, out vec3 r_ddx, out vec3 r_ddy) {
+	r_ddx = vec3(0.0);
+	r_ddy = vec3(0.0);
+	vec3 p0 = gl_ObjectToWorldEXT * vec4(fetch_blas_position(geom, i0), 1.0);
+	vec3 e1 = gl_ObjectToWorldEXT * vec4(fetch_blas_position(geom, i1), 1.0) - p0;
+	vec3 e2 = gl_ObjectToWorldEXT * vec4(fetch_blas_position(geom, i2), 1.0) - p0;
+	vec3 n = cross(e1, e2);
+	if (dot(n, n) < 1e-24) {
+		return;
+	}
+	vec3 origin = gl_WorldRayOriginEXT;
+	vec3 direction = gl_WorldRayDirectionEXT;
+	vec3 camera_position = vec3(scene_data_block.data.inv_view_matrix[0].w, scene_data_block.data.inv_view_matrix[1].w, scene_data_block.data.inv_view_matrix[2].w);
+	vec3 dir_x, dir_y;
+	if (distance(origin, camera_position) < 1e-3) {
+		vec2 pixel = vec2(gl_LaunchIDEXT.xy);
+		vec3 center = camera_ray_direction(pixel);
+		dir_x = direction + camera_ray_direction(pixel + vec2(1.0, 0.0)) - center;
+		dir_y = direction + camera_ray_direction(pixel + vec2(0.0, 1.0)) - center;
+	} else {
+		float pixel_angle = 2.0 / (float(gl_LaunchSizeEXT.y) * abs(scene_data_block.data.projection_matrix[1][1]));
+		vec3 u = normalize(cross(direction, abs(direction.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+		vec3 v = cross(direction, u);
+		dir_x = direction + u * pixel_angle;
+		dir_y = direction + v * pixel_angle;
+	}
+	vec3 bx = ray_plane_barycentrics(origin, dir_x, p0, e1, e2, n);
+	vec3 by = ray_plane_barycentrics(origin, dir_y, p0, e1, e2, n);
+	if (bx.x > -0.5 || bx.y > -0.5) {
+		r_ddx = bx - bary;
+	}
+	if (by.x > -0.5 || by.y > -0.5) {
+		r_ddy = by - bary;
+	}
+}
+#endif
 
 // ============================================================================
 // UV FETCHING
 // ============================================================================
-vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
-	if (geom.uv_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
+// UV or UV2 at byte offset p_offset, with the compression scale packed in p_scale_packed.
+vec2 fetch_uv_attribute(in GeometryData geom, uint p_offset, uint p_scale_packed, uint i0, uint i1, uint i2, vec3 bary) {
+	if (p_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
 		return vec2(0.0);
 	}
 
 	uint stride_words = geom.attribute_stride >> 2;
-	uint uv_word_off = geom.uv_byte_offset >> 2;
-	bool compressed = (geom.flags & FLAG_COMPRESSED) != 0u;
+	uint uv_word_off = p_offset >> 2;
+	bool compressed = (geom.flags & (FLAG_COMPRESSED | FLAG_COMPRESSED_ATTRIBUTES)) != 0u;
 
 	vec2 uv0, uv1, uv2;
 
@@ -89,7 +190,7 @@ vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 		uv1 = vec2(float(p1 & 0xFFFFu), float(p1 >> 16)) / 65535.0;
 		uv2 = vec2(float(p2 & 0xFFFFu), float(p2 >> 16)) / 65535.0;
 
-		vec2 scale = unpackHalf2x16(geom.uv_scale_packed);
+		vec2 scale = unpackHalf2x16(p_scale_packed);
 		if (scale.x != 0.0 || scale.y != 0.0) {
 			uv0 = (uv0 - 0.5) * scale;
 			uv1 = (uv1 - 0.5) * scale;
@@ -98,7 +199,7 @@ vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 	} else {
 		FloatBuffer attr_f = FloatBuffer(geom.attribute_address);
 		uint stride_floats = geom.attribute_stride >> 2;
-		uint uv_float_off = geom.uv_byte_offset >> 2;
+		uint uv_float_off = p_offset >> 2;
 
 		uv0 = vec2(attr_f.v[i0 * stride_floats + uv_float_off],
 				attr_f.v[i0 * stride_floats + uv_float_off + 1u]);
@@ -111,12 +212,80 @@ vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 	return bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
 }
 
+vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	return fetch_uv_attribute(geom, geom.uv_byte_offset, geom.uv_scale_packed, i0, i1, i2, bary);
+}
+
+vec2 fetch_uv2(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	return fetch_uv_attribute(geom, geom.uv2_byte_offset, geom.uv2_scale_packed, i0, i1, i2, bary);
+}
+
 // ============================================================================
-// VERTEX COLOR FETCHING (RGBA8 packed in uint32)
+// MULTIMESH INSTANCE DATA (COLOR and INSTANCE_CUSTOM, as raster reads them)
+// ============================================================================
+// The 4 floats at p_float_offset in the instance drawing vertex p_index, or p_default without them.
+vec4 fetch_multimesh_data(in GeometryData geom, uint p_index, uint p_float_offset, vec4 p_default) {
+	if (geom.multimesh_address_lo == 0u && geom.multimesh_address_hi == 0u) {
+		return p_default;
+	}
+	if (p_float_offset == 0xFFFFu) {
+		return p_default;
+	}
+	// A merged BLAS's vertices are its instances' copies, one after the other. No branch around the division: DXIL's
+	// udiv by 0 gives 0xFFFFFFFF where NIR's gives 0, and the branch flattened into the previous instance on D3D12.
+	uint instance = geom.multimesh_offset + p_index / geom.multimesh_vertex_count;
+	FloatBuffer mm = FloatBuffer(packUint2x32(uvec2(geom.multimesh_address_lo, geom.multimesh_address_hi)));
+	uint o = instance * geom.multimesh_stride + p_float_offset;
+	return vec4(mm.v[o], mm.v[o + 1u], mm.v[o + 2u], mm.v[o + 3u]);
+}
+
+// An instance's transform, as raster reads it (three rows).
+mat4 fetch_multimesh_transform(in GeometryData geom, uint p_instance) {
+	FloatBuffer mm = FloatBuffer(packUint2x32(uvec2(geom.multimesh_address_lo, geom.multimesh_address_hi)));
+	uint o = p_instance * geom.multimesh_stride;
+	return transpose(mat4(vec4(mm.v[o], mm.v[o + 1u], mm.v[o + 2u], mm.v[o + 3u]),
+			vec4(mm.v[o + 4u], mm.v[o + 5u], mm.v[o + 6u], mm.v[o + 7u]),
+			vec4(mm.v[o + 8u], mm.v[o + 9u], mm.v[o + 10u], mm.v[o + 11u]),
+			vec4(0.0, 0.0, 0.0, 1.0)));
+}
+
+// A merged MultiMesh: where p_position (in the MultiMesh's space, on vertex p_index's instance) was in the previous frame.
+vec3 multimesh_previous_position(in GeometryData geom, uint p_index, vec3 p_position) {
+	uint instance = p_index / geom.multimesh_vertex_count;
+	mat4 current = fetch_multimesh_transform(geom, geom.multimesh_offset + instance);
+	mat4 previous = fetch_multimesh_transform(geom, geom.multimesh_previous_offset + instance);
+	return (previous * (inverse(current) * vec4(p_position, 1.0))).xyz;
+}
+
+// A merged MultiMesh's BLAS holds its instances' vertices in the MultiMesh's space, where raster's object space (VERTEX,
+// MODEL_MATRIX, object triplanar mapping) is each instance's: the transform of vertex p_index's instance; identity otherwise.
+bool is_merged_multimesh(in GeometryData geom) {
+	return (geom.multimesh_address_lo | geom.multimesh_address_hi) != 0u && geom.multimesh_vertex_count != 0xFFFFFFFFu;
+}
+
+mat4 merged_multimesh_instance_transform(in GeometryData geom, uint p_index) {
+	if (!is_merged_multimesh(geom)) {
+		return mat4(1.0);
+	}
+	return fetch_multimesh_transform(geom, geom.multimesh_offset + p_index / max(geom.multimesh_vertex_count, 1u));
+}
+
+vec4 fetch_instance_color(in GeometryData geom, uint p_index) {
+	return fetch_multimesh_data(geom, p_index, geom.multimesh_data_offsets & 0xFFFFu, vec4(1.0));
+}
+
+vec4 fetch_instance_custom(in GeometryData geom, uint p_index) {
+	return fetch_multimesh_data(geom, p_index, geom.multimesh_data_offsets >> 16u, vec4(0.0));
+}
+
+// ============================================================================
+// VERTEX COLOR FETCHING (RGBA8 packed in uint32), times the MultiMesh instance's color
 // ============================================================================
 vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	// The three vertices belong to the same instance.
+	vec4 instance_color = fetch_instance_color(geom, i0);
 	if (geom.color_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
-		return vec4(1.0);
+		return instance_color;
 	}
 
 	Uint32Buffer attr = Uint32Buffer(geom.attribute_address);
@@ -127,7 +296,37 @@ vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 	vec4 col1 = unpackUnorm4x8(attr.v[i1 * stride_words + color_word_off]);
 	vec4 col2 = unpackUnorm4x8(attr.v[i2 * stride_words + color_word_off]);
 
-	return bary.x * col0 + bary.y * col1 + bary.z * col2;
+	return (bary.x * col0 + bary.y * col1 + bary.z * col2) * instance_color;
+}
+
+// ============================================================================
+// CUSTOM0-3 FETCHING, as the vertex input gives them to raster (missing components 0, alpha 1)
+// ============================================================================
+vec4 fetch_custom(in GeometryData geom, uint p_custom, uint p_index) {
+	uint format = (geom.custom_formats >> (p_custom * 4u)) & 0xFu;
+	if ((format & CUSTOM_FORMAT_PRESENT) == 0u || geom.attribute_address == 0ul) {
+		return vec4(0.0);
+	}
+	Uint32Buffer attr = Uint32Buffer(geom.attribute_address);
+	uint w = p_index * (geom.attribute_stride >> 2u) + (((geom.custom_byte_offsets >> (p_custom * 8u)) & 0xFFu) >> 2u);
+	switch (format & 7u) {
+		case 0u: // RGBA8 unorm.
+			return unpackUnorm4x8(attr.v[w]);
+		case 1u: // RGBA8 snorm.
+			return unpackSnorm4x8(attr.v[w]);
+		case 2u: // RG half.
+			return vec4(unpackHalf2x16(attr.v[w]), 0.0, 1.0);
+		case 3u: // RGBA half.
+			return vec4(unpackHalf2x16(attr.v[w]), unpackHalf2x16(attr.v[w + 1u]));
+		case 4u: // R float.
+			return vec4(uintBitsToFloat(attr.v[w]), 0.0, 0.0, 1.0);
+		case 5u: // RG float.
+			return vec4(uintBitsToFloat(attr.v[w]), uintBitsToFloat(attr.v[w + 1u]), 0.0, 1.0);
+		case 6u: // RGB float.
+			return vec4(uintBitsToFloat(attr.v[w]), uintBitsToFloat(attr.v[w + 1u]), uintBitsToFloat(attr.v[w + 2u]), 1.0);
+		default: // RGBA float.
+			return uintBitsToFloat(uvec4(attr.v[w], attr.v[w + 1u], attr.v[w + 2u], attr.v[w + 3u]));
+	}
 }
 
 // ============================================================================
@@ -256,7 +455,8 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, vec2 hit_attribs,
 		attrs.has_uv = true;
 	}
 
-	if ((fetch_flags & FETCH_COLOR) != 0u && geom.color_byte_offset != OFFSET_NONE) {
+	// A MultiMesh's instance colors count without vertex colors too, as raster's white default attribute.
+	if ((fetch_flags & FETCH_COLOR) != 0u && (geom.color_byte_offset != OFFSET_NONE || (geom.multimesh_address_lo | geom.multimesh_address_hi) != 0u)) {
 		attrs.color = fetch_color(geom, i0, i1, i2, bary);
 		attrs.has_color = true;
 	}

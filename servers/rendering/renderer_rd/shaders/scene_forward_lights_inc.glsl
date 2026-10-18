@@ -498,6 +498,9 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #ifndef SHADOWS_DISABLED
 	// Omni light shadow.
 	if (omni_attenuation > HALF_FLT_MIN && omni_lights.data[idx].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+		shadow = mix(half(1.0), half(rt_shadow_visibility(vertex, vec3(normal), light_rel_vec / max(light_length, 0.0001), light_length)), half(omni_lights.data[idx].shadow_opacity));
+#else
 		// there is a shadowmap
 		vec2 texel_size = scene_data_block.data.shadow_atlas_pixel_size;
 		vec4 base_uv_rect = omni_lights.data[idx].atlas_rect;
@@ -623,6 +626,7 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			depth = 1.0 - depth;
 			shadow = mix(half(1.0), sample_omni_pcf_shadow(shadow_atlas, omni_lights.data[idx].soft_shadow_scale / shadow_sample.z, pos, uv_rect, flip_offset, depth, taa_frame_count), half(omni_lights.data[idx].shadow_opacity));
 		}
+#endif // USE_RT_SHADOWS
 	}
 #endif
 
@@ -631,7 +635,7 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #ifdef LIGHT_TRANSMITTANCE_USED
 	half transmittance_z = transmittance_depth; //no transmittance by default
 	transmittance_color.a *= omni_attenuation;
-#ifndef SHADOWS_DISABLED
+#if !defined(SHADOWS_DISABLED) && !defined(USE_RT_SHADOWS) // The path tracer's transparent pass reads no shadow map.
 	if (omni_lights.data[idx].shadow_opacity > 0.001) {
 		// Redo shadowmapping, but shrink the model a bit to avoid artifacts.
 		vec2 texel_size = scene_data_block.data.shadow_atlas_pixel_size;
@@ -808,6 +812,9 @@ void light_process_spot(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #ifndef SHADOWS_DISABLED
 	// Spot light shadow.
 	if (spot_attenuation > HALF_FLT_MIN && spot_lights.data[idx].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+		shadow = mix(half(1.0), half(rt_shadow_visibility(vertex, vec3(normal), vec3(light_rel_vec_norm), light_length)), half(spot_lights.data[idx].shadow_opacity));
+#else
 		vec3 normal_bias = vec3(normal) * light_length * spot_lights.data[idx].shadow_normal_bias * (1.0 - abs(dot(normal, light_rel_vec_norm)));
 
 		//there is a shadowmap
@@ -877,6 +884,7 @@ void light_process_spot(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			vec3 shadow_uv = vec3(splane.xy * spot_lights.data[idx].atlas_rect.zw + spot_lights.data[idx].atlas_rect.xy, splane.z);
 			shadow = mix(half(1.0), sample_pcf_shadow(shadow_atlas, spot_lights.data[idx].soft_shadow_scale * scene_data_block.data.shadow_atlas_pixel_size, shadow_uv, taa_frame_count), half(spot_lights.data[idx].shadow_opacity));
 		}
+#endif // USE_RT_SHADOWS
 	}
 #endif // SHADOWS_DISABLED
 
@@ -885,7 +893,7 @@ void light_process_spot(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #ifdef LIGHT_TRANSMITTANCE_USED
 	half transmittance_z = transmittance_depth;
 	transmittance_color.a *= spot_attenuation;
-#ifndef SHADOWS_DISABLED
+#if !defined(SHADOWS_DISABLED) && !defined(USE_RT_SHADOWS) // The path tracer's transparent pass reads no shadow map.
 	if (spot_lights.data[idx].shadow_opacity > 0.001) {
 		vec4 splane = (spot_lights.data[idx].shadow_matrix * vec4(vertex - vec3(normal) * spot_lights.data[idx].transmittance_bias, 1.0));
 		splane /= splane.w;
@@ -1006,6 +1014,13 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #ifndef SHADOWS_DISABLED
 	// Area light shadow.
 	if (light_attenuation_raw > HALF_FLT_MIN && area_lights.data[idx].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+		// Towards the light's point closest to the surface.
+		vec3 closest_point = area_lights.data[idx].position + vec3(area_a_dir) * float(closest_point_local_to_light.x) + vec3(area_b_dir) * float(closest_point_local_to_light.y);
+		vec3 to_light = closest_point - vertex;
+		float to_light_length = length(to_light);
+		shadow = mix(half(1.0), half(rt_shadow_visibility(vertex, vec3(normal), to_light / max(to_light_length, 0.0001), to_light_length)), half(area_lights.data[idx].shadow_opacity));
+#else
 		// there is a shadowmap
 		vec2 texel_size = scene_data_block.data.shadow_atlas_pixel_size;
 		vec4 base_uv_rect = area_lights.data[idx].atlas_rect;
@@ -1118,6 +1133,7 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			depth = 1.0 - depth;
 			shadow = mix(half(1.0), sample_omni_pcf_shadow(shadow_atlas, area_lights.data[idx].soft_shadow_scale / shadow_sample.z, pos, uv_rect, vec2(0), depth, taa_frame_count), half(area_lights.data[idx].shadow_opacity));
 		}
+#endif // USE_RT_SHADOWS
 	}
 #endif
 	light_attenuation_ltc = light_attenuation_ltc * shadow;
@@ -1219,7 +1235,7 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 	{
 		half transmittance_z = transmittance_depth;
 		transmittance_color.a *= light_attenuation_raw; // not including shadows or ltc falloff
-#ifndef SHADOWS_DISABLED
+#if !defined(SHADOWS_DISABLED) && !defined(USE_RT_SHADOWS) // The path tracer's transparent pass reads no shadow map.
 		if (area_lights.data[idx].shadow_opacity > 0.001) {
 			// Redo shadowmapping, but shrink the model a bit to avoid artifacts.
 			vec2 texel_size = scene_data_block.data.shadow_atlas_pixel_size;

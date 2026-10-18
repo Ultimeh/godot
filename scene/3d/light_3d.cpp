@@ -214,20 +214,23 @@ void Light3D::set_projector(const Ref<Texture2D> &p_texture) {
 	RID tex_id = projector.is_valid() ? projector->get_rid() : RID();
 
 #ifdef DEBUG_ENABLED
+	// A DirectionalLight3D binds its projector as it is (no decal atlas copy): textures drawn by the GPU work there.
+	const bool directional = type == RSE::LIGHT_DIRECTIONAL;
 	if (p_texture.is_valid() &&
 			(p_texture->is_class("AnimatedTexture") ||
 					p_texture->is_class("AtlasTexture") ||
 					p_texture->is_class("CameraTexture") ||
 					p_texture->is_class("CanvasTexture") ||
 					p_texture->is_class("MeshTexture") ||
-					p_texture->is_class("Texture2DRD") ||
-					p_texture->is_class("ViewportTexture"))) {
+					(!directional && p_texture->is_class("Texture2DRD")) ||
+					(!directional && p_texture->is_class("ViewportTexture")))) {
 		WARN_PRINT(vformat("%s cannot be used as a Light3D projector texture (%s). As a workaround, assign the value returned by %s's `get_image()` instead.", p_texture->get_class(), get_path(), p_texture->get_class()));
 	}
 #endif
 
 	RS::get_singleton()->light_set_projector(light, tex_id);
 	update_configuration_warnings();
+	notify_property_list_changed();
 }
 
 Ref<Texture2D> Light3D::get_projector() const {
@@ -479,7 +482,8 @@ Light3D::Light3D(RSE::LightType p_type) {
 		};
 	}
 
-	RS::get_singleton()->instance_set_base(get_instance(), light);
+	// Through VisualInstance3D, so that get_base() returns the light (RenderingServer's light_* functions take it).
+	set_base(light);
 
 	set_color(Color(1, 1, 1, 1));
 	set_shadow(false);
@@ -519,7 +523,7 @@ Light3D::Light3D() {
 
 Light3D::~Light3D() {
 	ERR_FAIL_NULL(RenderingServer::get_singleton());
-	RS::get_singleton()->instance_set_base(get_instance(), RID());
+	set_base(RID());
 
 	if (light.is_valid()) {
 		RenderingServer::get_singleton()->free_rid(light);
@@ -556,6 +560,35 @@ DirectionalLight3D::SkyMode DirectionalLight3D::get_sky_mode() const {
 	return sky_mode;
 }
 
+void DirectionalLight3D::set_projector_size(const Vector2 &p_size) {
+	ERR_FAIL_COND_MSG(p_size.x <= 0.0 || p_size.y <= 0.0, "The projector size must be positive.");
+	projector_size = p_size;
+	RS::get_singleton()->light_directional_set_projector_size(light, p_size);
+}
+
+Vector2 DirectionalLight3D::get_projector_size() const {
+	return projector_size;
+}
+
+void DirectionalLight3D::set_projector_offset(const Vector2 &p_offset) {
+	projector_offset = p_offset;
+	RS::get_singleton()->light_directional_set_projector_offset(light, p_offset);
+}
+
+Vector2 DirectionalLight3D::get_projector_offset() const {
+	return projector_offset;
+}
+
+PackedStringArray DirectionalLight3D::get_configuration_warnings() const {
+	PackedStringArray warnings = Light3D::get_configuration_warnings();
+
+	if (get_projector().is_valid() && (OS::get_singleton()->get_current_rendering_method() == "gl_compatibility" || OS::get_singleton()->get_current_rendering_method() == "dummy")) {
+		warnings.push_back(RTR("Projector textures are not supported when using the Compatibility renderer yet. Support will be added in a future release."));
+	}
+
+	return warnings;
+}
+
 void DirectionalLight3D::_validate_property(PropertyInfo &p_property) const {
 	if (Engine::get_singleton()->is_editor_hint()) {
 		if (shadow_mode == SHADOW_ORTHOGONAL && (p_property.name == "directional_shadow_split_1" || p_property.name == "directional_shadow_blend_splits")) {
@@ -567,9 +600,13 @@ void DirectionalLight3D::_validate_property(PropertyInfo &p_property) const {
 			// Splits 3 and 4 are only used with the PSSM 4 Splits shadow mode.
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+
+		if (get_projector().is_null() && (p_property.name == "light_projector_size" || p_property.name == "light_projector_offset")) {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
 	}
-	if (p_property.name == "light_size" || p_property.name == "light_projector") {
-		// Not implemented in DirectionalLight3D (`light_size` is replaced by `light_angular_distance`).
+	if (p_property.name == "light_size") {
+		// Not implemented in DirectionalLight3D (replaced by `light_angular_distance`).
 		p_property.usage = PROPERTY_USAGE_NONE;
 	} else if (p_property.name == "distance_fade_enabled" || p_property.name == "distance_fade_begin" || p_property.name == "distance_fade_shadow" || p_property.name == "distance_fade_length") {
 		// Not relevant for DirectionalLight3D, as the light LOD system only pertains to point lights.
@@ -587,6 +624,16 @@ void DirectionalLight3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_sky_mode", "mode"), &DirectionalLight3D::set_sky_mode);
 	ClassDB::bind_method(D_METHOD("get_sky_mode"), &DirectionalLight3D::get_sky_mode);
+
+	ClassDB::bind_method(D_METHOD("set_projector_size", "size"), &DirectionalLight3D::set_projector_size);
+	ClassDB::bind_method(D_METHOD("get_projector_size"), &DirectionalLight3D::get_projector_size);
+
+	ClassDB::bind_method(D_METHOD("set_projector_offset", "offset"), &DirectionalLight3D::set_projector_offset);
+	ClassDB::bind_method(D_METHOD("get_projector_offset"), &DirectionalLight3D::get_projector_offset);
+
+	ADD_GROUP("Light", "light_");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "light_projector_size", PROPERTY_HINT_NONE, "suffix:m"), "set_projector_size", "get_projector_size");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "light_projector_offset", PROPERTY_HINT_NONE, "suffix:m"), "set_projector_offset", "get_projector_offset");
 
 	ADD_GROUP("Directional Shadow", "directional_shadow_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "directional_shadow_mode", PROPERTY_HINT_ENUM, "Orthogonal (Fast),PSSM 2 Splits (Average),PSSM 4 Splits (Slow)"), "set_shadow_mode", "get_shadow_mode");
@@ -620,6 +667,8 @@ DirectionalLight3D::DirectionalLight3D() :
 	set_shadow_mode(SHADOW_PARALLEL_4_SPLITS);
 	blend_splits = false;
 	set_sky_mode(SKY_MODE_LIGHT_AND_SKY);
+	set_projector_size(projector_size);
+	set_projector_offset(projector_offset);
 }
 
 void OmniLight3D::set_shadow_mode(ShadowMode p_mode) {

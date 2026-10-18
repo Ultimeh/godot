@@ -30,6 +30,9 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "core/os/os.h"
+#include "core/templates/pair.h"
+#include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
@@ -37,6 +40,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/environment_storage.h"
 
@@ -49,6 +53,7 @@ using namespace RendererSceneRenderImplementation;
 void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
 	bindless_block = memnew(BindlessBlock);
+	bindless_array_block = memnew(BindlessBlock);
 
 	// Initialize merged MultiMesh BLAS compute shader.
 	Vector<String> merge_modes;
@@ -60,6 +65,43 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.version_shader[i] = mm_merge_shader.shader.version_get_shader(mm_merge_shader.version, i);
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
+
+	Vector<String> compact_modes;
+	compact_modes.push_back("\n#define MODE_MARK\n");
+	compact_modes.push_back("\n#define MODE_ASSIGN\n");
+	compact_modes.push_back("\n#define MODE_REMAP\n");
+	lod_compact_shader.shader.initialize(compact_modes);
+	lod_compact_shader.version = lod_compact_shader.shader.version_create();
+	for (int i = 0; i < LodCompactShader::MODE_MAX; i++) {
+		lod_compact_shader.version_shader[i] = lod_compact_shader.shader.version_get_shader(lod_compact_shader.version, i);
+		lod_compact_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(lod_compact_shader.version_shader[i]);
+	}
+	lod_view_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
+	displace_dummy_buffer = RD::get_singleton()->storage_buffer_create(16);
+
+	tlas_expand_supported = RD::get_singleton()->tlas_instance_layout_is_standard() && RD::get_singleton()->has_feature(RD::SUPPORTS_BUFFER_DEVICE_ADDRESS);
+	if (tlas_expand_supported) {
+		Vector<String> expand_modes;
+		expand_modes.push_back("\n");
+		tlas_expand_shader.shader.initialize(expand_modes);
+		tlas_expand_shader.version = tlas_expand_shader.shader.version_create();
+		tlas_expand_shader.version_shader = tlas_expand_shader.shader.version_get_shader(tlas_expand_shader.version, 0);
+		tlas_expand_shader.pipeline = RD::get_singleton()->compute_pipeline_create(tlas_expand_shader.version_shader);
+	}
+
+	Vector<String> fog_modes;
+	fog_modes.push_back("\n");
+	volumetric_fog_shader.shader.initialize(fog_modes);
+	volumetric_fog_shader.version = volumetric_fog_shader.shader.version_create();
+	volumetric_fog_shader.version_shader = volumetric_fog_shader.shader.version_get_shader(volumetric_fog_shader.version, 0);
+	volumetric_fog_shader.pipeline = RD::get_singleton()->compute_pipeline_create(volumetric_fog_shader.version_shader);
+
+	Vector<String> sky_guide_modes;
+	sky_guide_modes.push_back("\n");
+	sky_guide_shader.shader.initialize(sky_guide_modes);
+	sky_guide_shader.version = sky_guide_shader.shader.version_create();
+	sky_guide_shader.version_shader = sky_guide_shader.shader.version_get_shader(sky_guide_shader.version, 0);
+	sky_guide_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_guide_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -79,12 +121,36 @@ RenderRaytracing::~RenderRaytracing() {
 		memdelete(bindless_block);
 		bindless_block = nullptr;
 	}
+	if (bindless_array_block) {
+		memdelete(bindless_array_block);
+		bindless_array_block = nullptr;
+	}
 	if (shader) {
 		memdelete(shader);
 		shader = nullptr;
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
+	lod_compact_shader.shader.version_free(lod_compact_shader.version);
+	if (lod_view_dummy_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(lod_view_dummy_buffer);
+	}
+	if (displace_dummy_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(displace_dummy_buffer);
+	}
+	if (mm_displace_job_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(mm_displace_job_buffer);
+	}
+	if (tlas_expand_supported) {
+		tlas_expand_shader.shader.version_free(tlas_expand_shader.version);
+	}
+	for (RID buffer : { tlas_expand_job_buffer, tlas_expand_geometry_template_buffer, tlas_expand_material_template_buffer }) {
+		if (buffer.is_valid()) {
+			RD::get_singleton()->free_rid(buffer);
+		}
+	}
+	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
+	sky_guide_shader.shader.version_free(sky_guide_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,11 +199,20 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->motion_transform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->motion_transform_buffer);
 	}
+	if (p_state->tlas_instance_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->tlas_instance_buffer);
+	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
+	}
+	if (p_state->decal_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->decal_buffer);
+	}
+	if (p_state->decal_grid_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->decal_grid_buffer);
 	}
 	if (p_state->scene_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(p_state->scene_uniform_set)) {
 		RD::get_singleton()->free_rid(p_state->scene_uniform_set);
@@ -166,30 +241,41 @@ void RenderRaytracing::rt_ensure_textures(RenderSceneBuffersRD *p_render_buffers
 			RD::TEXTURE_USAGE_SAMPLING_BIT |
 			RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 
-	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING)) {
-		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING)) {
+		p_render_buffers->create_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
-	if (!p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH)) {
-		p_render_buffers->create_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH)) {
+		p_render_buffers->create_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	}
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER)) {
+		p_render_buffers->create_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	}
 }
 
 bool RenderRaytracing::rt_has_texture(RenderSceneBuffersRD *p_render_buffers) const {
-	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING);
+	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING);
 }
 
 RID RenderRaytracing::rt_get_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING);
+	return p_render_buffers->get_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING);
 }
 
 bool RenderRaytracing::rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const {
-	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH);
+	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH);
 }
 
 RID RenderRaytracing::rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
-	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH);
+	return p_render_buffers->get_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_DEPTH);
+}
+
+RID RenderRaytracing::rt_get_front_layer_texture(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	if (!p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER)) {
+		return RID();
+	}
+	return p_render_buffers->get_texture(RB_SCOPE_RAYTRACING, RB_TEX_RT_FRONT_LAYER);
 }
 
 void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -212,6 +298,12 @@ void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buf
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, RD::DATA_FORMAT_R8G8B8A8_SNORM, usage_bits, RD::TEXTURE_SAMPLES_1);
 	// Specular Hit Distance: Single channel distance (R16F is sufficient).
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST, RD::DATA_FORMAT_R16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
+	// The noisy color before the transparent pass draws on it: RR tells the transparents apart and keeps them
+	// sharp. The guide says to use the noisy color's format, or precision differences read as transparency.
+	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY, p_render_buffers->get_base_data_format(), usage_bits, RD::TEXTURE_SAMPLES_1);
+	// Depth, NDC as rt_depth: where a transparent surface's reflection dominates, that surface's (DLSS-RR Integration
+	// Guide, 3.4.1: depth, normal and specular hit distance set consistently on the transparent surface).
+	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DEPTH, RD::DATA_FORMAT_R32_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 }
 
 void RenderRaytracing::dlss_rr_free_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -238,9 +330,19 @@ RID RenderRaytracing::dlss_rr_get_normal_roughness(RenderSceneBuffersRD *p_rende
 	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS);
 }
 
+RID RenderRaytracing::dlss_rr_get_color_before_transparency(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_COLOR_BEFORE_TRANSPARENCY);
+}
+
 RID RenderRaytracing::dlss_rr_get_specular_hit_dist(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
 	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST);
+}
+
+RID RenderRaytracing::dlss_rr_get_depth(RenderSceneBuffersRD *p_render_buffers) const {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	return p_render_buffers->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DEPTH);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,11 +423,18 @@ uint64_t RenderRaytracing::mat_ubo_pool_get_address(uint32_t p_slot) const {
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::cleanup_caches() {
+	// Before the surfaces' BLASes, which free the micromap BLASes built from the same buffers.
+	_omm_evict(true);
+
 	for (uint32_t i = 0; i < surface_chunks.size(); i++) {
 		if (surface_chunks[i]) {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					// Unless the mesh was freed first, which frees the BLAS built from its buffers.
+					if (entry->ptr->blas.is_valid() && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+						RD::get_singleton()->free_rid(entry->ptr->blas);
+					}
 					memdelete(entry->ptr);
 					entry->ptr = nullptr;
 				}
@@ -346,7 +455,8 @@ void RenderRaytracing::cleanup_caches() {
 				continue;
 			}
 			if (e->ptr) {
-				if (e->ptr->blas.is_valid()) {
+				// A BLAS goes with the mesh buffers it was built from.
+				if (e->ptr->blas.is_valid() && rd->acceleration_structure_is_valid(e->ptr->blas)) {
 					rd->free_rid(e->ptr->blas);
 				}
 				memdelete(e->ptr);
@@ -360,40 +470,35 @@ void RenderRaytracing::cleanup_caches() {
 				rd->free_rid(e->prev_pos_vb);
 				e->prev_pos_vb = RID();
 			}
+			if (e->displaced_vb.is_valid()) {
+				rd->free_rid(e->displaced_vb);
+				e->displaced_vb = RID();
+			}
 			deformed_pool.free(live[i]);
 		}
+	}
+	if (displace_job_buffer.is_valid()) {
+		rd->free_rid(displace_job_buffer);
+		displace_job_buffer = RID();
+		displace_job_capacity = 0;
 	}
 
 	// Free all merged MultiMesh BLAS data.
 	{
 		LocalVector<RID> live = merged_mm_pool.get_owned_list();
 		for (uint32_t i = 0; i < live.size(); i++) {
-			RTMergedMMEntry *e = merged_mm_pool.get_or_null(live[i]);
-			if (!e) {
-				continue;
-			}
-			if (e->blas.is_valid()) {
-				rd->free_rid(e->blas);
-				e->blas = RID();
-			}
-			if (e->merged_vtx_buffer.is_valid()) {
-				rd->free_rid(e->merged_vtx_buffer);
-				e->merged_vtx_buffer = RID();
-			}
-			if (e->merged_attr_buffer.is_valid()) {
-				rd->free_rid(e->merged_attr_buffer);
-				e->merged_attr_buffer = RID();
-			}
-			if (e->replicated_idx_buffer.is_valid()) {
-				rd->free_rid(e->replicated_idx_buffer);
-				e->replicated_idx_buffer = RID();
-			}
-			merged_mm_pool.free(live[i]);
+			_free_merged_mm_entry(live[i]);
 		}
 	}
 	mm_handles.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
+	multimesh_buffers_read_this_frame.clear();
+
+	for (KeyValue<RTLodViewKey, RTLodView> &kv : lod_views) {
+		_free_lod_view(kv.value);
+	}
+	lod_views.clear();
 
 	// Free all cached material data
 	for (uint32_t i = 0; i < material_chunks.size(); i++) {
@@ -402,6 +507,7 @@ void RenderRaytracing::cleanup_caches() {
 				RTMaterialCacheEntry *entry = &material_chunks[i][j];
 				if (entry->ptr) {
 					if (entry->ptr->uniform_buffer.is_valid()) {
+						mat_ubo_dedicated_buffers.erase(entry->ptr->uniform_buffer);
 						RD::get_singleton()->free_rid(entry->ptr->uniform_buffer);
 					}
 					if (entry->ptr->uniform_pool_slot != UINT32_MAX) {
@@ -416,12 +522,37 @@ void RenderRaytracing::cleanup_caches() {
 	}
 	material_chunks.clear();
 
+	// Every slot is free again: the pool goes too, mat_ubo_pool_ensure_initialized() makes it again.
+	if (mat_ubo_pool_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
+		mat_ubo_pool_buffer = RID();
+	}
+	mat_ubo_pool_bda = 0;
+	mat_ubo_pool_free_slots.clear();
+	mat_ubo_pool_free_count = 0;
+	mat_ubo_pool_next_slot = 0;
+
 	// Reset counters
 	material_free_slots.clear();
 	next_material_slot = 0;
 	vram_used = 0;
+	last_trace_frame = 0;
 	cache_hits = 0;
 	cache_misses = 0;
+}
+
+void RenderRaytracing::free_caches_if_unused() {
+	// A few frames of margin: a view can skip frames (an UPDATE_WHEN_VISIBLE SubViewport), and rebuilding the caches
+	// is a hitch.
+	const uint32_t RT_UNUSED_FRAMES = 10;
+	if (last_trace_frame == 0 || RSG::rasterizer->get_frame_number() - last_trace_frame <= RT_UNUSED_FRAMES) {
+		return;
+	}
+	for (KeyValue<RenderSceneBuffersRD *, RTViewportState *> &kv : viewport_states) {
+		_free_viewport_state_internal(kv.value);
+	}
+	viewport_states.clear();
+	cleanup_caches();
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +630,40 @@ RTDeformedCacheEntry *RenderRaytracing::_access_deformed_slot(RID &r_handle) {
 	return entry;
 }
 
+const RTMergedMMEntry *RenderRaytracing::_get_merged_mm_entry(RID p_mm_rid, uint32_t p_surface_index) {
+	const uint32_t li = p_mm_rid.get_local_index();
+	if (li >= mm_handles.size()) {
+		return nullptr;
+	}
+	const MMSurfaceHandles &handles = mm_handles[li];
+	if (handles.mm_validator != uint32_t(p_mm_rid.get_id() >> 32) || p_surface_index >= handles.per_surface.size()) {
+		return nullptr;
+	}
+	const RTMergedMMEntry *entry = merged_mm_pool.get_or_null(handles.per_surface[p_surface_index]);
+	return entry && entry->blas.is_valid() ? entry : nullptr;
+}
+
+void RenderRaytracing::_free_merged_mm_entry(RID p_handle) {
+	RTMergedMMEntry *e = merged_mm_pool.get_or_null(p_handle);
+	if (!e) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	if (e->blas.is_valid()) {
+		rd->free_rid(e->blas);
+	}
+	if (e->merge_uniform_set.is_valid() && rd->uniform_set_is_valid(e->merge_uniform_set)) {
+		rd->free_rid(e->merge_uniform_set);
+	}
+	const RID buffers[] = { e->merged_vtx_buffer, e->merged_attr_buffer, e->replicated_idx_buffer, e->merged_prev_buffer };
+	for (const RID &buffer : buffers) {
+		if (buffer.is_valid()) {
+			rd->free_rid(buffer);
+		}
+	}
+	merged_mm_pool.free(p_handle);
+}
+
 RTMergedMMEntry *RenderRaytracing::_access_merged_mm_slot(RID &r_handle) {
 	RTMergedMMEntry *entry = merged_mm_pool.get_or_null(r_handle);
 	if (!entry) {
@@ -518,13 +683,21 @@ void RenderRaytracing::prepare_frame() {
 	blas_transforms.clear();
 	instance_flags.clear();
 	instance_masks.clear();
+	front_layer_instance_count = 0;
+	mm_displace_requests.clear();
 	sbt_offsets.clear();
 	geometry_data.clear();
 	material_data.clear();
 	motion_indices.clear();
 	motion_transforms.clear();
+	tlas_expand_jobs.clear();
+	tlas_expand_geometry_templates.clear();
+	tlas_expand_material_templates.clear();
+	tlas_expand_instance_count = 0;
+	tlas_expand_motion_count = 0;
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
+	multimesh_buffers_read_this_frame.clear();
 
 	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 	RD *rd = RD::get_singleton();
@@ -538,11 +711,13 @@ void RenderRaytracing::prepare_frame() {
 			if (!e) {
 				continue;
 			}
-			if (e->last_used_frame == 0 || current_frame - e->last_used_frame <= DEFORMED_CACHE_TTL) {
+			const uint32_t last_used = MAX(e->last_used_frame, e->displaced_frame);
+			if (last_used == 0 || current_frame - last_used <= DEFORMED_CACHE_TTL) {
 				continue;
 			}
 			if (e->ptr) {
-				if (e->ptr->blas.is_valid()) {
+				// A BLAS goes with the mesh buffers it was built from.
+				if (e->ptr->blas.is_valid() && rd->acceleration_structure_is_valid(e->ptr->blas)) {
 					rd->free_rid(e->ptr->blas);
 				}
 				memdelete(e->ptr);
@@ -556,6 +731,10 @@ void RenderRaytracing::prepare_frame() {
 				rd->free_rid(e->prev_pos_vb);
 				e->prev_pos_vb = RID();
 			}
+			if (e->displaced_vb.is_valid()) {
+				rd->free_rid(e->displaced_vb);
+				e->displaced_vb = RID();
+			}
 			deformed_pool.free(live[i]);
 		}
 	}
@@ -563,32 +742,114 @@ void RenderRaytracing::prepare_frame() {
 	// TTL-evict stale merged-MultiMesh entries.
 	{
 		static const uint32_t MM_BLAS_CACHE_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/multimesh_blas_cache_ttl_frames");
+		// The entries no view traced for MM_BLAS_CACHE_COLD_FRAMES are kept for when the camera comes back, up to this many
+		// bytes of merged buffers: a camera crossing a large map otherwise kept every MultiMesh it saw for the whole TTL
+		// (Solfarer: 1.5 GB unused beside 1.5 GB in use). Past it, the least recently used go, down to three quarters of it so
+		// that this pass does not run every frame. Not before: a game shows and hides MultiMeshes for a few frames (Solfarer's
+		// map chunks: thousands come back 2 to 5 frames later, almost none after 60), and those were made again every time.
+		static constexpr uint32_t MM_BLAS_CACHE_COLD_FRAMES = 60;
+		static const uint64_t MM_BLAS_CACHE_UNUSED_BYTES = uint64_t(int64_t(GLOBAL_GET("rendering/pathtracing/multimesh_blas_cache_unused_size_mb"))) << 20;
 		LocalVector<RID> live = merged_mm_pool.get_owned_list();
+		LocalVector<Pair<uint32_t, RID>> unused; // Last used frame, handle.
+		uint64_t unused_bytes = 0;
 		for (uint32_t i = 0; i < live.size(); i++) {
 			RTMergedMMEntry *e = merged_mm_pool.get_or_null(live[i]);
-			if (!e) {
+			if (!e || e->last_used_frame == 0) {
 				continue;
 			}
-			if (e->last_used_frame == 0 || current_frame - e->last_used_frame <= MM_BLAS_CACHE_TTL) {
+			const uint32_t age = current_frame - e->last_used_frame;
+			if (age > MM_BLAS_CACHE_TTL) {
+				_free_merged_mm_entry(live[i]);
+			} else if (age > MM_BLAS_CACHE_COLD_FRAMES) {
+				unused.push_back({ e->last_used_frame, live[i] });
+				unused_bytes += e->buffer_bytes;
+			}
+		}
+		if (unused_bytes > MM_BLAS_CACHE_UNUSED_BYTES) {
+			struct OldestFirst {
+				_FORCE_INLINE_ bool operator()(const Pair<uint32_t, RID> &p_a, const Pair<uint32_t, RID> &p_b) const { return p_a.first < p_b.first; }
+			};
+			unused.sort_custom<OldestFirst>();
+			const uint64_t target = MM_BLAS_CACHE_UNUSED_BYTES / 4 * 3;
+			for (uint32_t i = 0; i < unused.size() && unused_bytes > target; i++) {
+				const RTMergedMMEntry *e = merged_mm_pool.get_or_null(unused[i].second);
+				unused_bytes -= e->buffer_bytes;
+				_free_merged_mm_entry(unused[i].second);
+			}
+		}
+
+		// The entries of a MultiMesh freed since go now, not after the TTL: a game that frees and makes MultiMeshes as its
+		// units move (Solfarer's map chunks) otherwise kept gigabytes of merged buffers. A few hundred handles per frame.
+		const uint32_t MM_HANDLES_SWEPT_PER_FRAME = 512;
+		RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+		const uint32_t sweep_count = MIN(MM_HANDLES_SWEPT_PER_FRAME, mm_handles.size());
+		for (uint32_t n = 0; n < sweep_count; n++) {
+			if (mm_handles_sweep_cursor >= mm_handles.size()) {
+				mm_handles_sweep_cursor = 0;
+			}
+			const uint32_t li = mm_handles_sweep_cursor++;
+			MMSurfaceHandles &handles = mm_handles[li];
+			if (handles.per_surface.is_empty() || mesh_storage->owns_multimesh(RID::from_uint64((uint64_t(handles.mm_validator) << 32) | li))) {
 				continue;
 			}
-			if (e->blas.is_valid()) {
-				rd->free_rid(e->blas);
-				e->blas = RID();
+			for (RID &handle : handles.per_surface) {
+				_free_merged_mm_entry(handle);
+				handle = RID();
 			}
-			if (e->merged_vtx_buffer.is_valid()) {
-				rd->free_rid(e->merged_vtx_buffer);
-				e->merged_vtx_buffer = RID();
+			handles.per_surface.clear();
+		}
+
+		LocalVector<RTLodViewKey> stale;
+		for (KeyValue<RTLodViewKey, RTLodView> &kv : lod_views) {
+			if (current_frame - kv.value.last_used_frame > MM_BLAS_CACHE_TTL) {
+				_free_lod_view(kv.value);
+				stale.push_back(kv.key);
 			}
-			if (e->merged_attr_buffer.is_valid()) {
-				rd->free_rid(e->merged_attr_buffer);
-				e->merged_attr_buffer = RID();
+		}
+		for (const RTLodViewKey &key : stale) {
+			lod_views.erase(key);
+		}
+	}
+
+	// Surfaces and materials no view traced for a while (a dungeon left, a map whose meshes a game rebuilds): a few chunks
+	// of each per frame. Their BLAS and buffers otherwise stayed until no view traced at all, growing with every trip.
+	static const uint32_t STATIC_CACHE_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/static_cache_ttl_frames");
+	const uint32_t SWEEP_CHUNKS_PER_FRAME = 16;
+	for (uint32_t sweep = 0; sweep < SWEEP_CHUNKS_PER_FRAME; sweep++) {
+		if (!surface_chunks.is_empty()) {
+			surface_sweep_chunk = (surface_sweep_chunk + 1) % surface_chunks.size();
+			RTCacheEntry *chunk = surface_chunks[surface_sweep_chunk];
+			for (uint32_t j = 0; chunk && j < RT_CACHE_CHUNK_SIZE; j++) {
+				RTCacheEntry &entry = chunk[j];
+				if (!entry.ptr || entry.last_used_frame == 0 || current_frame - entry.last_used_frame <= STATIC_CACHE_TTL) {
+					continue;
+				}
+				// Unless the mesh was freed first, which freed the BLAS built from its buffers.
+				if (entry.ptr->blas.is_valid() && rd->acceleration_structure_is_valid(entry.ptr->blas)) {
+					rd->free_rid(entry.ptr->blas);
+				}
+				memdelete(entry.ptr);
+				entry = RTCacheEntry();
 			}
-			if (e->replicated_idx_buffer.is_valid()) {
-				rd->free_rid(e->replicated_idx_buffer);
-				e->replicated_idx_buffer = RID();
+		}
+		if (!material_chunks.is_empty()) {
+			material_sweep_chunk = (material_sweep_chunk + 1) % material_chunks.size();
+			RTMaterialCacheEntry *chunk = material_chunks[material_sweep_chunk];
+			for (uint32_t j = 0; chunk && j < RT_CACHE_CHUNK_SIZE; j++) {
+				RTMaterialCacheEntry &entry = chunk[j];
+				if (!entry.ptr || entry.last_used_frame == 0 || current_frame - entry.last_used_frame <= STATIC_CACHE_TTL) {
+					continue;
+				}
+				if (entry.ptr->uniform_buffer.is_valid()) {
+					mat_ubo_dedicated_buffers.erase(entry.ptr->uniform_buffer);
+					rd->free_rid(entry.ptr->uniform_buffer);
+				}
+				if (entry.ptr->uniform_pool_slot != UINT32_MAX) {
+					mat_ubo_pool_release(entry.ptr->uniform_pool_slot);
+				}
+				memdelete(entry.ptr);
+				entry = RTMaterialCacheEntry();
 			}
-			merged_mm_pool.free(live[i]);
 		}
 	}
 
@@ -599,10 +860,15 @@ void RenderRaytracing::prepare_frame() {
 	cache_hits = 0;
 	cache_misses = 0;
 
+	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	if (!bindless_block->is_initialized()) {
-		bindless_block->initialize(RD::get_singleton());
+		bindless_block->initialize(RD::get_singleton(), texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE));
+	}
+	if (!bindless_array_block->is_initialized()) {
+		bindless_array_block->initialize(RD::get_singleton(), texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE));
 	}
 	bindless_block->begin_frame();
+	bindless_array_block->begin_frame();
 }
 
 // ---------------------------------------------------------------------------
@@ -649,11 +915,12 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
 	} else if (entry->ptr->blas.is_valid()) {
-		if (entry->cached_rid_version == mesh_version) {
-			// Same mesh, surface data changed: BLAS is still live, free explicitly.
+		// Same mesh, surface data changed: the BLAS is still live after a region update, but already freed with the old
+		// vertex buffer when the mesh replaced its surfaces (AnimatedSprite3D, Label3D...). A version mismatch means the old
+		// mesh was deleted, which freed it too.
+		if (entry->cached_rid_version == mesh_version && RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
 			RD::get_singleton()->free_rid(entry->ptr->blas);
 		}
-		// Version mismatch: old mesh was deleted, BLAS already cascade-freed by RD.
 		entry->ptr->blas = RID();
 	}
 
@@ -721,9 +988,14 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	bool data_changed = layout_changed ||
 			entry.cached_change_stamp != p_source.change_stamp ||
 			entry.cached_buffer_id != buffer_id;
+	// A micromap freed (evicted) is no longer one to build with.
+	if (entry.omm_micromap.is_valid() && !rd->acceleration_structure_is_valid(entry.omm_micromap)) {
+		entry.omm_micromap = RID();
+	}
 	bool needs_full_rebuild = !entry.ptr || !entry.blas_built_once || layout_changed ||
 			entry.cached_key_version != p_source.cache_version ||
-			entry.cached_surface_counter != p_source.surface_counter;
+			entry.cached_surface_counter != p_source.surface_counter ||
+			entry.omm_micromap != entry.built_omm_micromap;
 
 	BitField<RD::BufferCreationBits> owned_full_flags = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT |
 			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
@@ -761,7 +1033,10 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	// Per-frame copies run exactly once per frame, even when the same surface is visible from multiple viewports.
 	const bool first_touch_this_frame = entry.last_used_frame != current_frame;
 	if (first_touch_this_frame) {
-		if (entry.prev_pos_seeded) {
+		if (p_source.prev_offset != UINT32_MAX && data_changed) {
+			rd->buffer_copy(p_source.prev_vb, entry.prev_pos_vb, p_source.prev_offset, 0, pos_size);
+			entry.prev_pos_seeded = true;
+		} else if (entry.prev_pos_seeded) {
 			rd->buffer_copy(entry.owned_vb_full, entry.prev_pos_vb, 0, 0, pos_size);
 		}
 		if (data_changed || !entry.prev_pos_seeded) {
@@ -780,15 +1055,23 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 			entry.ptr = memnew(RTSurfaceData);
 		}
 		if (entry.ptr->blas.is_valid()) {
-			rd->free_rid(entry.ptr->blas);
+			// Freed already with the micromap it was built with, when that one was evicted.
+			if (rd->acceleration_structure_is_valid(entry.ptr->blas)) {
+				rd->free_rid(entry.ptr->blas);
+			}
 			entry.ptr->blas = RID();
 		}
 		_populate_surface_blas(p_mesh_surface, entry.owned_vb_full, true, true, true,
-				static_cast<uint32_t>(p_source.cache_key), entry.ptr, r_dirty_blas_list);
+				static_cast<uint32_t>(p_source.cache_key), entry.ptr, r_dirty_blas_list, entry.omm_micromap, entry.omm_level);
 		entry.blas_built_once = entry.ptr->blas.is_valid();
+		entry.built_omm_micromap = entry.omm_micromap;
 	} else if (data_changed) {
 		cache_misses++;
-		r_dirty_blas_update_list.push_back(entry.ptr->blas);
+		if (p_source.force_rebuild) {
+			r_dirty_blas_list.push_back(entry.ptr->blas);
+		} else {
+			r_dirty_blas_update_list.push_back(entry.ptr->blas);
+		}
 	} else {
 		cache_hits++;
 	}
@@ -829,7 +1112,8 @@ static void _fill_surface_geometry_data(
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
 	uint64_t surface_format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
-	bool compressed = (surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) && !p_force_uncompressed;
+	bool attributes_compressed = surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
+	bool compressed = attributes_compressed && !p_force_uncompressed;
 	bool is_2d = surface_format & RSE::ARRAY_FLAG_USE_2D_VERTICES;
 
 	r_surf_data->is_compressed = compressed;
@@ -908,7 +1192,7 @@ static void _fill_surface_geometry_data(
 	}
 	geom.normal_stride = normal_stride;
 	geom.tangent_stride = tangent_stride;
-	geom.flags = compressed ? RT_GEOM_FLAG_COMPRESSED : 0;
+	geom.flags = compressed ? RT_GEOM_FLAG_COMPRESSED : (attributes_compressed ? RT_GEOM_FLAG_COMPRESSED_ATTRIBUTES : 0);
 
 	if (compressed) {
 		AABB surface_aabb = mesh_storage->mesh_surface_get_aabb(p_mesh_surface);
@@ -931,6 +1215,7 @@ static void _fill_surface_geometry_data(
 	uint32_t attrib_offset = 0;
 	geom.uv_byte_offset = RT_OFFSET_NONE;
 	geom.color_byte_offset = RT_OFFSET_NONE;
+	geom.uv2_byte_offset = RT_OFFSET_NONE;
 
 	if (surface_format & RSE::ARRAY_FORMAT_COLOR) {
 		geom.color_byte_offset = attrib_offset;
@@ -938,16 +1223,20 @@ static void _fill_surface_geometry_data(
 	}
 	if (surface_format & RSE::ARRAY_FORMAT_TEX_UV) {
 		geom.uv_byte_offset = attrib_offset;
-		attrib_offset += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
+		attrib_offset += attributes_compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
 	}
 	if (surface_format & RSE::ARRAY_FORMAT_TEX_UV2) {
-		attrib_offset += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
+		geom.uv2_byte_offset = attrib_offset;
+		attrib_offset += attributes_compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
 	}
 	for (int ci = 0; ci < RSE::ARRAY_CUSTOM_COUNT; ci++) {
 		const uint32_t fmt_shift[RSE::ARRAY_CUSTOM_COUNT] = { RSE::ARRAY_FORMAT_CUSTOM0_SHIFT, RSE::ARRAY_FORMAT_CUSTOM1_SHIFT, RSE::ARRAY_FORMAT_CUSTOM2_SHIFT, RSE::ARRAY_FORMAT_CUSTOM3_SHIFT };
 		if (surface_format & (1ULL << (RSE::ARRAY_CUSTOM0 + ci))) {
 			uint32_t fmt = (surface_format >> fmt_shift[ci]) & RSE::ARRAY_FORMAT_CUSTOM_MASK;
 			const uint32_t fmtsize[RSE::ARRAY_CUSTOM_MAX] = { 4, 4, 4, 8, 4, 8, 12, 16 };
+			// Read by vertex() as CUSTOM0-3.
+			geom.custom_byte_offsets |= attrib_offset << (ci * 8);
+			geom.custom_formats |= (RT_CUSTOM_FORMAT_PRESENT | fmt) << (ci * 4);
 			attrib_offset += fmtsize[fmt];
 		}
 	}
@@ -956,6 +1245,7 @@ static void _fill_surface_geometry_data(
 	// UV scale (fp16 packed, matches GLSL unpackHalf2x16)
 	Vector4 uv_scale = mesh_storage->mesh_surface_get_uv_scale(p_mesh_surface);
 	geom.uv_scale_packed = (uint32_t(Math::make_half_float(uv_scale.y)) << 16) | Math::make_half_float(uv_scale.x);
+	geom.uv2_scale_packed = (uint32_t(Math::make_half_float(uv_scale.w)) << 16) | Math::make_half_float(uv_scale.z);
 
 	// Index format (no device address — caller fills those in)
 	if (index_buffer.is_valid() && index_count > 0) {
@@ -976,7 +1266,9 @@ void RenderRaytracing::_populate_surface_blas(
 		bool p_allow_update,
 		uint32_t p_cache_key,
 		RTSurfaceData *r_surf_data,
-		LocalVector<RID> &r_dirty_blas_list) {
+		LocalVector<RID> &r_dirty_blas_list,
+		RID p_opacity_micromap,
+		uint32_t p_opacity_micromap_level) {
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, p_force_uncompressed, r_surf_data,
 			&vertex_buffer, &attribute_buffer, &index_buffer);
@@ -1036,14 +1328,676 @@ void RenderRaytracing::_populate_surface_blas(
 			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		}
 
+		if (p_opacity_micromap.is_valid()) {
+			// One entry per triangle, in triangle order (_omm_entry()): no index buffer.
+			as_geom.geometry.triangles.opacity_micromap = p_opacity_micromap;
+			RD::OpacityMicromapUsage usage;
+			usage.count = (index_count > 0 ? index_count : vertex_count) / 3;
+			usage.subdivision_level = p_opacity_micromap_level;
+			usage.format = RD::OPACITY_MICROMAP_FORMAT_4_STATE;
+			as_geom.geometry.triangles.opacity_micromap_usages.push_back(usage);
+		}
+
 		r_surf_data->blas = RD::get_singleton()->blas_create({ &as_geom, 1 }, as_flags);
 		if (!r_surf_data->blas.is_valid()) {
 			return;
 		}
 		RD::get_singleton()->set_resource_name(r_surf_data->blas,
-				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
+				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + (p_opacity_micromap.is_valid() ? "] OMM" : "]"));
 		r_dirty_blas_list.push_back(r_surf_data->blas);
 	}
+}
+
+// p_threads threads of a shader with local_size_x = 64 and its index at gl_GlobalInvocationID.x +
+// gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64: the groups beyond the device's X limit (65535 on most GPUs, 4M
+// threads) go on Y. A MultiMesh's vertices or a surface's micro-triangles reach that count.
+static void _rt_dispatch_linear(RenderingDevice *p_rd, RD::ComputeListID p_compute_list, uint32_t p_threads) {
+	if (p_threads == 0) {
+		return;
+	}
+	const uint32_t groups = Math::division_round_up(p_threads, 64u);
+	const uint32_t max_x = MAX(uint32_t(p_rd->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_X)), 1u);
+	const uint32_t x = MIN(groups, max_x);
+	p_rd->compute_list_dispatch(p_compute_list, x, Math::division_round_up(groups, x), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Displacement by material vertex() code
+// ---------------------------------------------------------------------------
+
+// Runs the vertex() of every material that moves VERTEX on its surfaces, so their BLAS holds what raster draws
+// (Terrain3D builds its whole relief there). The output goes through the deformed path in build_tlas().
+void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
+	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	RD *rd = RD::get_singleton();
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+
+	const bool camera_moved = p_render_data->scene_data->cam_transform != displace_camera_transform || p_render_data->scene_data->cam_projection != displace_camera_projection;
+	displaced_evaluated = 0;
+	displaced_deferred = 0;
+	displaced_vertices = 0;
+	displace_camera_moved = camera_moved;
+	static const float update_distance = GLOBAL_GET("rendering/pathtracing/displacement_update_distance");
+	const uint32_t MAX_UPDATE_PERIOD = 8;
+	const Vector3 camera_origin = p_render_data->scene_data->cam_transform.origin;
+	displace_camera_transform = p_render_data->scene_data->cam_transform;
+	displace_camera_projection = p_render_data->scene_data->cam_projection;
+
+	// The material a surface draws with: override, then surface override, then mesh.
+	auto surface_material = [mesh_storage](const RenderForwardClustered::GeometryInstanceSurfaceDataCache *p_surf) -> RID {
+		if (p_surf->owner->data->material_override.is_valid()) {
+			return p_surf->owner->data->material_override;
+		}
+		if (p_surf->surface_index < p_surf->owner->data->surface_materials.size() && p_surf->owner->data->surface_materials[p_surf->surface_index].is_valid()) {
+			return p_surf->owner->data->surface_materials[p_surf->surface_index];
+		}
+		RID mesh_rid = p_surf->owner->data->base;
+		if (mesh_rid.is_valid() && mesh_storage->owns_mesh(mesh_rid)) {
+			return mesh_storage->mesh_surface_get_material(mesh_rid, p_surf->surface_index);
+		}
+		return RID();
+	};
+
+	struct Job {
+		RTDeformedCacheEntry *entry = nullptr;
+		RID shader;
+		RID pipeline;
+		RID material_buffer;
+		uint32_t vertex_count = 0;
+	};
+	LocalVector<Job> jobs;
+	LocalVector<RT_DisplaceJob> job_data;
+
+	const PagedArray<RenderGeometryInstance *> &rt_instances = *p_render_data->rt_instances;
+	for (uint32_t i = 0; i < (uint32_t)rt_instances.size(); i++) {
+		const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
+				static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(rt_instances[i]);
+		// Skinned and blend shape meshes have their own deformed buffer; MultiMesh and procedural geometry are not covered.
+		if (!inst || !inst->data || inst->rt_procedural || inst->data->base_type == RSE::INSTANCE_MULTIMESH || inst->mesh_instance.is_valid()) {
+			continue;
+		}
+
+		for (const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches; surf; surf = surf->next) {
+			// Transparent surfaces too, as build_tlas() traces them for their reflections; not the unshaded ones.
+			const bool front_layer = surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA;
+			if ((front_layer && (!surf->shader || surf->shader->unshaded)) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
+				continue;
+			}
+			const RID material_rid = surface_material(surf);
+			if (!material_rid.is_valid()) {
+				continue;
+			}
+			const uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
+			RTMaterialData *mat_data = process_material(material_rid, material_counter);
+			if (!mat_data || mat_data->rt_sbt_offset == 0) {
+				continue;
+			}
+			const SceneShaderRaytracing::CustomShaderEntry *cse = rt_shader->get_custom_shader_entry(mat_data->rt_sbt_offset);
+			if (!cse || !cse->writes_vertex) {
+				continue;
+			}
+			RID program_shader;
+			const RID pipeline = rt_shader->get_displace_pipeline(mat_data->rt_sbt_offset, program_shader);
+			if (!pipeline.is_valid()) {
+				continue;
+			}
+
+			void *mesh_surface = surf->surface;
+			const uint64_t format = mesh_storage->mesh_surface_get_format(mesh_surface);
+			const uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(mesh_surface);
+			if (vertex_count == 0 || (format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
+				continue;
+			}
+			const uint32_t tbn_words = (format & RSE::ARRAY_FORMAT_NORMAL) ? ((format & RSE::ARRAY_FORMAT_TANGENT) ? 2 : 1) : 0;
+			const uint32_t size = vertex_count * (3 + tbn_words + 3 + 3) * sizeof(uint32_t);
+
+			RTDeformedCacheEntry *entry = _access_deformed_slot(surf->rt_deformed_handle);
+			// An instance uniform animated by a script (a wall growing out of the ground) moves the geometry too.
+			const uint32_t instance_uniforms_hash = material_storage->global_shader_parameters_instance_hash(inst->shader_uniforms_offset);
+			bool evaluate = entry->displaced_frame == 0 || entry->displaced_slot != mat_data->rt_sbt_offset || entry->displaced_transform != inst->transform;
+			if (!evaluate && (entry->displaced_deferred || entry->displaced_material_counter != material_counter || entry->displaced_instance_uniforms_hash != instance_uniforms_hash || cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved))) {
+				// What vertex() keeps moving (TIME, the camera, a parameter set every frame: Terrain3D's geomorphing, an
+				// instance uniform) is evaluated, and its BLAS rebuilt, every frame near the camera and every N frames beyond,
+				// N growing with the distance. The surfaces take turns, and the motion between two updates is reported on the
+				// update frame.
+				uint32_t period = 1;
+				if (update_distance > 0.0f) {
+					const Vector3 lo = inst->transformed_aabb.position;
+					const Vector3 hi = lo + inst->transformed_aabb.size;
+					const float distance = Vector3().max(lo - camera_origin).max(camera_origin - hi).length();
+					period = CLAMP(uint32_t(distance / update_distance), 1u, MAX_UPDATE_PERIOD);
+				}
+				evaluate = (current_frame + uint32_t(surf->rt_deformed_handle.get_id())) % period == 0;
+				entry->displaced_deferred = !evaluate;
+				displaced_deferred += evaluate ? 0 : 1;
+			}
+			if (entry->displaced_vb_capacity < size) {
+				if (entry->displaced_vb.is_valid()) {
+					rd->free_rid(entry->displaced_vb);
+				}
+				entry->displaced_vb = rd->storage_buffer_create(size, Vector<uint8_t>(), 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+				ERR_CONTINUE(!entry->displaced_vb.is_valid());
+				rd->set_resource_name(entry->displaced_vb, "RT displaced VB");
+				entry->displaced_vb_capacity = size;
+				evaluate = true;
+			}
+			entry->displaced_frame = current_frame;
+			entry->displaced_rebuild = evaluate;
+			entry->displaced_prev_offset = vertex_count * (3 + tbn_words + 3) * sizeof(uint32_t);
+			if (!evaluate) {
+				continue;
+			}
+			entry->displaced_stamp++;
+			entry->displaced_deferred = false;
+			displaced_evaluated++;
+			displaced_vertices += vertex_count;
+			entry->displaced_slot = mat_data->rt_sbt_offset;
+			entry->displaced_material_counter = material_counter;
+			entry->displaced_instance_uniforms_hash = instance_uniforms_hash;
+			entry->displaced_transform = inst->transform;
+
+			RT_DisplaceJob data = {};
+			RTSurfaceData source;
+			RID vertex_buffer, attribute_buffer;
+			_fill_surface_geometry_data(mesh_surface, false, &source, &vertex_buffer, &attribute_buffer);
+			data.geometry = source.geometry;
+			if (vertex_buffer.is_valid()) {
+				data.geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+			}
+			if (attribute_buffer.is_valid()) {
+				data.geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+			}
+			RendererRD::MaterialStorage::store_transform(inst->transform, data.model_matrix);
+			RendererRD::MaterialStorage::store_transform(inst->transform.affine_inverse(), data.inv_model_matrix);
+			// A teleported instance has no motion from its transform (Terrain3D moves its clipmap that way).
+			const Transform3D &prev_transform = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED ? inst->prev_transform : inst->transform;
+			RendererRD::MaterialStorage::store_transform(prev_transform, data.prev_model_matrix);
+			RendererRD::MaterialStorage::store_transform(prev_transform.affine_inverse(), data.prev_inv_model_matrix);
+			data.material_address = mat_data->data.uniform_address;
+			data.tbn_words = tbn_words;
+			data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
+			data.mm_instance_count = 0;
+			job_data.push_back(data);
+
+			mat_ubo_pool_ensure_initialized();
+			Job job;
+			job.entry = entry;
+			job.shader = program_shader;
+			job.pipeline = pipeline;
+			job.material_buffer = mat_data->uniform_buffer.is_valid() ? mat_data->uniform_buffer : mat_ubo_pool_buffer;
+			job.vertex_count = vertex_count;
+			jobs.push_back(job);
+		}
+	}
+
+	if (jobs.is_empty()) {
+		return;
+	}
+
+	// The textures the materials above registered are in the tables already.
+	const RID bindless_set = bindless_block->get_secondary_uniform_set(jobs[0].shader, 1);
+	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(jobs[0].shader, 2);
+	if (!bindless_set.is_valid() || !bindless_array_set.is_valid()) {
+		for (Job &job : jobs) {
+			job.entry->displaced_frame = 0;
+		}
+		ERR_FAIL_MSG("RT: no bindless tables for the displacement pass.");
+	}
+
+	if (displace_job_capacity < job_data.size()) {
+		if (displace_job_buffer.is_valid()) {
+			rd->free_rid(displace_job_buffer);
+		}
+		displace_job_capacity = Math::next_power_of_2(job_data.size());
+		displace_job_buffer = rd->storage_buffer_create(displace_job_capacity * sizeof(RT_DisplaceJob));
+		rd->set_resource_name(displace_job_buffer, "RT displace jobs");
+	}
+	rd->buffer_update(displace_job_buffer, 0, job_data.size() * sizeof(RT_DisplaceJob), job_data.ptr());
+
+	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(displace_job_buffer);
+
+	RD::get_singleton()->draw_command_begin_label("RT Displace Surfaces");
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	RID bound_pipeline;
+	LocalVector<RID> job_sets;
+	for (uint32_t i = 0; i < jobs.size(); i++) {
+		const Job &job = jobs[i];
+		if (job.pipeline != bound_pipeline) {
+			rd->compute_list_bind_compute_pipeline(compute_list, job.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(job.shader, 0, frame_uniforms), 0);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_set, 1);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_array_set, 2);
+			bound_pipeline = job.pipeline;
+		}
+
+		RD::Uniform output(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, job.entry->displaced_vb);
+		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, job.material_buffer);
+		RD::Uniform mm_transforms(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, lod_view_dummy_buffer);
+		RD::Uniform mm_remap(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, lod_view_dummy_buffer);
+		RD::Uniform mm_previous(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, displace_dummy_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous }, job.shader, 3, /*p_linear_pool=*/true);
+		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
+		job_sets.push_back(job_set);
+
+		const uint32_t push_constant[4] = { i, 0, 0, 0 };
+		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
+		_rt_dispatch_linear(rd, compute_list, job.vertex_count);
+	}
+	rd->compute_list_end();
+	for (const RID &job_set : job_sets) {
+		rd->free_rid(job_set);
+	}
+	RD::get_singleton()->draw_command_end_label();
+}
+
+LocalVector<RD::Uniform> RenderRaytracing::_displace_frame_uniforms(RID p_job_buffer) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	LocalVector<RD::Uniform> frame_uniforms;
+	{
+		RD::Uniform u;
+		u.binding = 2;
+		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+		u.append_id(owner->scene_state.uniform_buffers[0]);
+		frame_uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 14;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		const RID global_buffer = material_storage->global_shader_uniforms_get_storage_buffer();
+		u.append_id(global_buffer.is_valid() ? global_buffer : mesh_storage->get_default_rd_storage_buffer());
+		frame_uniforms.push_back(u);
+	}
+	material_storage->samplers_rd_get_default().append_uniforms(frame_uniforms, 16);
+	{
+		RD::Uniform u;
+		u.binding = 30;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(p_job_buffer);
+		frame_uniforms.push_back(u);
+	}
+	return frame_uniforms;
+}
+
+// ---------------------------------------------------------------------------
+// Opacity micromaps
+// ---------------------------------------------------------------------------
+
+RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh) {
+	RD *rd = RD::get_singleton();
+	// GODOT_RT_OPACITY_MICROMAPS=0 turns them off without touching the project, for comparisons.
+	static const bool omm_enabled = GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && rd->has_feature(RD::SUPPORTS_OPACITY_MICROMAP) &&
+			OS::get_singleton()->get_environment("GODOT_RT_OPACITY_MICROMAPS") != "0";
+	if (!omm_enabled || !p_mat_data || !p_material.is_valid() || !p_mesh_surface || !p_mesh.is_valid()) {
+		return nullptr;
+	}
+
+	// The cut-out must be the same for every instance: a MultiMesh's instance colors multiply COLOR.
+	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	const uint32_t slot = p_mat_data->rt_sbt_offset;
+	if (slot != 0) {
+		const SceneShaderRaytracing::CustomShaderEntry *cse = rt_shader->get_custom_shader_entry(slot);
+		if (!cse || !cse->alpha_bakeable || (p_multimesh && cse->alpha_reads_color)) {
+			return nullptr;
+		}
+	} else if (p_multimesh && (p_mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR_ALBEDO)) {
+		return nullptr;
+	}
+
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	RTOmmKey key;
+	key.mesh = p_mesh;
+	key.surface_index = p_surface_index;
+	key.surface_counter = p_surface_counter;
+	key.material = p_material;
+	key.material_counter = p_material_counter;
+	// A surface baked once it lasts RT_OMM_STABLE_FRAMES: a sprite's mesh replaced every frame would be baked and its BLAS
+	// built again every frame.
+	static constexpr uint32_t RT_OMM_STABLE_FRAMES = 10;
+	RTOmmEntry *existing = omm_entries.getptr(key);
+	if (!existing) {
+		RTOmmEntry &waiting = omm_entries.insert(key, RTOmmEntry())->value;
+		waiting.first_seen_frame = current_frame;
+		waiting.last_used_frame = current_frame;
+		return nullptr;
+	}
+	existing->last_used_frame = current_frame;
+	if (existing->micromap.is_valid() || existing->failed) {
+		return existing->failed ? nullptr : existing;
+	}
+	if (current_frame - existing->first_seen_frame < RT_OMM_STABLE_FRAMES) {
+		return nullptr;
+	}
+
+	RTOmmEntry &entry = *existing;
+	entry.failed = true;
+
+	RID bake_shader;
+	const RID bake_pipeline = rt_shader->get_omm_bake_pipeline(slot, bake_shader);
+	if (!bake_pipeline.is_valid()) {
+		return nullptr;
+	}
+
+	// The surface at rest, as the mesh stores it: the micromap goes with its triangles, wherever they are moved.
+	RTSurfaceData rest;
+	RID vertex_buffer, attribute_buffer, index_buffer;
+	_fill_surface_geometry_data(p_mesh_surface, false, &rest, &vertex_buffer, &attribute_buffer, &index_buffer);
+	RT_GeometryData &geometry = rest.geometry;
+	if (vertex_buffer.is_valid()) {
+		geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+	}
+	if (attribute_buffer.is_valid()) {
+		geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+	}
+	if (index_buffer.is_valid() && geometry.index_format != RT_INDEX_FORMAT_NONE) {
+		geometry.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+	}
+	if (geometry.primitive_count == 0 || !vertex_buffer.is_valid()) {
+		return nullptr;
+	}
+
+	static const uint32_t max_level = CLAMP(uint32_t(int(GLOBAL_GET("rendering/pathtracing/opacity_micromap_subdivision_level"))), 1u, 8u);
+	// A surface of many triangles is subdivided less, to keep its micromap within RT_OMM_MAX_MICRO_TRIANGLES (16 MiB of
+	// states, one bake thread each); one too large even at level 1 goes without.
+	static constexpr uint64_t RT_OMM_MAX_MICRO_TRIANGLES = uint64_t(1) << 26;
+	const uint32_t triangle_count = geometry.primitive_count;
+	uint32_t level = max_level;
+	while (level > 1 && (uint64_t(triangle_count) << (level * 2)) > RT_OMM_MAX_MICRO_TRIANGLES) {
+		level--;
+	}
+	if ((uint64_t(triangle_count) << (level * 2)) > RT_OMM_MAX_MICRO_TRIANGLES) {
+		return nullptr;
+	}
+	const uint64_t bits_per_entry = (uint64_t(1) << (level * 2)) * 2;
+	const uint64_t data_size = STEPIFY((uint64_t(triangle_count) * bits_per_entry + 7) / 8, 4);
+	const uint64_t desc_size = uint64_t(triangle_count) * 8;
+	ERR_FAIL_COND_V(data_size > UINT32_MAX || desc_size > UINT32_MAX, nullptr);
+
+	const BitField<RD::BufferCreationBits> input_bits = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT;
+	entry.data_buffer = rd->storage_buffer_create(uint32_t(data_size), Span<uint8_t>(), 0, input_bits);
+	entry.desc_buffer = rd->storage_buffer_create(uint32_t(desc_size), Span<uint8_t>(), 0, input_bits);
+	ERR_FAIL_COND_V(!entry.data_buffer.is_valid() || !entry.desc_buffer.is_valid(), nullptr);
+	rd->set_resource_name(entry.data_buffer, "RT OMM data");
+	rd->set_resource_name(entry.desc_buffer, "RT OMM descriptions");
+
+	RD::OpacityMicromapUsage usage;
+	usage.count = triangle_count;
+	usage.subdivision_level = level;
+	usage.format = RD::OPACITY_MICROMAP_FORMAT_4_STATE;
+	entry.micromap = rd->opacity_micromap_create({ &usage, 1 }, entry.data_buffer, 0, entry.desc_buffer, 0);
+	ERR_FAIL_COND_V(!entry.micromap.is_valid(), nullptr);
+	rd->set_resource_name(entry.micromap, "RT OMM");
+	entry.level = level;
+
+	PendingOmmBake bake;
+	bake.shader = bake_shader;
+	bake.pipeline = bake_pipeline;
+	mat_ubo_pool_ensure_initialized();
+	bake.material_buffer = p_mat_data->uniform_buffer.is_valid() ? p_mat_data->uniform_buffer : mat_ubo_pool_buffer;
+	bake.data_buffer = entry.data_buffer;
+	bake.desc_buffer = entry.desc_buffer;
+	bake.micromap = entry.micromap;
+	bake.data_size = uint32_t(data_size);
+	bake.micro_triangles = triangle_count << (level * 2);
+	RT_OmmBakeJob &job = bake.job;
+	job.geometry = geometry;
+	job.material_address = p_mat_data->data.uniform_address;
+	job.triangle_count = triangle_count;
+	job.level = level;
+	job.data_offset = 0;
+	job.desc_offset = 0;
+	job.albedo_texture_idx = p_mat_data->data.albedo_texture_idx;
+	job.albedo_alpha = p_mat_data->data.albedo_color[3];
+	job.uv1_scale[0] = p_mat_data->data.uv1_scale[0];
+	job.uv1_scale[1] = p_mat_data->data.uv1_scale[1];
+	job.uv1_offset[0] = p_mat_data->data.uv1_offset[0];
+	job.uv1_offset[1] = p_mat_data->data.uv1_offset[1];
+	job.use_vertex_color = (p_mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR_ALBEDO) ? 1 : 0;
+	job.max_samples = 32;
+	pending_omm_bakes.push_back(bake);
+
+	entry.failed = false;
+	return &entry;
+}
+
+RID RenderRaytracing::_omm_static_blas(RTOmmEntry *p_entry, void *p_mesh_surface, LocalVector<RID> &r_dirty_blas_list) {
+	RD *rd = RD::get_singleton();
+	if (p_entry->surf_data.blas.is_valid() && rd->acceleration_structure_is_valid(p_entry->surf_data.blas)) {
+		return p_entry->surf_data.blas;
+	}
+	// The surface's BLAS again, as process_surface() builds it, with the micromap.
+	p_entry->surf_data = RTSurfaceData();
+	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, 0, &p_entry->surf_data, r_dirty_blas_list, p_entry->micromap, p_entry->level);
+	return p_entry->surf_data.blas;
+}
+
+void RenderRaytracing::_omm_dispatch_bakes() {
+	if (pending_omm_bakes.is_empty()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+
+	// The textures the materials registered are in the tables already.
+	const RID bindless_set = bindless_block->get_secondary_uniform_set(pending_omm_bakes[0].shader, 1);
+	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(pending_omm_bakes[0].shader, 2);
+	if (!bindless_set.is_valid() || !bindless_array_set.is_valid()) {
+		pending_omm_bakes.clear();
+		ERR_FAIL_MSG("RT: no bindless tables for the opacity micromap bakes.");
+	}
+
+	if (omm_job_capacity < pending_omm_bakes.size()) {
+		if (omm_job_buffer.is_valid()) {
+			rd->free_rid(omm_job_buffer);
+		}
+		omm_job_capacity = Math::next_power_of_2(pending_omm_bakes.size());
+		omm_job_buffer = rd->storage_buffer_create(omm_job_capacity * sizeof(RT_OmmBakeJob));
+		rd->set_resource_name(omm_job_buffer, "RT OMM bake jobs");
+	}
+	LocalVector<RT_OmmBakeJob> job_data;
+	job_data.resize(pending_omm_bakes.size());
+	for (uint32_t i = 0; i < pending_omm_bakes.size(); i++) {
+		job_data[i] = pending_omm_bakes[i].job;
+		// The bake ORs the states in.
+		rd->buffer_clear(pending_omm_bakes[i].data_buffer, 0, pending_omm_bakes[i].data_size);
+	}
+	rd->buffer_update(omm_job_buffer, 0, job_data.size() * sizeof(RT_OmmBakeJob), job_data.ptr());
+
+	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(omm_job_buffer);
+
+	rd->draw_command_begin_label("RT Bake Opacity Micromaps");
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	RID bound_pipeline;
+	LocalVector<RID> job_sets;
+	for (uint32_t i = 0; i < pending_omm_bakes.size(); i++) {
+		const PendingOmmBake &bake = pending_omm_bakes[i];
+		if (bake.pipeline != bound_pipeline) {
+			rd->compute_list_bind_compute_pipeline(compute_list, bake.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(bake.shader, 0, frame_uniforms), 0);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_set, 1);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_array_set, 2);
+			bound_pipeline = bake.pipeline;
+		}
+		RD::Uniform data(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, bake.data_buffer);
+		RD::Uniform descs(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, bake.desc_buffer);
+		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, bake.material_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ data, descs, material }, bake.shader, 3, /*p_linear_pool=*/true);
+		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
+		job_sets.push_back(job_set);
+
+		const uint32_t push_constant[4] = { i, 0, 0, 0 };
+		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
+		_rt_dispatch_linear(rd, compute_list, bake.micro_triangles);
+	}
+	rd->compute_list_end();
+	for (const RID &job_set : job_sets) {
+		rd->free_rid(job_set);
+	}
+	// The micromaps, before the BLAS builds that read them.
+	for (const PendingOmmBake &bake : pending_omm_bakes) {
+		rd->opacity_micromap_build(bake.micromap);
+	}
+	rd->draw_command_end_label();
+	pending_omm_bakes.clear();
+}
+
+void RenderRaytracing::_omm_free_entry(RTOmmEntry &p_entry) {
+	RD *rd = RD::get_singleton();
+	// The BLAS goes with the mesh buffers it was built from, and with the micromap; the micromap with its buffers.
+	if (p_entry.surf_data.blas.is_valid() && rd->acceleration_structure_is_valid(p_entry.surf_data.blas)) {
+		rd->free_rid(p_entry.surf_data.blas);
+	}
+	if (p_entry.micromap.is_valid() && rd->acceleration_structure_is_valid(p_entry.micromap)) {
+		rd->free_rid(p_entry.micromap);
+	}
+	if (p_entry.data_buffer.is_valid()) {
+		rd->free_rid(p_entry.data_buffer);
+	}
+	if (p_entry.desc_buffer.is_valid()) {
+		rd->free_rid(p_entry.desc_buffer);
+	}
+	p_entry = RTOmmEntry();
+}
+
+void RenderRaytracing::_omm_evict(bool p_all) {
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	static const uint32_t ttl = uint32_t(int(GLOBAL_GET("rendering/pathtracing/static_cache_ttl_frames")));
+	LocalVector<RTOmmKey> expired;
+	for (KeyValue<RTOmmKey, RTOmmEntry> &E : omm_entries) {
+		// An entry still waiting to be baked holds nothing: one a second or two old is a surface that did not last.
+		const uint32_t entry_ttl = (E.value.micromap.is_valid() || E.value.failed) ? ttl : 120;
+		if (p_all || current_frame - E.value.last_used_frame > entry_ttl) {
+			_omm_free_entry(E.value);
+			expired.push_back(E.key);
+		}
+	}
+	for (const RTOmmKey &key : expired) {
+		omm_entries.erase(key);
+	}
+	if (p_all) {
+		pending_omm_bakes.clear();
+		if (omm_job_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(omm_job_buffer);
+			omm_job_buffer = RID();
+			omm_job_capacity = 0;
+		}
+	}
+}
+
+void RenderRaytracing::_displace_merged_multimeshes() {
+	if (mm_displace_requests.is_empty()) {
+		return;
+	}
+	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RD *rd = RD::get_singleton();
+
+	struct Job {
+		const MMDisplaceRequest *request = nullptr;
+		RID shader;
+		RID pipeline;
+		RID material_buffer;
+	};
+	LocalVector<Job> jobs;
+	LocalVector<RT_DisplaceJob> job_data;
+	for (const MMDisplaceRequest &request : mm_displace_requests) {
+		RID program_shader;
+		const RID pipeline = rt_shader->get_displace_pipeline(request.mat_data->rt_sbt_offset, program_shader);
+		if (!pipeline.is_valid()) {
+			continue;
+		}
+		const uint64_t format = mesh_storage->mesh_surface_get_format(request.mesh_surface);
+
+		RT_DisplaceJob data = {};
+		RTSurfaceData source;
+		RID vertex_buffer, attribute_buffer;
+		_fill_surface_geometry_data(request.mesh_surface, false, &source, &vertex_buffer, &attribute_buffer);
+		data.geometry = source.geometry;
+		if (vertex_buffer.is_valid()) {
+			data.geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+		}
+		if (attribute_buffer.is_valid()) {
+			data.geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+		}
+		RendererRD::MaterialStorage::store_transform(request.transform, data.model_matrix);
+		RendererRD::MaterialStorage::store_transform(request.transform.affine_inverse(), data.inv_model_matrix);
+		RendererRD::MaterialStorage::store_transform(request.prev_transform, data.prev_model_matrix);
+		RendererRD::MaterialStorage::store_transform(request.prev_transform.affine_inverse(), data.prev_inv_model_matrix);
+		data.material_address = request.mat_data->data.uniform_address;
+		data.tbn_words = (format & RSE::ARRAY_FORMAT_NORMAL) ? ((format & RSE::ARRAY_FORMAT_TANGENT) ? 2 : 1) : 0;
+		data.instance_uniforms_ofs = request.instance_uniforms_ofs;
+		data.mm_instance_count = request.mm_count;
+		data.mm_vertex_count = request.vertex_count;
+		data.mm_stride = request.mm_stride;
+		data.mm_offset = request.mm_offset;
+		data.mm_use_remap = request.remap_buffer.is_valid() ? 1 : 0;
+		data.mm_color_offset = request.mm_color_offset;
+		data.mm_custom_offset = request.mm_custom_offset;
+		job_data.push_back(data);
+
+		mat_ubo_pool_ensure_initialized();
+		Job job;
+		job.request = &request;
+		job.shader = program_shader;
+		job.pipeline = pipeline;
+		job.material_buffer = request.mat_data->uniform_buffer.is_valid() ? request.mat_data->uniform_buffer : mat_ubo_pool_buffer;
+		jobs.push_back(job);
+	}
+	if (jobs.is_empty()) {
+		return;
+	}
+
+	const RID bindless_set = bindless_block->get_secondary_uniform_set(jobs[0].shader, 1);
+	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(jobs[0].shader, 2);
+	ERR_FAIL_COND_MSG(!bindless_set.is_valid() || !bindless_array_set.is_valid(), "RT: no bindless tables for the MultiMesh displacement.");
+
+	if (mm_displace_job_capacity < job_data.size()) {
+		if (mm_displace_job_buffer.is_valid()) {
+			rd->free_rid(mm_displace_job_buffer);
+		}
+		mm_displace_job_capacity = Math::next_power_of_2(job_data.size());
+		mm_displace_job_buffer = rd->storage_buffer_create(mm_displace_job_capacity * sizeof(RT_DisplaceJob));
+		rd->set_resource_name(mm_displace_job_buffer, "RT MultiMesh displace jobs");
+	}
+	rd->buffer_update(mm_displace_job_buffer, 0, job_data.size() * sizeof(RT_DisplaceJob), job_data.ptr());
+	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(mm_displace_job_buffer);
+
+	rd->draw_command_begin_label("RT Displace MultiMeshes");
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	RID bound_pipeline;
+	LocalVector<RID> job_sets;
+	for (uint32_t i = 0; i < jobs.size(); i++) {
+		const Job &job = jobs[i];
+		const MMDisplaceRequest &request = *job.request;
+		if (job.pipeline != bound_pipeline) {
+			rd->compute_list_bind_compute_pipeline(compute_list, job.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(job.shader, 0, frame_uniforms), 0);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_set, 1);
+			rd->compute_list_bind_uniform_set(compute_list, bindless_array_set, 2);
+			bound_pipeline = job.pipeline;
+		}
+
+		// The displaced positions replace the merged ones, which the BLAS build reads next.
+		RD::Uniform output(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, request.merged_vtx_buffer);
+		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, job.material_buffer);
+		RD::Uniform mm_transforms(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, request.mm_gpu_buffer);
+		RD::Uniform mm_remap(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, request.remap_buffer.is_valid() ? request.remap_buffer : lod_view_dummy_buffer);
+		RD::Uniform mm_previous(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, request.merged_prev_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous }, job.shader, 3, /*p_linear_pool=*/true);
+		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
+		job_sets.push_back(job_set);
+
+		const uint32_t push_constant[4] = { i, 0, 0, 0 };
+		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
+		_rt_dispatch_linear(rd, compute_list, request.mm_count * request.vertex_count);
+	}
+	rd->compute_list_end();
+	for (const RID &job_set : job_sets) {
+		rd->free_rid(job_set);
+	}
+	rd->draw_command_end_label();
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,6 +2018,17 @@ static uint32_t _def_uint(const ShaderLanguage::ShaderNode::Uniform &u, int idx)
 
 static uint32_t _def_bool(const ShaderLanguage::ShaderNode::Uniform &u, int idx) {
 	return (int)u.default_value.size() > idx ? (uint32_t)u.default_value[idx].boolean : 0u;
+}
+
+// Colors as the raster path fills them (MaterialStorage::fill_std140_uniform()): a Color value is made linear unless the
+// uniform disables color conversion, a default value only when the uniform is a source_color.
+static Color _uniform_color(const ShaderLanguage::ShaderNode::Uniform &u, const Color &p_color) {
+	return u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED ? p_color : p_color.srgb_to_linear();
+}
+
+static Color _default_color(const ShaderLanguage::ShaderNode::Uniform &u) {
+	const Color c(_def_real(u, 0), _def_real(u, 1), _def_real(u, 2), _def_real(u, 3));
+	return u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR ? c.srgb_to_linear() : c;
 }
 
 static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Variant &val, uint8_t *dst) {
@@ -1105,42 +2070,28 @@ static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Var
 				fv[0] = (float)v.x;
 				fv[1] = (float)v.y;
 				fv[2] = (float)v.z;
-			} else if (val.get_type() == Variant::COLOR) {
-				Color c = val;
-				if (u.hint == SL::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-					c = c.srgb_to_linear();
-				}
+			} else {
+				const Color c = val.get_type() == Variant::COLOR ? _uniform_color(u, val) : _default_color(u);
 				fv[0] = c.r;
 				fv[1] = c.g;
 				fv[2] = c.b;
-			} else {
-				fv[0] = _def_real(u, 0);
-				fv[1] = _def_real(u, 1);
-				fv[2] = _def_real(u, 2);
 			}
 			memcpy(dst, fv, 12);
 		} break;
 		case SL::TYPE_VEC4: {
 			float fv[4] = {};
-			if (val.get_type() == Variant::COLOR) {
-				Color c = val;
-				if (u.hint == SL::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-					c = c.srgb_to_linear();
-				}
-				fv[0] = c.r;
-				fv[1] = c.g;
-				fv[2] = c.b;
-				fv[3] = c.a;
-			} else if (val.get_type() == Variant::VECTOR4) {
+			if (val.get_type() == Variant::VECTOR4) {
 				Vector4 v = val;
 				fv[0] = (float)v.x;
 				fv[1] = (float)v.y;
 				fv[2] = (float)v.z;
 				fv[3] = (float)v.w;
 			} else {
-				for (int i = 0; i < 4; i++) {
-					fv[i] = _def_real(u, i);
-				}
+				const Color c = val.get_type() == Variant::COLOR ? _uniform_color(u, val) : _default_color(u);
+				fv[0] = c.r;
+				fv[1] = c.g;
+				fv[2] = c.b;
+				fv[3] = c.a;
 			}
 			memcpy(dst, fv, 16);
 		} break;
@@ -1377,6 +2328,29 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 // Material processing
 // ---------------------------------------------------------------------------
 
+RTMaterialData *RenderRaytracing::_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out) {
+	// A neutral standard material, so the ground and the walls do not vanish for the seconds a new pipeline takes to
+	// compile (a pipeline cache miss: a new shader or engine version). Cut-out and billboard materials wait: their shape
+	// comes from their shader, a gray card would be worse than nothing.
+	if (p_cut_out) {
+		return nullptr;
+	}
+	const SceneShaderRaytracing::CustomShaderEntry *entry = SceneShaderRaytracing::get_singleton()->get_custom_shader_entry(p_mat_data->rt_sbt_offset);
+	if (!entry || entry->writes_modelview || entry->uses_alpha_clip || entry->alpha_texture_buffer_offset != UINT32_MAX) {
+		return nullptr;
+	}
+	static RTMaterialData s_compiling_mat;
+	static bool s_compiling_mat_initialized = false;
+	if (!s_compiling_mat_initialized) {
+		s_compiling_mat = *process_material(RID(), 0);
+		for (int i = 0; i < 3; i++) {
+			s_compiling_mat.data.albedo_color[i] = 0.3f;
+		}
+		s_compiling_mat_initialized = true;
+	}
+	return &s_compiling_mat;
+}
+
 RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t p_material_invalidation_counter) {
 	// Static default material for invalid/null materials
 	static RTMaterialData s_default_mat;
@@ -1461,8 +2435,19 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_scale[1] = 1.0f;
 	mat.uv1_offset[0] = 0.0f;
 	mat.uv1_offset[1] = 0.0f;
+	mat.uv1_scale_z = 1.0f;
+	mat.uv1_offset_z = 0.0f;
+	mat.uv1_blend_sharpness = 1.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.backlight[0] = 0.0f;
+	mat.backlight[1] = 0.0f;
+	mat.backlight[2] = 0.0f;
+	mat.backlight_texture_idx = 0;
+	mat.ao_texture_idx = 0;
+	mat.ao_channel = 0;
+	mat.ao_light_affect = 0.0f;
+	mat.ao_pad = 0;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1523,8 +2508,12 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// Material properties
 	// Colors declared with source_color in Godot shaders are stored in sRGB;
 	// material_get_param returns the raw sRGB value, so we convert to linear here.
+	// BaseMaterial3D's shaders are evaluated from their parameters (hit group 0); any other shader runs its own code, even
+	// when it names its uniforms as BaseMaterial3D does. A Shader resource converted from a StandardMaterial3D keeps the
+	// generated header, often with an edited vertex(): only the generated shaders have no resource path.
 	Variant albedo_var = material_storage->material_get_param(p_material_rid, "albedo");
-	if (albedo_var.get_type() == Variant::COLOR) {
+	if (albedo_var.get_type() == Variant::COLOR && material_storage->material_get_shader_path_hint(p_material_rid).is_empty() &&
+			material_storage->material_get_shader_code_rt(p_material_rid).begins_with("// NOTE: Shader automatically converted from ")) {
 		Color c = ((Color)albedo_var).srgb_to_linear();
 		mat.albedo_color[0] = c.r;
 		mat.albedo_color[1] = c.g;
@@ -1555,6 +2544,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 				uint32_t offset = cse->uniform_offsets[u.order];
 				uint32_t size = ShaderLanguage::get_datatype_size(u.type);
+				if (u.array_size > 0) {
+					const uint32_t padded = 16 * u.array_size;
+					size *= u.array_size;
+					if (size % padded != 0) {
+						size += padded - (size % padded);
+					}
+				}
 				if (offset + size > cse->uniform_total_size) {
 					continue;
 				}
@@ -1565,6 +2561,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					int32_t idx = material_storage->global_shader_uniform_get_buffer_index(kv.key);
 					uint32_t uidx = (idx >= 0) ? (uint32_t)idx : 0;
 					memcpy(dst, &uidx, sizeof(uint32_t));
+				} else if (u.array_size > 0) {
+					Variant val = material_storage->material_get_param(p_material_rid, kv.key);
+					RendererRD::MaterialStorage::fill_std140_uniform(u, val.get_type() == Variant::NIL ? nullptr : &val, dst, true);
 				} else {
 					Variant val = material_storage->material_get_param(p_material_rid, kv.key);
 					pack_uniform(u, val, dst);
@@ -1574,6 +2573,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			RendererRD::TextureStorage *ts = RendererRD::TextureStorage::get_singleton();
 			for (int ti = 0; ti < cse->texture_uniforms.size(); ti++) {
 				const SceneShaderRaytracing::TextureUniformInfo &tui = cse->texture_uniforms[ti];
+				BindlessBlock *table = tui.is_array ? bindless_array_block : bindless_block;
 				uint32_t bindless_idx = 0;
 
 				if (tui.is_global) {
@@ -1581,7 +2581,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					if (tex_rid.is_valid()) {
 						RID rd_tex = ts->texture_get_rd_texture(tex_rid, tui.use_color);
 						if (rd_tex.is_valid()) {
-							bindless_idx = bindless_block->add_texture(rd_tex);
+							bindless_idx = table->add_texture(rd_tex);
 						}
 					}
 				} else {
@@ -1591,7 +2591,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 						if (tex_rid.is_valid()) {
 							RID rd_tex = ts->texture_get_rd_texture(tex_rid, tui.use_color);
 							if (rd_tex.is_valid()) {
-								bindless_idx = bindless_block->add_texture(rd_tex);
+								bindless_idx = table->add_texture(rd_tex);
 							}
 						}
 					}
@@ -1599,26 +2599,28 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 				if (bindless_idx == 0 && tui.hint != ShaderLanguage::ShaderNode::Uniform::HINT_NONE) {
 					using Hint = ShaderLanguage::ShaderNode::Uniform::Hint;
-					RID default_tex;
+					using DefaultTexture = RendererRD::TextureStorage::DefaultRDTexture;
+					DefaultTexture default_type;
 					switch (tui.hint) {
 						case Hint::HINT_DEFAULT_BLACK:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : DefaultTexture::DEFAULT_RD_TEXTURE_BLACK;
 							break;
 						case Hint::HINT_DEFAULT_TRANSPARENT:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_TRANSPARENT);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_TRANSPARENT : DefaultTexture::DEFAULT_RD_TEXTURE_TRANSPARENT;
 							break;
 						case Hint::HINT_NORMAL:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_NORMAL);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_NORMAL : DefaultTexture::DEFAULT_RD_TEXTURE_NORMAL;
 							break;
 						case Hint::HINT_ANISOTROPY:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_ANISO);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : DefaultTexture::DEFAULT_RD_TEXTURE_ANISO;
 							break;
 						default:
-							default_tex = ts->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
+							default_type = tui.is_array ? DefaultTexture::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE : DefaultTexture::DEFAULT_RD_TEXTURE_WHITE;
 							break;
 					}
+					RID default_tex = ts->texture_rd_get_default(default_type);
 					if (default_tex.is_valid()) {
-						bindless_idx = bindless_block->add_texture(default_tex);
+						bindless_idx = table->add_texture(default_tex);
 					}
 				}
 
@@ -1647,6 +2649,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				if (mat_data->uniform_pool_slot != UINT32_MAX) {
 					// Transitioning from a dedicated buffer back into the pool.
 					if (mat_data->uniform_buffer.is_valid()) {
+						mat_ubo_dedicated_buffers.erase(mat_data->uniform_buffer);
 						RD::get_singleton()->free_rid(mat_data->uniform_buffer);
 						mat_data->uniform_buffer = RID();
 					}
@@ -1657,29 +2660,28 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			}
 
 			if (!used_pool) {
-				// Oversized or pool exhausted: dedicated per-material buffer.
-				// This is the slow path: a per-material storage_buffer_create on
-				// every rebuild. Warn once so it's visible in the log; the fix is
-				// either to shrink the material's uniform footprint below
-				// MAT_UBO_POOL_SLOT_SIZE or to grow the pool slot/capacity.
-				const char *reason = (cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE)
-						? "uniform size exceeds slot"
-						: "pool exhausted";
-				WARN_PRINT_ONCE(vformat(
-						"RT Material UBO falling back to dedicated buffer (%s): "
-						"sbt_offset=%u, uniform_total_size=%u, slot_size=%u.",
-						String(reason), mat_data->rt_sbt_offset,
-						cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
-
+				// Oversized or pool exhausted: a buffer of the material's own, updated in place by the next rebuilds of the
+				// same size. Recreating it on every rebuild allocated a buffer (and on D3D12 a GPU pointer descriptor) every
+				// frame for a material changed every frame: Terrain3D's (36 KB of region maps) follows the camera.
 				if (mat_data->uniform_pool_slot != UINT32_MAX) {
 					mat_ubo_pool_release(mat_data->uniform_pool_slot);
 					mat_data->uniform_pool_slot = UINT32_MAX;
 				}
-				if (mat_data->uniform_buffer.is_valid()) {
-					RD::get_singleton()->free_rid(mat_data->uniform_buffer);
+				if (mat_data->uniform_buffer.is_valid() && mat_data->uniform_buffer_size == cse->uniform_total_size) {
+					RD::get_singleton()->buffer_update(mat_data->uniform_buffer, 0, cse->uniform_total_size, ubo_data.ptr());
+				} else {
+					if (mat_data->uniform_buffer.is_valid()) {
+						mat_ubo_dedicated_buffers.erase(mat_data->uniform_buffer);
+						RD::get_singleton()->free_rid(mat_data->uniform_buffer);
+					}
+					print_verbose(vformat("RT: material uniforms in a buffer of their own (%s): sbt_offset=%d, %d bytes, pool slots %d bytes.",
+							cse->uniform_total_size > MAT_UBO_POOL_SLOT_SIZE ? "larger than a pool slot" : "pool exhausted",
+							mat_data->rt_sbt_offset, cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
+					mat_data->uniform_buffer = RD::get_singleton()->storage_buffer_create(cse->uniform_total_size, ubo_data, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+					mat_data->uniform_buffer_size = cse->uniform_total_size;
+					mat_ubo_dedicated_buffers.insert(mat_data->uniform_buffer);
+					RD::get_singleton()->set_resource_name(mat_data->uniform_buffer, String("RT Material UBO [sbt=") + itos(mat_data->rt_sbt_offset) + "]");
 				}
-				mat_data->uniform_buffer = RD::get_singleton()->storage_buffer_create(cse->uniform_total_size, ubo_data, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
-				RD::get_singleton()->set_resource_name(mat_data->uniform_buffer, String("RT Material UBO [sbt=") + itos(mat_data->rt_sbt_offset) + "]");
 				mat.uniform_address = RD::get_singleton()->buffer_get_device_address(mat_data->uniform_buffer);
 			}
 		}
@@ -1713,12 +2715,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.emission_strength = emission_energy_var;
 	}
 
-	// UV1 scale and offset (vec3 in Godot, we only use xy).
+	// UV1 scale and offset (z is only used by triplanar mapping).
 	Variant uv1_scale_var = material_storage->material_get_param(p_material_rid, "uv1_scale");
 	if (uv1_scale_var.get_type() == Variant::VECTOR3) {
 		Vector3 s = uv1_scale_var;
 		mat.uv1_scale[0] = s.x;
 		mat.uv1_scale[1] = s.y;
+		mat.uv1_scale_z = s.z;
 	}
 
 	Variant uv1_offset_var = material_storage->material_get_param(p_material_rid, "uv1_offset");
@@ -1726,6 +2729,93 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		Vector3 o = uv1_offset_var;
 		mat.uv1_offset[0] = o.x;
 		mat.uv1_offset[1] = o.y;
+		mat.uv1_offset_z = o.z;
+	}
+
+	// BaseMaterial3D's triplanar mapping and billboard modes are shader features, not parameters: read them from its
+	// generated code.
+	mat_data->billboard_mode = RT_BILLBOARD_DISABLED;
+	mat_data->billboard_keep_scale = false;
+	if (!mat_data->is_custom_shader) {
+		const String code = material_storage->material_get_shader_code_rt(p_material_rid);
+		if (code.contains("// Billboard Mode: Enabled")) {
+			mat_data->billboard_mode = RT_BILLBOARD_ENABLED;
+		} else if (code.contains("// Billboard Mode: Y-Billboard")) {
+			mat_data->billboard_mode = RT_BILLBOARD_FIXED_Y;
+		}
+		mat_data->billboard_keep_scale = code.contains("// Billboard Keep Scale: Enabled");
+		if (code.contains(", unshaded")) {
+			mat.flags |= RT_MAT_FLAG_UNSHADED;
+		}
+		// Ambient occlusion: its own texture on UV1 (triplanar too), or the ORM texture's red channel. Not on UV2.
+		if (code.contains("AO = dot(texture(texture_ambient_occlusion, base_uv)") || code.contains("AO = dot(triplanar_texture(texture_ambient_occlusion, uv1_power_normal")) {
+			const RID ao_rd = get_material_texture("texture_ambient_occlusion");
+			if (ao_rd.is_valid()) {
+				mat.ao_texture_idx = bindless_block->add_texture(ao_rd);
+				mat.flags |= RT_MAT_FLAG_AO_TEXTURE;
+				const Variant channel_var = material_storage->material_get_param(p_material_rid, "ao_texture_channel");
+				Vector4 channel_mask(1, 0, 0, 0);
+				if (channel_var.get_type() == Variant::VECTOR4) {
+					channel_mask = channel_var;
+				} else if (channel_var.get_type() == Variant::PLANE) {
+					const Plane p = channel_var;
+					channel_mask = Vector4(p.normal.x, p.normal.y, p.normal.z, p.d);
+				}
+				mat.ao_channel = channel_mask.y > 0.5f ? 1 : (channel_mask.z > 0.5f ? 2 : (channel_mask.w > 0.5f ? 3 : 0));
+			}
+		} else if (code.contains("AO = orm_tex.r;")) {
+			mat.flags |= RT_MAT_FLAG_AO_ORM;
+		}
+		if (mat.flags & (RT_MAT_FLAG_AO_TEXTURE | RT_MAT_FLAG_AO_ORM)) {
+			const Variant affect_var = material_storage->material_get_param(p_material_rid, "ao_light_affect");
+			if (affect_var.get_type() == Variant::FLOAT) {
+				mat.ao_light_affect = affect_var;
+			}
+		}
+		// texture_filter is a sampler hint in the generated code, not a parameter.
+		if (code.contains(", filter_linear_mipmap_anisotropic")) {
+			mat.flags |= RT_MAT_FLAG_ANISOTROPIC_FILTER;
+		}
+		if (code.contains("// Vertex Color Use as Albedo: Enabled")) {
+			mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_ALBEDO;
+			if (code.contains("// Vertex Color is sRGB: Enabled")) {
+				mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_SRGB;
+			}
+		}
+		if (code.contains(", specular_disabled")) {
+			mat.flags |= RT_MAT_FLAG_SPECULAR_DISABLED;
+		}
+		if (code.contains("BACKLIGHT = (backlight.rgb")) {
+			mat.flags |= RT_MAT_FLAG_BACKLIGHT;
+			Variant backlight_var = material_storage->material_get_param(p_material_rid, "backlight");
+			if (backlight_var.get_type() == Variant::COLOR) {
+				const Color c = ((Color)backlight_var).srgb_to_linear();
+				mat.backlight[0] = c.r;
+				mat.backlight[1] = c.g;
+				mat.backlight[2] = c.b;
+			}
+			const RID backlight_rd = get_material_texture("texture_backlight", true);
+			if (backlight_rd.is_valid()) {
+				mat.backlight_texture_idx = bindless_block->add_texture(backlight_rd);
+				mat.flags |= RT_MAT_FLAG_HAS_BACKLIGHT_TEX;
+			}
+		}
+		if (code.contains("// Emission: Enabled")) {
+			mat.flags |= RT_MAT_FLAG_EMISSION;
+			if (code.contains("// Emission Operator: Add")) {
+				mat.flags |= RT_MAT_FLAG_EMISSION_ADD;
+			}
+		}
+		if (code.contains("varying vec3 uv1_triplanar_pos;")) {
+			mat.flags |= RT_MAT_FLAG_UV1_TRIPLANAR;
+			if (code.contains("uv1_triplanar_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz")) {
+				mat.flags |= RT_MAT_FLAG_UV1_WORLD_TRIPLANAR;
+			}
+			Variant sharpness_var = material_storage->material_get_param(p_material_rid, "uv1_blend_sharpness");
+			if (sharpness_var.get_type() == Variant::FLOAT) {
+				mat.uv1_blend_sharpness = sharpness_var;
+			}
+		}
 	}
 
 	// Point filtering: check if material requests nearest filtering (e.g. pixel art).
@@ -1769,7 +2859,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 
 	RENDER_TIMESTAMP("TLAS Build");
 
-	uint32_t needed = MAX(blass.size(), (uint32_t)1);
+	uint32_t needed = MAX(blass.size() + tlas_expand_instance_count, (uint32_t)1);
 	if (!p_state->tlas.is_valid() || needed > p_state->tlas_max_instances) {
 		if (p_state->tlas.is_valid()) {
 			RD::get_singleton()->free_rid(p_state->tlas);
@@ -1787,57 +2877,306 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.transform = blas_transforms[i];
 		inst.blas = blass[i];
 		inst.flags = BitField<RD::AccelerationStructureInstanceFlagBits>(instance_flags[i]);
-		inst.mask = (i < instance_masks.size()) ? instance_masks[i] : 0xFF;
+		inst.mask = instance_masks[i];
 		uint32_t sbt_off = (i < sbt_offsets.size()) ? sbt_offsets[i] : 0;
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
 	}
 
+	if (tlas_expand_instance_count > 0) {
+		_build_tlas_with_expanded_multimeshes(p_state, instances);
+		return;
+	}
 	RD::get_singleton()->tlas_build(p_state->tlas, instances);
 }
 
+void RenderRaytracing::_build_tlas_with_expanded_multimeshes(RTViewportState *p_state, LocalVector<RD::AccelerationStructureInstance> &p_instances) {
+	RD *rd = RD::get_singleton();
+	DEV_ASSERT(geometry_data.size() == p_instances.size() && motion_indices.size() == p_instances.size());
+	const uint32_t cpu_count = p_instances.size();
+	const uint32_t total = cpu_count + tlas_expand_instance_count;
+	const uint32_t instance_size = rd->tlas_get_instance_size();
+
+	if (!p_state->tlas_instance_buffer.is_valid() || p_state->tlas_instance_buffer_capacity < total) {
+		if (p_state->tlas_instance_buffer.is_valid()) {
+			rd->free_rid(p_state->tlas_instance_buffer);
+		}
+		p_state->tlas_instance_buffer_capacity = p_state->tlas_max_instances;
+		p_state->tlas_instance_buffer = rd->storage_buffer_create(p_state->tlas_instance_buffer_capacity * instance_size, {}, 0,
+				RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		ERR_FAIL_COND(!p_state->tlas_instance_buffer.is_valid());
+		rd->set_resource_name(p_state->tlas_instance_buffer, "RT TLAS instances");
+	}
+
+	// The CPU's instances, then for each job its instance's last words (BLAS, mask, flags, hit group) as the driver writes them.
+	const uint32_t job_count = tlas_expand_jobs.size();
+	thread_local LocalVector<RD::AccelerationStructureInstance> templates;
+	thread_local LocalVector<uint8_t> encoded;
+	templates.resize(job_count);
+	for (uint32_t i = 0; i < job_count; i++) {
+		const TlasExpandJob &job = tlas_expand_jobs[i];
+		RD::AccelerationStructureInstance &inst = templates[i];
+		inst = RD::AccelerationStructureInstance();
+		inst.blas = job.blas;
+		inst.mask = job.mask;
+		inst.flags = BitField<RD::AccelerationStructureInstanceFlagBits>(job.flags);
+		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(job.sbt_offset));
+	}
+	encoded.resize(MAX(cpu_count, job_count) * instance_size);
+	ERR_FAIL_COND(rd->tlas_instances_encode(templates, encoded.ptr()) != OK);
+	for (uint32_t i = 0; i < job_count; i++) {
+		memcpy(tlas_expand_jobs[i].data.instance_tail, encoded.ptr() + i * instance_size + 48, 16);
+	}
+	if (cpu_count > 0) {
+		ERR_FAIL_COND(rd->tlas_instances_encode(p_instances, encoded.ptr()) != OK);
+		rd->buffer_update(p_state->tlas_instance_buffer, 0, cpu_count * instance_size, encoded.ptr());
+	}
+
+	// The jobs and their records' templates.
+	thread_local LocalVector<RT_TlasExpandJob> job_data;
+	job_data.resize(job_count);
+	for (uint32_t i = 0; i < job_count; i++) {
+		job_data[i] = tlas_expand_jobs[i].data;
+	}
+	const uint32_t template_count = tlas_expand_geometry_templates.size();
+	if (tlas_expand_job_capacity < job_count) {
+		if (tlas_expand_job_buffer.is_valid()) {
+			rd->free_rid(tlas_expand_job_buffer);
+		}
+		tlas_expand_job_capacity = Math::next_power_of_2(job_count);
+		tlas_expand_job_buffer = rd->storage_buffer_create(tlas_expand_job_capacity * sizeof(RT_TlasExpandJob));
+		rd->set_resource_name(tlas_expand_job_buffer, "RT TLAS expand jobs");
+	}
+	if (tlas_expand_template_capacity < template_count) {
+		for (RID *buffer : { &tlas_expand_geometry_template_buffer, &tlas_expand_material_template_buffer }) {
+			if (buffer->is_valid()) {
+				rd->free_rid(*buffer);
+			}
+		}
+		tlas_expand_template_capacity = Math::next_power_of_2(template_count);
+		tlas_expand_geometry_template_buffer = rd->storage_buffer_create(tlas_expand_template_capacity * sizeof(RT_GeometryData));
+		tlas_expand_material_template_buffer = rd->storage_buffer_create(tlas_expand_template_capacity * sizeof(RT_MaterialData));
+		rd->set_resource_name(tlas_expand_geometry_template_buffer, "RT TLAS expand geometry templates");
+		rd->set_resource_name(tlas_expand_material_template_buffer, "RT TLAS expand material templates");
+	}
+	rd->buffer_update(tlas_expand_job_buffer, 0, job_count * sizeof(RT_TlasExpandJob), job_data.ptr());
+	rd->buffer_update(tlas_expand_geometry_template_buffer, 0, template_count * sizeof(RT_GeometryData), tlas_expand_geometry_templates.ptr());
+	rd->buffer_update(tlas_expand_material_template_buffer, 0, template_count * sizeof(RT_MaterialData), tlas_expand_material_templates.ptr());
+
+	const LocalVector<RD::Uniform> uniforms = {
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, tlas_expand_job_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, tlas_expand_geometry_template_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, tlas_expand_material_template_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, p_state->tlas_instance_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, p_state->geometry_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, p_state->material_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, p_state->motion_index_buffer),
+		RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 7, p_state->motion_transform_buffer),
+	};
+	const RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(tlas_expand_shader.version_shader, 0, uniforms);
+
+	struct {
+		uint32_t job_count;
+		uint32_t first_slot;
+		uint32_t instance_count;
+		uint32_t geometry_words;
+		uint32_t material_words;
+		uint32_t mm_offset_word;
+		uint32_t mm_prev_offset_word;
+		uint32_t pad;
+	} params = { job_count, cpu_count, tlas_expand_instance_count, uint32_t(sizeof(RT_GeometryData) / 4), uint32_t(sizeof(RT_MaterialData) / 4),
+		uint32_t(offsetof(RT_GeometryData, multimesh_offset) / 4), uint32_t(offsetof(RT_GeometryData, multimesh_previous_offset) / 4), 0 };
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, tlas_expand_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+	rd->compute_list_set_push_constant(compute_list, &params, sizeof(params));
+	// Read through their addresses: the graph orders this pass after their updates.
+	for (const TlasExpandJob &job : tlas_expand_jobs) {
+		rd->compute_list_add_buffer_dependency(compute_list, job.mm_gpu_buffer, false);
+	}
+	rd->compute_list_dispatch_threads(compute_list, tlas_expand_instance_count, 1, 1);
+	rd->compute_list_end();
+
+	// Every BLAS the instances reference: the build waits for those built this frame.
+	thread_local LocalVector<RID> tlas_blases;
+	tlas_blases.clear();
+	for (const RD::AccelerationStructureInstance &inst : p_instances) {
+		if (inst.blas.is_valid()) {
+			tlas_blases.push_back(inst.blas);
+		}
+	}
+	for (const TlasExpandJob &job : tlas_expand_jobs) {
+		tlas_blases.push_back(job.blas);
+	}
+	rd->tlas_build_from_buffer(p_state->tlas, p_state->tlas_instance_buffer, total, tlas_blases);
+}
+
 void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
-	// Grow-only uploads. Callers must not free these in prepare_frame().
-	auto update_or_grow = [](RID &p_buffer, uint32_t &p_capacity, const void *p_data, uint32_t p_size) {
-		if (p_size == 0) {
+	// Grow-only uploads. Callers must not free these in prepare_frame(). p_size: the CPU's part, uploaded; p_total_size:
+	// with what the GPU writes after it (_build_tlas_with_expanded_multimeshes()).
+	auto update_or_grow = [](RID &p_buffer, uint32_t &p_capacity, const void *p_data, uint32_t p_size, uint32_t p_total_size) {
+		if (p_total_size == 0) {
 			return;
 		}
-		if (p_size > p_capacity) {
+		if (p_total_size > p_capacity) {
 			if (p_buffer.is_valid()) {
 				RD::get_singleton()->free_rid(p_buffer);
 			}
-			p_capacity = p_size;
-			Vector<uint8_t> init;
-			init.resize(p_size);
-			memcpy(init.ptrw(), p_data, p_size);
-			p_buffer = RD::get_singleton()->storage_buffer_create(p_size, init);
-		} else {
+			// With room for the GPU's part to grow a little (units entering the view) without a new buffer each frame.
+			p_capacity = p_size == p_total_size ? p_total_size : STEPIFY(p_total_size + p_total_size / 4, 16u);
+			p_buffer = RD::get_singleton()->storage_buffer_create(p_capacity);
+		}
+		if (p_size > 0) {
 			RD::get_singleton()->buffer_update(p_buffer, 0, p_size, p_data);
 		}
 	};
 
+	const uint32_t expanded = tlas_expand_instance_count;
 	update_or_grow(p_state->geometry_buffer, p_state->geometry_buffer_capacity,
-			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData));
+			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData), (geometry_data.size() + expanded) * sizeof(RT_GeometryData));
 	update_or_grow(p_state->material_buffer, p_state->material_buffer_capacity,
-			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData));
+			material_data.ptr(), material_data.size() * sizeof(RT_MaterialData), (material_data.size() + expanded) * sizeof(RT_MaterialData));
 	update_or_grow(p_state->motion_index_buffer, p_state->motion_index_buffer_capacity,
-			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
+			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t), (motion_indices.size() + expanded) * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
-			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
+			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData), (motion_transforms.size() + tlas_expand_motion_count) * sizeof(RT_InstanceMotionData));
 }
 
 // ---------------------------------------------------------------------------
 // Merged MultiMesh BLAS builder
 // ---------------------------------------------------------------------------
 
-bool RenderRaytracing::_mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count) const {
+void RenderRaytracing::_free_lod_view(RTLodView &p_view) {
+	RD *rd = RD::get_singleton();
+	if (p_view.vertex_remap_buffer.is_valid()) {
+		rd->free_rid(p_view.vertex_remap_buffer);
+		p_view.vertex_remap_buffer = RID();
+	}
+	if (p_view.index_buffer.is_valid()) {
+		rd->free_rid(p_view.index_buffer);
+		p_view.index_buffer = RID();
+	}
+}
+
+const RTLodView *RenderRaytracing::_get_lod_view(void *p_mesh_surface, uint32_t p_lod) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
-	// Compressed meshes are skipped: their positions are UNORM16x4, not float3.
-	if (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+	const uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(p_mesh_surface);
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	RTLodViewKey key;
+	key.surface = p_mesh_surface;
+	key.lod = p_lod;
+
+	RTLodView *view = lod_views.getptr(key);
+	if (view && view->surface_counter != surface_counter) {
+		_free_lod_view(*view);
+		lod_views.erase(key);
+		view = nullptr;
+	}
+	if (view) {
+		view->last_used_frame = current_frame;
+		return view;
+	}
+
+	const RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, p_lod);
+	const uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, p_lod);
+	const uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	ERR_FAIL_COND_V(!index_buffer.is_valid() || index_count == 0 || vertex_count == 0, nullptr);
+
+	// Built on the GPU: reading the indices back would stall it in the middle of the frame.
+	RD *rd = RD::get_singleton();
+	const uint32_t kept_bound = MIN(vertex_count, index_count);
+	Vector<uint8_t> zeros;
+	zeros.resize(MAX(vertex_count * uint32_t(sizeof(uint32_t)), 16u));
+	memset(zeros.ptrw(), 0, zeros.size());
+
+	RTLodView new_view;
+	new_view.vertex_count = kept_bound;
+	new_view.index_count = index_count;
+	new_view.surface_counter = surface_counter;
+	new_view.last_used_frame = current_frame;
+	new_view.vertex_remap_buffer = rd->storage_buffer_create(kept_bound * sizeof(uint32_t), Span<uint8_t>(zeros.ptr(), kept_bound * sizeof(uint32_t)));
+	new_view.index_buffer = rd->storage_buffer_create(index_count * sizeof(uint32_t));
+	const RID kept_buffer = rd->storage_buffer_create(vertex_count * sizeof(uint32_t), Span<uint8_t>(zeros.ptr(), vertex_count * sizeof(uint32_t)));
+	const RID counter_buffer = rd->storage_buffer_create(16, Span<uint8_t>(zeros.ptr(), 16));
+	if (!new_view.vertex_remap_buffer.is_valid() || !new_view.index_buffer.is_valid() || !kept_buffer.is_valid() || !counter_buffer.is_valid()) {
+		_free_lod_view(new_view);
+		if (kept_buffer.is_valid()) {
+			rd->free_rid(kept_buffer);
+		}
+		if (counter_buffer.is_valid()) {
+			rd->free_rid(counter_buffer);
+		}
+		ERR_FAIL_V(nullptr);
+	}
+	rd->set_resource_name(new_view.vertex_remap_buffer, "RT LOD vertex remap");
+	rd->set_resource_name(new_view.index_buffer, "RT LOD indices");
+
+	Vector<RD::Uniform> uniforms;
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, kept_buffer));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, counter_buffer));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, new_view.vertex_remap_buffer));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, new_view.index_buffer));
+	const RID uniform_set = rd->uniform_set_create(uniforms, lod_compact_shader.version_shader[0], 0, /*p_linear_pool=*/true);
+
+	const uint64_t index_address = rd->buffer_get_device_address(index_buffer);
+	const uint32_t params[8] = { uint32_t(index_address), uint32_t(index_address >> 32), index_count, vertex_count <= 65536 ? 1u : 0u, vertex_count, 0, 0, 0 };
+	const uint32_t threads[LodCompactShader::MODE_MAX] = { index_count, vertex_count, index_count };
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	for (int mode = 0; mode < LodCompactShader::MODE_MAX; mode++) {
+		if (mode > 0) {
+			rd->compute_list_add_barrier(compute_list);
+		}
+		rd->compute_list_bind_compute_pipeline(compute_list, lod_compact_shader.pipeline[mode]);
+		rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+		rd->compute_list_set_push_constant(compute_list, params, sizeof(params));
+		rd->compute_list_dispatch_threads(compute_list, threads[mode], 1, 1);
+	}
+	rd->compute_list_end();
+
+	// Freed once the GPU is done with this frame.
+	rd->free_rid(uniform_set);
+	rd->free_rid(kept_buffer);
+	rd->free_rid(counter_buffer);
+	return &lod_views.insert(key, new_view)->value;
+}
+
+bool RenderRaytracing::_set_multimesh_instance_data(RT_GeometryData &r_geom, RID p_mm_rid, RID p_mm_gpu_buffer, uint32_t p_vertex_count) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const bool uses_colors = mesh_storage->multimesh_uses_colors(p_mm_rid);
+	const bool uses_custom_data = mesh_storage->multimesh_uses_custom_data(p_mm_rid);
+	uint32_t current_offset = 0;
+	uint32_t previous_offset = 0;
+	// The previous transforms are kept while a viewport uses motion vectors (DLSS, TAA), as raster reads them.
+	const bool moved = p_vertex_count != UINT32_MAX && mesh_storage->_multimesh_get_motion_vectors_offsets(p_mm_rid, current_offset, previous_offset) && previous_offset != current_offset;
+	// A merged BLAS always: its hit shaders find each instance's transform there (its object space, as raster's).
+	if ((!uses_colors && !uses_custom_data && p_vertex_count == UINT32_MAX) || !p_mm_gpu_buffer.is_valid()) {
 		return false;
 	}
-	const uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
-	const RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
-	const uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
+	// The 3D layout, as raster reads it: 12 floats of transform, then 4 of color and 4 of custom data when used.
+	const uint32_t color_offset = uses_colors ? 12 : 0xFFFF;
+	const uint32_t custom_offset = uses_custom_data ? (uses_colors ? 16 : 12) : 0xFFFF;
+	const uint64_t address = RD::get_singleton()->buffer_get_device_address(p_mm_gpu_buffer);
+	r_geom.multimesh_address_lo = uint32_t(address);
+	r_geom.multimesh_address_hi = uint32_t(address >> 32);
+	r_geom.multimesh_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
+	r_geom.multimesh_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
+	r_geom.multimesh_previous_offset = moved ? previous_offset : r_geom.multimesh_offset;
+	r_geom.multimesh_vertex_count = p_vertex_count;
+	r_geom.multimesh_data_offsets = color_offset | (custom_offset << 16);
+	return true;
+}
+
+bool RenderRaytracing::_mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count, const RTLodView *p_lod_view) const {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
+	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
+	if (p_lod_view) {
+		vertex_count = p_lod_view->vertex_count;
+		index_buffer = p_lod_view->index_buffer;
+		index_count = p_lod_view->index_count;
+	}
 	const uint32_t prim_count = (index_buffer.is_valid() && index_count > 0) ? (index_count / 3) : (vertex_count / 3);
 	if (prim_count == 0 || vertex_count == 0) {
 		return false;
@@ -1854,19 +3193,40 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		uint32_t p_mm_count,
 		uint32_t p_surface_index,
 		uint32_t p_surface_counter,
+		uint32_t p_lod,
+		bool p_displace,
+		bool p_reevaluate,
+		RTMaterialData *p_mat_data,
+		uint16_t p_material_counter,
+		const Transform3D &p_transform,
+		const Transform3D &p_prev_transform,
+		uint32_t p_instance_uniforms_ofs,
 		RD::ComputeListID p_compute_list,
 		LocalVector<RID> &r_dirty_blas_list,
 		LocalVector<RID> &r_dirty_blas_update_list,
 		RTSurfaceData *r_surf_data) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
-	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	// Vertices of the source mesh, and of every instance in the merged buffers (fewer than the mesh's for a LOD).
+	const uint32_t src_vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	uint32_t vertex_count = src_vertex_count;
 	RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
 	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
+	const RTLodView *lod_view = nullptr;
+	if (p_lod > 0) {
+		// Looked up (and created) in phase 1; this only finds it.
+		lod_view = lod_views.getptr({ p_mesh_surface, p_lod });
+		if (lod_view) {
+			vertex_count = lod_view->vertex_count;
+			index_buffer = lod_view->index_buffer;
+			index_count = lod_view->index_count;
+		}
+	}
+	const uint32_t lod = lod_view ? p_lod : 0;
 	bool indexed = index_buffer.is_valid() && index_count > 0;
 	uint32_t prim_count = indexed ? (index_count / 3) : (vertex_count / 3);
 
-	if (!_mm_fits_merged_blas(p_mesh_surface, p_mm_count)) {
+	if (!_mm_fits_merged_blas(p_mesh_surface, p_mm_count, lod_view)) {
 		return false;
 	}
 	const uint64_t surface_format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
@@ -1882,28 +3242,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	if (mm_entry.mm_validator != mm_validator) {
 		// Local index has been recycled (or first-ever access). Release any slots
 		// the previous owner left behind so we don't leak until TTL.
-		RD *rd_local = RD::get_singleton();
-		for (uint32_t s = 0; s < mm_entry.per_surface.size(); s++) {
-			RID &h = mm_entry.per_surface[s];
-			RTMergedMMEntry *old = merged_mm_pool.get_or_null(h);
-			if (!old) {
-				h = RID();
-				continue;
-			}
-			if (old->blas.is_valid()) {
-				rd_local->free_rid(old->blas);
-			}
-			if (old->merged_vtx_buffer.is_valid()) {
-				rd_local->free_rid(old->merged_vtx_buffer);
-			}
-			if (old->merged_attr_buffer.is_valid()) {
-				rd_local->free_rid(old->merged_attr_buffer);
-			}
-			if (old->replicated_idx_buffer.is_valid()) {
-				rd_local->free_rid(old->replicated_idx_buffer);
-			}
-			merged_mm_pool.free(h);
-			h = RID();
+		for (RID &handle : mm_entry.per_surface) {
+			_free_merged_mm_entry(handle);
+			handle = RID();
 		}
 		mm_entry.per_surface.clear();
 		mm_entry.mm_validator = mm_validator;
@@ -1930,24 +3271,23 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	const bool transforms_changed = (entry.cached_mm_last_change != mm_last_change);
 
 	bool structure_changed = (entry.last_mm_count != p_mm_count ||
-			entry.last_surface_counter != p_surface_counter);
-
-	entry.indexed = indexed;
+			entry.last_surface_counter != p_surface_counter ||
+			entry.last_lod != lod);
 
 	if (structure_changed) {
-		RD *rd = RD::get_singleton();
-		if (entry.blas.is_valid()) {
-			rd->free_rid(entry.blas);
-			entry.blas = RID();
-		}
+		// Other triangles are active: a full build, in place when the capacity below holds them.
 		entry.blas_built_once = false;
 		entry.last_mm_count = p_mm_count;
 		entry.last_surface_counter = p_surface_counter;
+		entry.last_lod = lod;
 	}
 
 	bool has_normal = surface_format & RSE::ARRAY_FORMAT_NORMAL;
 	bool has_tangent = surface_format & RSE::ARRAY_FORMAT_TANGENT;
 	bool has_tbn = has_normal;
+	// Compressed source: [UNORM16x4 positions × V] + [octahedral normal (UNORM16x2) × V], the tangent in each
+	// position's w. The merge shader decompresses it; the merged buffers below are always uncompressed.
+	const bool compressed = surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
 
 	// Layout of uncompressed vertex buffer: [float3 positions × V] + [packed TBN × V].
 	// normal_stride = 8 when both normal+tangent present (two uint16x2 packed), 4 with normal only.
@@ -1957,19 +3297,15 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	} else if (has_normal) {
 		tbn_stride = 4; // 1 × uint32 (normal oct only)
 	}
-	// Byte offset of the TBN block in the source vertex buffer.
-	uint32_t src_tbn_byte_offset = vertex_count * 12; // after all float3 positions
+	// Byte offset of the TBN block in the source vertex buffer, after all its positions.
+	uint32_t src_tbn_byte_offset = src_vertex_count * (compressed ? 8 : 12);
 
-	// Merged vertex buffer: [float3 pos × N*V] + [packed TBN × N*V] (if TBN present).
-	uint32_t merged_vtx_bytes = p_mm_count * vertex_count * 12 + (has_tbn ? p_mm_count * vertex_count * tbn_stride : 0);
-
-	// Attribute buffer: attribute_stride bytes × V, replicated N times.
+	// Described as an uncompressed surface: positions and TBN are, its attributes keep their compressed layout (flag).
 	RTSurfaceData meta_sd;
-	_fill_surface_geometry_data(p_mesh_surface, false, &meta_sd);
+	_fill_surface_geometry_data(p_mesh_surface, true, &meta_sd);
 	uint32_t attrib_stride = meta_sd.geometry.attribute_stride;
 	bool has_attr = attrib_stride > 0;
 	const uint32_t MIN_ATTR_BYTES = 16;
-	uint32_t merged_attr_bytes = has_attr ? (p_mm_count * vertex_count * attrib_stride) : MIN_ATTR_BYTES;
 
 	RD *rd = RD::get_singleton();
 	BitField<RD::BufferCreationBits> gpu_buf_flags =
@@ -1977,45 +3313,77 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT |
 			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
 
-	// --- Grow / allocate merged vertex buffer ---
-	if (!entry.merged_vtx_buffer.is_valid() || entry.vtx_capacity_bytes < merged_vtx_bytes) {
-		if (entry.merged_vtx_buffer.is_valid()) {
-			rd->free_rid(entry.merged_vtx_buffer);
-			entry.merged_vtx_buffer = RID();
+	// --- Capacity: units entering or leaving a MultiMesh, or a LOD switch, change N*V and N*I every few frames. Within
+	// the capacity the buffers, the BLAS and its scratch stay; past it they are all made again (the BLAS's geometry
+	// description holds the buffers and the counts), and so they are when the capacity the need would get now has been
+	// under half of the current one for MM_SHRINK_DELAY_FRAMES: zooming back and forth switches LODs every few frames. ---
+	static constexpr uint32_t MM_SHRINK_DELAY_FRAMES = 300;
+	auto capacity_for = [](uint32_t p_count) { return p_count + p_count / 4 + 16; };
+	const uint32_t used_vertices = p_mm_count * vertex_count;
+	const uint32_t used_indices = indexed ? p_mm_count * index_count : 0;
+	// An indexed BLAS keeps one unused vertex for its unused indices.
+	const uint32_t needed_vertices = indexed ? used_vertices + 1 : used_vertices;
+	bool shrink = false;
+	if (capacity_for(needed_vertices) < entry.cap_vertices / 2) {
+		if (entry.oversized_since_frame == 0) {
+			entry.oversized_since_frame = current_frame;
 		}
-		entry.vtx_capacity_bytes = merged_vtx_bytes;
-		entry.merged_vtx_buffer = rd->vertex_buffer_create(merged_vtx_bytes, {}, gpu_buf_flags);
+		shrink = current_frame - entry.oversized_since_frame >= MM_SHRINK_DELAY_FRAMES;
+	} else {
+		entry.oversized_since_frame = 0;
+	}
+	const bool reallocate = !entry.merged_vtx_buffer.is_valid() || entry.indexed != indexed ||
+			entry.last_tbn_stride != tbn_stride || entry.last_attrib_stride != attrib_stride ||
+			needed_vertices > entry.cap_vertices || used_indices > entry.cap_indices || shrink;
+	if (reallocate) {
+		uint32_t cap_vertices = capacity_for(needed_vertices);
+		uint32_t cap_indices = 0;
+		if (indexed) {
+			cap_indices = capacity_for(used_indices);
+			cap_indices -= cap_indices % 3;
+		} else {
+			cap_vertices -= cap_vertices % 3; // Non-indexed: the vertices are the triangles.
+		}
+
+		if (entry.blas.is_valid()) {
+			rd->free_rid(entry.blas);
+			entry.blas = RID();
+		}
+		if (entry.merge_uniform_set.is_valid() && rd->uniform_set_is_valid(entry.merge_uniform_set)) {
+			rd->free_rid(entry.merge_uniform_set);
+		}
+		entry.merge_uniform_set = RID();
+		RID *buffers[] = { &entry.merged_vtx_buffer, &entry.merged_attr_buffer, &entry.replicated_idx_buffer, &entry.merged_prev_buffer };
+		for (RID *buffer : buffers) {
+			if (buffer->is_valid()) {
+				rd->free_rid(*buffer);
+				*buffer = RID();
+			}
+		}
+		entry.cap_vertices = cap_vertices;
+		entry.cap_indices = cap_indices;
+		entry.buffer_bytes = uint64_t(cap_vertices) * (12 + (has_tbn ? tbn_stride : 0) + attrib_stride) + uint64_t(cap_indices) * 4;
+		entry.oversized_since_frame = 0;
+		entry.indexed = indexed;
+		entry.last_tbn_stride = tbn_stride;
+		entry.last_attrib_stride = attrib_stride;
+		entry.blas_built_once = false;
+		entry.displaced = false; // The previous positions are gone with merged_prev_buffer.
+
+		// [float3 pos × cap] + [packed TBN × cap] (if TBN present).
+		entry.merged_vtx_buffer = rd->vertex_buffer_create(cap_vertices * (12 + (has_tbn ? tbn_stride : 0)), {}, gpu_buf_flags);
 		ERR_FAIL_COND_V(!entry.merged_vtx_buffer.is_valid(), false);
 		rd->set_resource_name(entry.merged_vtx_buffer, "RT MM merged vtx [" + itos(cache_key) + "]");
-		entry.blas_built_once = false;
-	}
 
-	// --- Grow / allocate merged attribute buffer ---
-	if (!entry.merged_attr_buffer.is_valid() || entry.attr_capacity_bytes < merged_attr_bytes) {
-		if (entry.merged_attr_buffer.is_valid()) {
-			rd->free_rid(entry.merged_attr_buffer);
-			entry.merged_attr_buffer = RID();
-		}
-		entry.attr_capacity_bytes = merged_attr_bytes;
-		entry.merged_attr_buffer = rd->storage_buffer_create(merged_attr_bytes, {}, 0, gpu_buf_flags);
+		// attribute_stride bytes per merged vertex.
+		entry.merged_attr_buffer = rd->storage_buffer_create(has_attr ? cap_vertices * attrib_stride : MIN_ATTR_BYTES, {}, 0, gpu_buf_flags);
 		ERR_FAIL_COND_V(!entry.merged_attr_buffer.is_valid(), false);
 		rd->set_resource_name(entry.merged_attr_buffer, "RT MM merged attr [" + itos(cache_key) + "]");
-	}
 
-	// --- Grow / allocate replicated index buffer ---
-	if (indexed) {
-		uint32_t needed_idx = p_mm_count * index_count;
-		if (!entry.replicated_idx_buffer.is_valid() || entry.idx_capacity < needed_idx) {
-			if (entry.replicated_idx_buffer.is_valid()) {
-				rd->free_rid(entry.replicated_idx_buffer);
-				entry.replicated_idx_buffer = RID();
-			}
-			entry.idx_capacity = needed_idx;
-			entry.replicated_idx_buffer = rd->index_buffer_create(
-					needed_idx, RD::INDEX_BUFFER_FORMAT_UINT32, {}, false, gpu_buf_flags);
+		if (indexed) {
+			entry.replicated_idx_buffer = rd->index_buffer_create(cap_indices, RD::INDEX_BUFFER_FORMAT_UINT32, {}, false, gpu_buf_flags);
 			ERR_FAIL_COND_V(!entry.replicated_idx_buffer.is_valid(), false);
 			rd->set_resource_name(entry.replicated_idx_buffer, "RT MM replicated idx [" + itos(cache_key) + "]");
-			entry.blas_built_once = false;
 		}
 	}
 
@@ -2034,8 +3402,21 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	ERR_FAIL_COND_V(!vtx_buf.is_valid(), false);
 	uint64_t vtx_bda = rd->buffer_get_device_address(vtx_buf);
 
+	// Positions displaced while near the camera go back to rest once it is no longer displaced.
 	const bool needs_rebake = first_touch_this_frame &&
-			(transforms_changed || !entry.blas_built_once);
+			(transforms_changed || !entry.blas_built_once || (entry.displaced && !p_displace));
+
+	// --- Displacement by the material's vertex(), after the merge (_displace_merged_multimeshes()) ---
+	if (p_displace && !entry.merged_prev_buffer.is_valid()) {
+		entry.merged_prev_buffer = rd->storage_buffer_create(entry.cap_vertices * 12, {}, 0, RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+		ERR_FAIL_COND_V(!entry.merged_prev_buffer.is_valid(), false);
+		rd->set_resource_name(entry.merged_prev_buffer, "RT MM displaced prev [" + itos(cache_key) + "]");
+		entry.displaced = false; // Its previous positions are not written yet.
+	}
+	// Evaluated after every merge, every frame when vertex() reads the time or the camera, and when the material's
+	// parameters or the instance uniforms change (godot3d's Rot Blossom grows its MultiMeshes with one).
+	const uint32_t displace_inputs = p_displace ? hash_murmur3_one_32(p_material_counter, RendererRD::MaterialStorage::get_singleton()->global_shader_parameters_instance_hash(int32_t(p_instance_uniforms_ofs))) : 0;
+	const bool displace_now = p_displace && first_touch_this_frame && (needs_rebake || p_reevaluate || !entry.displaced || entry.displaced_inputs != displace_inputs);
 
 	// --- Single merged dispatch: bake vertices + TBN + attributes + (optional) indices ---
 	if (needs_rebake) {
@@ -2054,53 +3435,90 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			push_buf(3, src_attr_buf);
 			if (indexed) {
 				push_buf(4, entry.replicated_idx_buffer);
+				// Bound, not read through addresses: the graph orders the LOD view's compaction before this pass.
+				push_buf(5, lod_view ? lod_view->vertex_remap_buffer : lod_view_dummy_buffer);
+				push_buf(6, lod_view ? lod_view->index_buffer : lod_view_dummy_buffer);
 			}
 		}
-		RID merge_uniform_set = rd->uniform_set_create(uniforms, mm_merge_shader.version_shader[merge_mode], 0, /*p_linear_pool=*/true);
-		ERR_FAIL_COND_V(!merge_uniform_set.is_valid(), false);
+		RID set_buffers[7] = {};
+		for (const RD::Uniform &u : uniforms) {
+			set_buffers[u.binding] = u.get_id(0);
+		}
+		bool reuse = entry.merge_uniform_set.is_valid() && rd->uniform_set_is_valid(entry.merge_uniform_set) && entry.merge_set_mode == uint32_t(merge_mode);
+		for (uint32_t i = 0; i < 7 && reuse; i++) {
+			reuse = entry.merge_set_buffers[i] == set_buffers[i];
+		}
+		if (!reuse) {
+			if (entry.merge_uniform_set.is_valid() && rd->uniform_set_is_valid(entry.merge_uniform_set)) {
+				rd->free_rid(entry.merge_uniform_set);
+			}
+			entry.merge_uniform_set = rd->uniform_set_create(uniforms, mm_merge_shader.version_shader[merge_mode], 0);
+			ERR_FAIL_COND_V(!entry.merge_uniform_set.is_valid(), false);
+			entry.merge_set_mode = uint32_t(merge_mode);
+			for (uint32_t i = 0; i < 7; i++) {
+				entry.merge_set_buffers[i] = set_buffers[i];
+			}
+		}
+		const RID merge_uniform_set = entry.merge_uniform_set;
 		uint32_t mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
 		uint32_t mm_cur_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
 		uint32_t tbn_stride_words = tbn_stride / 4;
-		// In the merged vertex buffer the TBN block starts after all N*V float3 positions.
-		uint32_t dst_tbn_base_words = p_mm_count * vertex_count * 3;
+		// In the merged vertex buffer the TBN block starts after all cap_vertices float3 positions.
+		uint32_t dst_tbn_base_words = entry.cap_vertices * 3;
 
 		struct MergePC {
 			uint32_t src_vtx_lo, src_vtx_hi;
 			// MODE_INDEXED only -- present in struct (uploaded only when indexed):
 			uint32_t src_idx_lo, src_idx_hi;
 			uint32_t index_count, src_is_16bit;
+			uint32_t use_lod_view, pad; // 1: vertices and indices come from the LOD view (bindings 5 and 6).
 			// Common tail:
 			uint32_t vertex_count, instance_count;
 			uint32_t pos_stride_words;
 			uint32_t src_tbn_base_words;
-			uint32_t src_tbn_stride_words;
+			uint32_t tbn_stride_words;
 			uint32_t dst_tbn_base_words;
 			uint32_t mm_stride, mm_offset;
 			uint32_t has_tbn;
 			uint32_t attr_stride_words;
+			uint32_t compressed;
+			float aabb_position[3];
+			float aabb_size[3];
+			uint32_t cap_vertices, cap_indices;
 		} pc;
 
 		pc.src_vtx_lo = uint32_t(vtx_bda);
 		pc.src_vtx_hi = uint32_t(vtx_bda >> 32);
 
 		if (indexed) {
-			uint64_t src_idx_bda = rd->buffer_get_device_address(index_buffer);
+			uint64_t src_idx_bda = lod_view ? 0 : rd->buffer_get_device_address(index_buffer);
 			pc.src_idx_lo = uint32_t(src_idx_bda);
 			pc.src_idx_hi = uint32_t(src_idx_bda >> 32);
 			pc.index_count = index_count;
-			pc.src_is_16bit = (vertex_count <= 65536) ? 1u : 0u;
+			pc.src_is_16bit = (!lod_view && src_vertex_count <= 65536) ? 1u : 0u;
+			pc.use_lod_view = lod_view ? 1u : 0u;
+			pc.pad = 0;
 		}
 
 		pc.vertex_count = vertex_count;
 		pc.instance_count = p_mm_count;
-		pc.pos_stride_words = 3; // always float3 (uncompressed check at top)
+		pc.pos_stride_words = compressed ? 2 : 3;
 		pc.src_tbn_base_words = src_tbn_byte_offset / 4;
-		pc.src_tbn_stride_words = tbn_stride_words;
+		pc.tbn_stride_words = tbn_stride_words;
 		pc.dst_tbn_base_words = dst_tbn_base_words;
 		pc.mm_stride = mm_stride;
 		pc.mm_offset = mm_cur_offset;
 		pc.has_tbn = has_tbn ? 1u : 0u;
 		pc.attr_stride_words = has_attr ? (attrib_stride / 4) : 0u;
+		pc.compressed = compressed ? 1u : 0u;
+		// The AABB raster decompresses the positions with (RTSurfaceData::aabb_transform for an unmerged surface).
+		const AABB surface_aabb = compressed ? mesh_storage->mesh_surface_get_aabb(p_mesh_surface) : AABB();
+		for (int axis = 0; axis < 3; axis++) {
+			pc.aabb_position[axis] = surface_aabb.position[axis];
+			pc.aabb_size[axis] = surface_aabb.size[axis];
+		}
+		pc.cap_vertices = entry.cap_vertices;
+		pc.cap_indices = entry.cap_indices;
 
 		MergeShader::Mode mode = indexed ? MergeShader::MODE_INDEXED : MergeShader::MODE_NON_INDEXED;
 		rd->compute_list_bind_compute_pipeline(p_compute_list, mm_merge_shader.pipeline[mode]);
@@ -2115,11 +3533,15 @@ bool RenderRaytracing::_build_merged_mm_blas(
 				uint32_t vertex_count, instance_count;
 				uint32_t pos_stride_words;
 				uint32_t src_tbn_base_words;
-				uint32_t src_tbn_stride_words;
+				uint32_t tbn_stride_words;
 				uint32_t dst_tbn_base_words;
 				uint32_t mm_stride, mm_offset;
 				uint32_t has_tbn;
 				uint32_t attr_stride_words;
+				uint32_t compressed;
+				float aabb_position[3];
+				float aabb_size[3];
+				uint32_t cap_vertices, cap_indices;
 			} pc_ni;
 			pc_ni.src_vtx_lo = pc.src_vtx_lo;
 			pc_ni.src_vtx_hi = pc.src_vtx_hi;
@@ -2127,27 +3549,26 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			pc_ni.instance_count = pc.instance_count;
 			pc_ni.pos_stride_words = pc.pos_stride_words;
 			pc_ni.src_tbn_base_words = pc.src_tbn_base_words;
-			pc_ni.src_tbn_stride_words = pc.src_tbn_stride_words;
+			pc_ni.tbn_stride_words = pc.tbn_stride_words;
 			pc_ni.dst_tbn_base_words = pc.dst_tbn_base_words;
 			pc_ni.mm_stride = pc.mm_stride;
 			pc_ni.mm_offset = pc.mm_offset;
 			pc_ni.has_tbn = pc.has_tbn;
 			pc_ni.attr_stride_words = pc.attr_stride_words;
+			pc_ni.compressed = pc.compressed;
+			memcpy(pc_ni.aabb_position, pc.aabb_position, sizeof(pc.aabb_position));
+			memcpy(pc_ni.aabb_size, pc.aabb_size, sizeof(pc.aabb_size));
+			pc_ni.cap_vertices = pc.cap_vertices;
+			pc_ni.cap_indices = pc.cap_indices;
 			rd->compute_list_set_push_constant(p_compute_list, &pc_ni, sizeof(MergePCNonIndexed));
 		}
 
 		// Single thread count: every thread processes one vertex (idx < N*V)
 		// and -- for MODE_INDEXED -- one output index (idx < N*I) using disjoint
-		// destination buffers, so no in-shader barrier is required.
-		uint32_t thread_count = p_mm_count * vertex_count;
-		if (indexed) {
-			thread_count = MAX(thread_count, p_mm_count * index_count);
-		}
+		// destination buffers, so no in-shader barrier is required. A build also writes the unused vertices and indices
+		// up to the capacity; a refit leaves them as they are.
+		uint32_t thread_count = entry.blas_built_once ? MAX(used_vertices, used_indices) : MAX(entry.cap_vertices, entry.cap_indices);
 		rd->compute_list_dispatch_threads(p_compute_list, thread_count, 1, 1);
-
-		// Drop the RID now that the dispatch is recorded; the underlying Vulkan
-		// descriptor set lives in the linear pool until frame end.
-		rd->free_rid(merge_uniform_set);
 	}
 
 	// --- Build or refit the merged BLAS (uses merged_vtx_buffer for positions) ---
@@ -2156,12 +3577,12 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		as_geom.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
 		as_geom.geometry.triangles.vertex_buffer = entry.merged_vtx_buffer;
 		as_geom.geometry.triangles.vertex_stride = 12; // float3, positions section only
-		as_geom.geometry.triangles.vertex_count = p_mm_count * vertex_count;
+		as_geom.geometry.triangles.vertex_count = entry.cap_vertices;
 		as_geom.geometry.triangles.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 
 		if (indexed) {
 			as_geom.geometry.triangles.index_buffer = entry.replicated_idx_buffer;
-			as_geom.geometry.triangles.index_count = p_mm_count * index_count;
+			as_geom.geometry.triangles.index_count = entry.cap_indices;
 		}
 
 		BitField<RD::AccelerationStructureFlagBits> as_flags =
@@ -2172,14 +3593,44 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + "]");
 	}
 
-	if (needs_rebake) {
+	if (needs_rebake || displace_now) {
 		if (!entry.blas_built_once) {
 			r_dirty_blas_list.push_back(entry.blas);
 			entry.blas_built_once = true;
 		} else {
 			r_dirty_blas_update_list.push_back(entry.blas);
 		}
+	}
+	if (needs_rebake) {
 		entry.cached_mm_last_change = mm_last_change;
+	}
+	if (displace_now) {
+		MMDisplaceRequest request;
+		request.merged_vtx_buffer = entry.merged_vtx_buffer;
+		request.merged_prev_buffer = entry.merged_prev_buffer;
+		request.mm_gpu_buffer = p_mm_gpu_buffer;
+		request.remap_buffer = lod_view ? lod_view->vertex_remap_buffer : RID();
+		request.mesh_surface = p_mesh_surface;
+		request.mm_count = p_mm_count;
+		request.vertex_count = vertex_count;
+		request.mm_stride = mesh_storage->multimesh_get_stride(p_mm_rid);
+		request.mm_offset = mesh_storage->multimesh_get_current_instance_offset(p_mm_rid);
+		// The 3D layout: 12 floats of transform, then 4 of color and 4 of custom data when used.
+		const bool mm_colors = mesh_storage->multimesh_uses_colors(p_mm_rid);
+		request.mm_color_offset = mm_colors ? 12 : UINT32_MAX;
+		request.mm_custom_offset = mesh_storage->multimesh_uses_custom_data(p_mm_rid) ? (mm_colors ? 16 : 12) : UINT32_MAX;
+		request.mat_data = p_mat_data;
+		request.transform = p_transform;
+		request.prev_transform = p_prev_transform;
+		request.instance_uniforms_ofs = p_instance_uniforms_ofs;
+		mm_displace_requests.push_back(request);
+	}
+	if (first_touch_this_frame) {
+		entry.displaced = p_displace;
+		entry.displaced_this_frame = displace_now;
+		if (displace_now) {
+			entry.displaced_inputs = displace_inputs;
+		}
 	}
 
 	// --- Populate r_surf_data from the metadata already computed above, then override merged buffer addresses.
@@ -2195,10 +3646,17 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	geom.vertex_count = p_mm_count * vertex_count;
 	geom.position_stride = 12; // float3, uncompressed
 	geom.flags &= ~RT_GEOM_FLAG_COMPRESSED;
+	if (entry.displaced_this_frame) {
+		// Moving with its vertex() this frame: the previous positions give the motion vectors.
+		const uint64_t prev_address = rd->buffer_get_device_address(entry.merged_prev_buffer);
+		geom.flags |= RT_GEOM_FLAG_DEFORMED;
+		geom.prev_vertex_buffer_address_lo = static_cast<uint32_t>(prev_address & 0xFFFFFFFFULL);
+		geom.prev_vertex_buffer_address_hi = static_cast<uint32_t>(prev_address >> 32);
+	}
 
 	// TBN section starts after all positions in the merged vertex buffer.
 	if (has_tbn) {
-		uint32_t tbn_base = p_mm_count * vertex_count * 12;
+		uint32_t tbn_base = entry.cap_vertices * 12;
 		geom.normal_byte_offset = tbn_base;
 		geom.normal_stride = tbn_stride;
 		if (has_tangent) {
@@ -2213,6 +3671,11 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	// Point attribute address at fully replicated attribute buffer.
 	if (has_attr && entry.merged_attr_buffer.is_valid()) {
 		geom.attribute_buffer_address = rd->buffer_get_device_address(entry.merged_attr_buffer);
+	}
+
+	// Its instances' COLOR, INSTANCE_CUSTOM and motion, read from the MultiMesh buffer: instance = merged vertex / vertex_count.
+	if (_set_multimesh_instance_data(geom, p_mm_rid, p_mm_gpu_buffer, vertex_count)) {
+		multimesh_buffers_read_this_frame.push_back(p_mm_gpu_buffer);
 	}
 
 	// Point index address at the replicated (uint32) index buffer.
@@ -2239,9 +3702,36 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
+// The instance transform BaseMaterial3D's billboard modes give in vertex() (MODELVIEW_MATRIX without the view).
+static Transform3D _billboard_transform(const Transform3D &p_model, const Transform3D &p_camera, RTBillboardMode p_mode, bool p_keep_scale) {
+	Basis basis = p_camera.basis;
+	if (p_mode == RT_BILLBOARD_FIXED_Y) {
+		const Vector3 up(0, 1, 0);
+		const Vector3 x = up.cross(p_camera.basis.get_column(2));
+		const Vector3 z = p_camera.basis.get_column(0).cross(up);
+		if (x.length_squared() < CMP_EPSILON2 || z.length_squared() < CMP_EPSILON2) {
+			return p_model; // Camera looking straight up or down: raster divides by zero there.
+		}
+		basis.set_column(0, x.normalized());
+		basis.set_column(1, up);
+		basis.set_column(2, z.normalized());
+	}
+	if (p_keep_scale) {
+		basis = basis * Basis::from_scale(p_model.basis.get_scale_abs());
+	}
+	return Transform3D(basis, p_model.origin);
+}
+
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
+	}
+	{
+		const uint32_t frame = RSG::rasterizer->get_frame_number();
+		if (frame - omm_sweep_frame >= 60) {
+			omm_sweep_frame = frame;
+			_omm_evict(false);
+		}
 	}
 
 	RTViewportState *state = _get_or_create_viewport_state(p_render_data);
@@ -2250,10 +3740,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 
 	prepare_frame();
+	last_trace_frame = MAX(RSG::rasterizer->get_frame_number(), 1u);
 
 	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
 	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
+
+	_displace_surfaces(p_render_data);
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
@@ -2270,6 +3764,20 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	const bool collect_render_info = (p_render_data->render_info != nullptr);
 #endif
 
+	// Which rays see an instance, from its cast_shadow setting.
+	auto instance_mask = [](const RenderGeometryInstanceBase *p_instance) -> uint8_t {
+		switch (p_instance->data->cast_shadows) {
+			case RSE::SHADOW_CASTING_SETTING_OFF:
+				return RT_INSTANCE_MASK_CAMERA;
+			case RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY:
+				return RT_INSTANCE_MASK_SHADOW;
+			case RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED:
+				return RT_INSTANCE_MASK_CAMERA | RT_INSTANCE_MASK_SHADOW | RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW;
+			default:
+				return RT_INSTANCE_MASK_CAMERA | RT_INSTANCE_MASK_SHADOW;
+		}
+	};
+
 	// -----------------------------------------------------------------------
 	// Phase 1: CPU / buffer-update work
 	// -----------------------------------------------------------------------
@@ -2281,11 +3789,19 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_count;
 		uint32_t surface_index;
 		uint32_t surface_counter;
+		uint32_t lod;
+		const RTLodView *lod_view;
+		bool displace; // Its material's vertex() moves it and it is near enough.
+		bool reevaluate; // That vertex() reads the time or the camera.
+		uint16_t material_counter; // Its parameters' version: a change evaluates vertex() again.
 		Transform3D instance_transform;
 		Transform3D prev_instance_transform;
 		bool transform_moved;
 		RTMaterialData *mat_data;
+		RID material_rid;
+		bool material_ready; // Not the stand-in of a hit group still compiling.
 		uint32_t inst_flags;
+		bool per_instance; // One TLAS instance per instance (_build_tlas_with_expanded_multimeshes()), not a merged BLAS.
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -2351,6 +3867,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				geom.aabb_size_x = (float)ps->culling_aabb.size.x;
 				geom.aabb_size_y = (float)ps->culling_aabb.size.y;
 				geom.aabb_size_z = (float)ps->culling_aabb.size.z;
+				geom.layer_mask = inst->layer_mask;
 				geometry_data.push_back(geom);
 
 				if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
@@ -2366,12 +3883,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
 				RTMaterialData *proc_mat_data = process_material(proc_material_rid, proc_mat_counter);
 				material_data.push_back(proc_mat_data->data);
+				material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 
 				// Procedural instances disable triangle culling and are opaque.
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(instance_mask(inst));
 			}
 			continue;
 		}
@@ -2394,6 +3912,16 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			bool transform_moved = (inst->transform_status ==
 					RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED);
+
+			// The LOD raster draws the MultiMesh with (RenderForwardClustered::_fill_render_list): a merged BLAS is built
+			// from it, so distant foliage costs the trace what it costs raster, not its full detail.
+			float lod_distance = 1.0;
+			if (!p_render_data->scene_data->cam_orthogonal) {
+				const Vector3 aabb_min = inst->transformed_aabb.position;
+				const Vector3 aabb_max = inst->transformed_aabb.position + inst->transformed_aabb.size;
+				const Vector3 camera_position = p_render_data->scene_data->main_cam_transform.origin;
+				lod_distance = Vector3().max(aabb_min - camera_position).max(camera_position - aabb_max).length();
+			}
 
 			const RenderForwardClustered::GeometryInstanceSurfaceDataCache *mm_surf = inst->surface_caches;
 			while (mm_surf) {
@@ -2421,10 +3949,16 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				RTMaterialData *mat_data = process_material(material_rid, material_counter);
 
+				bool mm_material_ready = true;
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
-					mm_surf = mm_surf->next;
-					continue;
+					mm_material_ready = false;
+					const SceneShaderForwardClustered::ShaderData *cut_shader = mm_surf->shader;
+					mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
+					if (!mat_data) {
+						mm_surf = mm_surf->next;
+						continue;
+					}
 				}
 
 				uint32_t inst_flags = 0;
@@ -2457,11 +3991,85 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 					}
 				}
+				// Near the camera, a material whose vertex() moves the MultiMesh (wind) is evaluated on it, as raster draws it.
+				bool displace = false;
+				bool reevaluate = false;
+				static const float mm_displacement_distance = GLOBAL_GET("rendering/pathtracing/multimesh_displacement_distance");
+				if (mm_displacement_distance > 0.0f && lod_distance <= mm_displacement_distance && mat_data->rt_sbt_offset > 0) {
+					const SceneShaderRaytracing::CustomShaderEntry *displace_cse = rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
+					RID displace_shader;
+					if (displace_cse && displace_cse->writes_vertex && rt_shader_singleton->get_displace_pipeline(mat_data->rt_sbt_offset, displace_shader).is_valid()) {
+						displace = true;
+						reevaluate = displace_cse->uses_vertex_time || (displace_cse->vertex_reads_camera && displace_camera_moved);
+					}
+				}
 
-				if (!mm_gpu_buffer.is_valid() || !_mm_fits_merged_blas(mesh_surface, mm_count)) {
-					// One TLAS instance per instance needs the instances on the CPU; the merged BLAS reads them from the GPU
-					// buffer. A copy of the buffer that waited for the GPU stalled the frame for every new MultiMesh (foliage
-					// streamed in as the camera moves): the copy is asynchronous, and the MultiMesh traced once it is there.
+				// One TLAS instance per instance, sharing the mesh's BLAS, written on the GPU from the MultiMesh buffer. A merged
+				// BLAS is built again or refit whenever its instances change (moving units: hundreds of refits a frame, a
+				// hierarchy that degrades, a copy of the mesh per instance in video memory); it is kept for the displaced
+				// MultiMeshes, whose vertices only it holds. Measured on Solfarer's army and godot3d's village: faster on the
+				// render thread and the GPU, less memory, also for static foliage.
+				const bool per_instance = tlas_expand_supported && mm_gpu_buffer.is_valid() && !displace;
+
+				uint32_t lod = 0;
+				const RTLodView *lod_view = nullptr;
+				// GODOT_RT_MULTIMESH_LOD=0 merges every MultiMesh at its full detail. One TLAS instance per instance traces
+				// the mesh itself: its BLAS is shared, whatever the instance count.
+				static const bool multimesh_lod = OS::get_singleton()->get_environment("GODOT_RT_MULTIMESH_LOD") != "0";
+				if (!per_instance && multimesh_lod && p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(mesh_surface)) {
+					uint32_t lod_indices = 0;
+					const float lod_model_scale = inst->lod_model_scale * inst->lod_bias;
+					const float lod_distance_scaled = lod_distance * p_render_data->scene_data->lod_distance_multiplier;
+					const float lod_threshold = p_render_data->scene_data->screen_mesh_lod_threshold;
+					lod = mesh_storage->mesh_surface_get_lod(mesh_surface, lod_model_scale, lod_distance_scaled, lod_threshold, lod_indices);
+					// A LOD switch builds the merged BLAS again, which raster pays nothing for. The LOD built stays while the
+					// distance is within RT_MULTIMESH_LOD_HYSTERESIS of one that picks it, so that a distance about a threshold
+					// (an AABB following moving units) does not switch it back and forth.
+					const RTMergedMMEntry *built = _get_merged_mm_entry(mm_rid, mm_surf->surface_index);
+					const uint32_t built_lod = built ? built->last_lod : UINT32_MAX;
+					if (built_lod != UINT32_MAX && built_lod != lod) {
+						static constexpr float RT_MULTIMESH_LOD_HYSTERESIS = 0.1f;
+						const uint32_t nearer_lod = mesh_storage->mesh_surface_get_lod(mesh_surface, lod_model_scale, lod_distance_scaled * (1.0f - RT_MULTIMESH_LOD_HYSTERESIS), lod_threshold, lod_indices);
+						const uint32_t farther_lod = mesh_storage->mesh_surface_get_lod(mesh_surface, lod_model_scale, lod_distance_scaled * (1.0f + RT_MULTIMESH_LOD_HYSTERESIS), lod_threshold, lod_indices);
+						if (built_lod >= nearer_lod && built_lod <= farther_lod) {
+							lod = built_lod;
+						}
+					}
+					if (lod > 0) {
+						// Read here: fetching a new LOD's indices waits for the GPU, which cannot happen inside the compute list of phase 2.
+						lod_view = _get_lod_view(mesh_surface, lod);
+						if (!lod_view) {
+							lod = 0;
+						}
+					}
+					// A zoom switches thousands of MultiMeshes at once, each a full build of its BLAS on the GPU. A switch the
+					// instance count does not force anyway is spread over the frames: past the frame's budget of triangles, the
+					// MultiMesh keeps the LOD it is built with, a frame longer.
+					if (built_lod != UINT32_MAX && lod != built_lod && built->last_mm_count == mm_count) {
+						static const uint64_t LOD_SWITCH_TRIANGLES_PER_FRAME = uint64_t(int64_t(GLOBAL_GET("rendering/pathtracing/multimesh_lod_switch_triangles_per_frame")));
+						const uint32_t frame_number = RSG::rasterizer->get_frame_number();
+						if (lod_switch_frame != frame_number) {
+							lod_switch_frame = frame_number;
+							lod_switch_triangles = 0;
+						}
+						const uint32_t switch_indices = lod_view ? lod_view->index_count : mesh_storage->mesh_surface_get_index_count(mesh_surface, 0);
+						const uint64_t switch_triangles = uint64_t(mm_count) * (switch_indices > 0 ? switch_indices : mesh_storage->mesh_surface_get_vertex_count(mesh_surface)) / 3;
+						if (lod_switch_triangles > 0 && lod_switch_triangles + switch_triangles > LOD_SWITCH_TRIANGLES_PER_FRAME) {
+							lod = built_lod;
+							lod_view = lod > 0 ? _get_lod_view(mesh_surface, lod) : nullptr;
+							if (lod > 0 && !lod_view) {
+								lod = 0;
+							}
+						} else {
+							lod_switch_triangles += switch_triangles;
+						}
+					}
+				}
+
+				if (!(tlas_expand_supported && mm_gpu_buffer.is_valid()) && (!mm_gpu_buffer.is_valid() || !_mm_fits_merged_blas(mesh_surface, mm_count, lod_view))) {
+					// One TLAS instance per instance, without writing them on the GPU, needs the instances on the CPU. A copy
+					// of the buffer that waited for the GPU stalled the frame for every new MultiMesh (foliage streamed in as
+					// the camera moves): the copy is asynchronous, and the MultiMesh traced once it is there.
 					if (!mesh_storage->multimesh_get_local_data_ptr_async(mm_rid)) {
 						mm_surf = mm_surf->next;
 						continue;
@@ -2476,11 +4084,19 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.mm_count = mm_count;
 				pending.surface_index = mm_surf->surface_index;
 				pending.surface_counter = surface_counter;
+				pending.lod = lod;
+				pending.lod_view = lod_view;
+				pending.displace = displace;
+				pending.reevaluate = reevaluate;
+				pending.material_counter = material_counter;
 				pending.instance_transform = instance_transform;
 				pending.prev_instance_transform = prev_instance_transform;
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
+				pending.material_rid = material_rid;
+				pending.material_ready = mm_material_ready;
 				pending.inst_flags = inst_flags;
+				pending.per_instance = per_instance;
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -2492,8 +4108,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
-			// Skip surfaces routed to the raster alpha overlay
-			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+			// Surfaces of the raster transparent pass are only seen by the front layer rays, for their reflections; an
+			// unshaded one has none.
+			const bool front_layer = surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA;
+			if (front_layer && (!surf->shader || surf->shader->unshaded)) {
 				surf = surf->next;
 				continue;
 			}
@@ -2523,6 +4141,30 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					surf_data = process_deformed_surface(surf, mesh_surface, src, dirty_blas_list, dirty_blas_update_list);
 				}
 			}
+			if (!surf_data && !inst->mesh_instance.is_valid()) {
+				// Displaced by its material's vertex() this frame.
+				RTDeformedCacheEntry *displaced = deformed_pool.get_or_null(surf->rt_deformed_handle);
+				if (displaced && displaced->displaced_frame == current_frame) {
+					RTDeformedGeometrySource src;
+					src.current_vb = displaced->displaced_vb;
+					src.change_stamp = displaced->displaced_stamp;
+					src.cache_key = surf->rt_deformed_handle.get_id();
+					src.surface_counter = surface_counter;
+					src.force_rebuild = displaced->displaced_rebuild;
+					src.prev_vb = displaced->displaced_vb;
+					src.prev_offset = displaced->displaced_prev_offset;
+					surf_data = process_deformed_surface(surf, mesh_surface, src, dirty_blas_list, dirty_blas_update_list);
+					if (surf_data && surf_data->blas.is_valid()) {
+						// The rest positions follow the deformed vertex buffer's sections.
+						const RT_GeometryData &g = surf_data->geometry;
+						const uint32_t tbn_bytes = g.normal_byte_offset == RT_OFFSET_NONE ? 0 : g.normal_stride;
+						const uint64_t rest_address = RD::get_singleton()->buffer_get_device_address(displaced->displaced_vb) + uint64_t(g.vertex_count) * (g.position_stride + tbn_bytes);
+						surf_data->geometry.flags |= RT_GEOM_FLAG_DISPLACED;
+						surf_data->geometry.rest_vertex_buffer_address_lo = static_cast<uint32_t>(rest_address & 0xFFFFFFFFULL);
+						surf_data->geometry.rest_vertex_buffer_address_hi = static_cast<uint32_t>(rest_address >> 32);
+					}
+				}
+			}
 			if (!surf_data) {
 				surf_data = process_surface(surf, mesh_surface, surface_counter, instance_transform, dirty_blas_list);
 			}
@@ -2547,16 +4189,29 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
+			// Not the stand-in of a hit group still compiling: its cut-out may be baked.
+			bool material_ready = true;
 
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
-				surf = surf->next;
-				continue;
+				material_ready = false;
+				const SceneShaderForwardClustered::ShaderData *cut_shader = surf->shader;
+				mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
+				if (!mat_data) {
+					surf = surf->next;
+					continue;
+				}
 			}
 
 			// Compute or reuse cached final transform (instance * aabb_transform for compressed meshes).
 			Transform3D final_transform;
-			if (instance_static && surf->cached_final_transform_valid) {
+			const bool billboard = mat_data->billboard_mode != RT_BILLBOARD_DISABLED;
+			if (billboard) {
+				final_transform = _billboard_transform(instance_transform, p_render_data->scene_data->cam_transform, mat_data->billboard_mode, mat_data->billboard_keep_scale);
+				if (surf_data->is_compressed) {
+					final_transform = final_transform * surf_data->aabb_transform;
+				}
+			} else if (instance_static && surf->cached_final_transform_valid) {
 				final_transform = surf->cached_final_transform;
 			} else {
 				final_transform = instance_transform;
@@ -2570,8 +4225,19 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			blass.push_back(surf_data->blas);
 			geometry_data.push_back(surf_data->geometry);
+			geometry_data[geometry_data.size() - 1].layer_mask = inst->layer_mask;
 
-			if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
+			if (billboard) {
+				// Turning with the camera is motion too.
+				motion_indices.push_back((int32_t)motion_transforms.size());
+				RT_InstanceMotionData motion = {};
+				Transform3D prev_final = _billboard_transform(prev_instance_transform, p_render_data->scene_data->prev_cam_transform, mat_data->billboard_mode, mat_data->billboard_keep_scale);
+				if (surf_data->is_compressed) {
+					prev_final = prev_final * surf_data->aabb_transform;
+				}
+				RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_final, motion.prev_object_to_world);
+				motion_transforms.push_back(motion);
+			} else if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
 				motion_indices.push_back((int32_t)motion_transforms.size());
 				RT_InstanceMotionData motion = {};
 				Transform3D prev_final = prev_instance_transform;
@@ -2601,6 +4267,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			sbt_offsets.push_back(mat_data->rt_sbt_offset);
 			material_data.push_back(mat_data->data);
+			material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 
 			// Determine per-instance TLAS flags from material properties.
 			uint32_t inst_flags = 0;
@@ -2621,7 +4288,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 			}
 
-			if (mat_data->rt_sbt_offset > 0) {
+			if (front_layer) {
+				// A blended surface is the front layer wherever it is drawn; only an alpha scissor cuts it.
+				if (!surf->shader->uses_alpha_clip) {
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				}
+			} else if (mat_data->rt_sbt_offset > 0) {
 				// Custom shader: enable any-hit if it uses alpha clip or has a hint_albedo texture.
 				const SceneShaderRaytracing::CustomShaderEntry *cse =
 						rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -2636,7 +4308,32 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(0xFF);
+			// A surface whose rays run an any-hit: its cut-out baked into an opacity micromap, when the material allows. A
+			// static surface's BLAS is built again with it; a deformed copy's is, the next frame (process_deformed_surface()).
+			{
+				RTOmmEntry *omm = nullptr;
+				if (material_ready && !front_layer && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
+					omm = _omm_entry(mesh_surface, surf->owner->data->base, surf->surface_index, surface_counter, material_rid, material_counter, mat_data, false);
+				}
+				if (surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED) {
+					RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(surf->rt_deformed_handle);
+					if (deformed) {
+						deformed->omm_micromap = omm ? omm->micromap : RID();
+						deformed->omm_level = omm ? omm->level : 0;
+					}
+				} else if (omm) {
+					const RID omm_blas = _omm_static_blas(omm, mesh_surface, dirty_blas_list);
+					if (omm_blas.is_valid()) {
+						blass[blass.size() - 1] = omm_blas;
+					}
+				}
+			}
+			if (front_layer) {
+				instance_masks.push_back(RT_INSTANCE_MASK_FRONT_LAYER);
+				front_layer_instance_count++;
+			} else {
+				instance_masks.push_back(instance_mask(inst));
+			}
 
 			surf = surf->next;
 		}
@@ -2653,20 +4350,32 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_pre_refit_size = dirty_blas_update_list.size();
 #endif
 		RTSurfaceData merged_sd;
-		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
+		bool use_merged = !pending.per_instance && pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
-						pending.mm_count, pending.surface_index, pending.surface_counter,
+						pending.mm_count, pending.surface_index, pending.surface_counter, pending.lod,
+						pending.displace, pending.reevaluate, pending.mat_data, pending.material_counter, pending.instance_transform, pending.prev_instance_transform,
+						uint32_t(pending.mm_surf->owner->shader_uniforms_offset),
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
 			blass.push_back(merged_sd.blas);
 			blas_transforms.push_back(pending.instance_transform);
 			geometry_data.push_back(merged_sd.geometry);
+			geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 			material_data.push_back(pending.mat_data->data);
-			motion_indices.push_back(-1);
+			material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
+			// The node's motion; its instances' own is the hit shader's (multimesh_previous_position()).
+			if (pending.transform_moved) {
+				motion_indices.push_back((int32_t)motion_transforms.size());
+				RT_InstanceMotionData motion = {};
+				RendererRD::MaterialStorage::store_transform_transposed_3x4(pending.prev_instance_transform, motion.prev_object_to_world);
+				motion_transforms.push_back(motion);
+			} else {
+				motion_indices.push_back(-1);
+			}
 			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(instance_mask(pending.mm_surf->owner));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -2680,8 +4389,68 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				rt_triangles_refit += prim_count * refit_delta;
 			}
 #endif
+		} else if (tlas_expand_supported && pending.mm_gpu_buffer.is_valid()) {
+			// One TLAS instance per instance, sharing the mesh's BLAS, written on the GPU from the MultiMesh buffer
+			// (_build_tlas_with_expanded_multimeshes()): no copy of the instances to the CPU, no work per instance here.
+			RTSurfaceData *surf_data = process_surface(pending.mm_surf, pending.mesh_surface,
+					pending.surface_counter, pending.instance_transform, dirty_blas_list);
+			if (!surf_data || !surf_data->blas.is_valid()) {
+				continue;
+			}
+
+			RT_GeometryData mm_geometry = surf_data->geometry;
+			if (_set_multimesh_instance_data(mm_geometry, pending.mm_rid, pending.mm_gpu_buffer, UINT32_MAX)) {
+				multimesh_buffers_read_this_frame.push_back(pending.mm_gpu_buffer);
+			}
+			mm_geometry.layer_mask = pending.mm_surf->owner->layer_mask;
+			RT_MaterialData mm_material = pending.mat_data->data;
+			mm_material.instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
+
+			TlasExpandJob job;
+			RendererRD::MaterialStorage::store_transform_transposed_3x4(pending.instance_transform, job.data.node);
+			RendererRD::MaterialStorage::store_transform_transposed_3x4(pending.transform_moved ? pending.prev_instance_transform : pending.instance_transform, job.data.prev_node);
+			RendererRD::MaterialStorage::store_transform_transposed_3x4(surf_data->is_compressed ? surf_data->aabb_transform : Transform3D(), job.data.aabb);
+			const uint64_t mm_address = RD::get_singleton()->buffer_get_device_address(pending.mm_gpu_buffer);
+			job.data.mm_address_lo = uint32_t(mm_address);
+			job.data.mm_address_hi = uint32_t(mm_address >> 32);
+			job.data.mm_stride = mesh_storage->multimesh_get_stride(pending.mm_rid);
+			job.data.mm_offset = mesh_storage->multimesh_get_current_instance_offset(pending.mm_rid);
+			// The instances' previous transforms, as raster's motion vectors read them (while a viewport uses them).
+			uint32_t mm_motion_current_offset = 0;
+			uint32_t mm_prev_offset = 0;
+			const bool mm_moved = mesh_storage->_multimesh_get_motion_vectors_offsets(pending.mm_rid, mm_motion_current_offset, mm_prev_offset) && mm_prev_offset != job.data.mm_offset;
+			job.data.mm_prev_offset = mm_moved ? mm_prev_offset : job.data.mm_offset;
+			job.data.template_index = tlas_expand_geometry_templates.size();
+			tlas_expand_geometry_templates.push_back(mm_geometry);
+			tlas_expand_material_templates.push_back(mm_material);
+			job.blas = surf_data->blas;
+			if (pending.material_ready && !(pending.inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
+				RTOmmEntry *omm = _omm_entry(pending.mesh_surface, mesh_storage->multimesh_get_mesh(pending.mm_rid), pending.surface_index, pending.surface_counter, pending.material_rid, pending.material_counter, pending.mat_data, true);
+				const RID omm_blas = omm ? _omm_static_blas(omm, pending.mesh_surface, dirty_blas_list) : RID();
+				if (omm_blas.is_valid()) {
+					job.blas = omm_blas;
+				}
+			}
+			job.mm_gpu_buffer = pending.mm_gpu_buffer;
+			job.count = pending.mm_count;
+			job.sbt_offset = pending.mat_data->rt_sbt_offset;
+			job.flags = pending.inst_flags;
+			job.mask = instance_mask(pending.mm_surf->owner);
+			tlas_expand_jobs.push_back(job);
+
+#ifdef TOOLS_ENABLED
+			if (collect_render_info) {
+				tlas_instance_count += pending.mm_count;
+				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(pending.mesh_surface);
+				uint32_t prim_count = _rt_indices_to_primitives(pending.mm_surf->primitive, vertices);
+				tlas_primitive_count += prim_count * pending.mm_count;
+				uint32_t build_delta = dirty_blas_list.size() - mm_pre_build_size;
+				rt_blas_builds += build_delta;
+				rt_triangles_built += prim_count * build_delta;
+			}
+#endif
 		} else {
-			// Fallback: expanded TLAS — one entry per instance, shared BLAS.
+			// Without the standard instance layout: the instances read back to the CPU, one TLAS instance each.
 			const float *mm_data = mesh_storage->multimesh_get_local_data_ptr_async(pending.mm_rid);
 			if (!mm_data) {
 				continue;
@@ -2696,21 +4465,35 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
+			RT_GeometryData mm_geometry = surf_data->geometry;
+			const bool reads_multimesh = _set_multimesh_instance_data(mm_geometry, pending.mm_rid, pending.mm_gpu_buffer, UINT32_MAX);
+			if (reads_multimesh) {
+				multimesh_buffers_read_this_frame.push_back(pending.mm_gpu_buffer);
+			}
+			// The instances' previous transforms, as raster's motion vectors read them (while a viewport uses them).
+			uint32_t mm_motion_current_offset = 0;
+			uint32_t mm_prev_offset = 0;
+			const bool mm_moved = mesh_storage->_multimesh_get_motion_vectors_offsets(pending.mm_rid, mm_motion_current_offset, mm_prev_offset) && mm_prev_offset != mm_cur_offset;
+			auto read_mm_xform = [](const float *d) {
+				Transform3D xform;
+				xform.basis.rows[0][0] = d[0];
+				xform.basis.rows[0][1] = d[1];
+				xform.basis.rows[0][2] = d[2];
+				xform.origin.x = d[3];
+				xform.basis.rows[1][0] = d[4];
+				xform.basis.rows[1][1] = d[5];
+				xform.basis.rows[1][2] = d[6];
+				xform.origin.y = d[7];
+				xform.basis.rows[2][0] = d[8];
+				xform.basis.rows[2][1] = d[9];
+				xform.basis.rows[2][2] = d[10];
+				xform.origin.z = d[11];
+				return xform;
+			};
+
 			for (uint32_t mi = 0; mi < pending.mm_count; mi++) {
-				const float *d = mm_data + (mm_cur_offset + mi) * mm_stride;
-				Transform3D mm_xform;
-				mm_xform.basis.rows[0][0] = d[0];
-				mm_xform.basis.rows[0][1] = d[1];
-				mm_xform.basis.rows[0][2] = d[2];
-				mm_xform.origin.x = d[3];
-				mm_xform.basis.rows[1][0] = d[4];
-				mm_xform.basis.rows[1][1] = d[5];
-				mm_xform.basis.rows[1][2] = d[6];
-				mm_xform.origin.y = d[7];
-				mm_xform.basis.rows[2][0] = d[8];
-				mm_xform.basis.rows[2][1] = d[9];
-				mm_xform.basis.rows[2][2] = d[10];
-				mm_xform.origin.z = d[11];
+				const Transform3D mm_xform = read_mm_xform(mm_data + (mm_cur_offset + mi) * mm_stride);
+				const Transform3D prev_mm_xform = mm_moved ? read_mm_xform(mm_data + (mm_prev_offset + mi) * mm_stride) : mm_xform;
 
 				Transform3D final_transform = pending.instance_transform * mm_xform;
 				if (surf_data->is_compressed) {
@@ -2719,12 +4502,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				blass.push_back(surf_data->blas);
 				blas_transforms.push_back(final_transform);
-				geometry_data.push_back(surf_data->geometry);
+				geometry_data.push_back(mm_geometry);
+				geometry_data[geometry_data.size() - 1].layer_mask = pending.mm_surf->owner->layer_mask;
+				geometry_data[geometry_data.size() - 1].multimesh_offset = mm_cur_offset + mi;
+				geometry_data[geometry_data.size() - 1].multimesh_previous_offset = mm_cur_offset + mi;
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
 				material_data.push_back(pending.mat_data->data);
+				material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(pending.mm_surf->owner->shader_uniforms_offset);
 
-				if (pending.transform_moved) {
-					Transform3D prev_final = pending.prev_instance_transform * mm_xform;
+				// Each instance's own motion too: a moving unit of a MultiMesh had none, and DLSS kept its texture where it
+				// was on screen.
+				if (pending.transform_moved || prev_mm_xform != mm_xform) {
+					Transform3D prev_final = (pending.transform_moved ? pending.prev_instance_transform : pending.instance_transform) * prev_mm_xform;
 					if (surf_data->is_compressed) {
 						prev_final = prev_final * surf_data->aabb_transform;
 					}
@@ -2737,7 +4526,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(instance_mask(pending.mm_surf->owner));
 			}
 
 #ifdef TOOLS_ENABLED
@@ -2757,6 +4546,51 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		}
 	}
 
+	// The shadow rays ignore the faces turned away from the light, as raster's shadow pass culls them. A double-sided
+	// shadow caster gets a second instance only the shadow rays see, with face culling off.
+	const uint32_t instance_count = blass.size();
+	for (uint32_t i = 0; i < instance_count; i++) {
+		if (!(instance_masks[i] & RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW)) {
+			continue;
+		}
+		instance_masks[i] &= ~RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW;
+		if (instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
+			continue;
+		}
+		instance_masks[i] &= ~RT_INSTANCE_MASK_SHADOW;
+		blass.push_back(blass[i]);
+		blas_transforms.push_back(blas_transforms[i]);
+		geometry_data.push_back(geometry_data[i]);
+		material_data.push_back(material_data[i]);
+		sbt_offsets.push_back(sbt_offsets[i]);
+		motion_indices.push_back(motion_indices[i]);
+		instance_flags.push_back(instance_flags[i] | RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT);
+		instance_masks.push_back(RT_INSTANCE_MASK_SHADOW);
+	}
+	const uint32_t expand_job_count = tlas_expand_jobs.size();
+	for (uint32_t i = 0; i < expand_job_count; i++) {
+		TlasExpandJob &job = tlas_expand_jobs[i];
+		if (!(job.mask & RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW)) {
+			continue;
+		}
+		job.mask &= ~RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW;
+		if (job.flags & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
+			continue;
+		}
+		job.mask &= ~RT_INSTANCE_MASK_SHADOW;
+		TlasExpandJob shadow_job = job;
+		shadow_job.flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+		shadow_job.mask = RT_INSTANCE_MASK_SHADOW;
+		tlas_expand_jobs.push_back(shadow_job);
+	}
+	// The GPU's instances, records and motion transforms follow the CPU's.
+	for (TlasExpandJob &job : tlas_expand_jobs) {
+		job.data.first_slot = blass.size() + tlas_expand_instance_count;
+		job.data.first_motion = motion_transforms.size() + tlas_expand_motion_count;
+		tlas_expand_instance_count += job.count;
+		tlas_expand_motion_count += job.count;
+	}
+
 	// Phase 3: BLAS / TLAS build.
 #ifdef TOOLS_ENABLED
 	if (collect_render_info) {
@@ -2770,12 +4604,59 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 #endif
 
+#ifdef TOOLS_ENABLED
+	// GODOT_RT_LOG_CACHES=1: the size of every cache and of the frame's work every 600 frames, to see what grows over a
+	// session (dungeon trips, streaming). Editor builds only, like the frame's counters it prints.
+	static const bool log_caches = OS::get_singleton()->get_environment("GODOT_RT_LOG_CACHES") == "1";
+	if (log_caches && RSG::rasterizer->get_frame_number() % 600 == 0) {
+		uint32_t live_surfaces = 0;
+		for (uint32_t i = 0; i < surface_chunks.size(); i++) {
+			if (surface_chunks[i]) {
+				for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
+					live_surfaces += surface_chunks[i][j].ptr && surface_chunks[i][j].ptr->blas.is_valid() ? 1 : 0;
+				}
+			}
+		}
+		uint32_t live_materials = 0;
+		for (uint32_t i = 0; i < material_chunks.size(); i++) {
+			if (material_chunks[i]) {
+				for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
+					live_materials += material_chunks[i][j].ptr ? 1 : 0;
+				}
+			}
+		}
+		// The merged buffers by when they were last traced: the unused budget holds those older than 60 frames.
+		uint64_t merged_mb[3] = {};
+		for (const RID &rid : merged_mm_pool.get_owned_list()) {
+			const RTMergedMMEntry *e = merged_mm_pool.get_or_null(rid);
+			const uint32_t age = RSG::rasterizer->get_frame_number() - e->last_used_frame;
+			merged_mb[age <= 2 ? 0 : (age <= 60 ? 1 : 2)] += e->buffer_bytes;
+		}
+		print_line(vformat("RTCACHES merged MultiMesh buffers: %d MB traced in the last 2 frames, %d MB in the last 60, %d MB older | RD buffers %d MB, textures %d MB",
+				int(merged_mb[0] >> 20), int(merged_mb[1] >> 20), int(merged_mb[2] >> 20),
+				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_BUFFERS) >> 20), int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TEXTURES) >> 20)));
+		const SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+		print_line(vformat("RTCACHES frame %d: TLAS %d instances, %d BLAS builds, %d refits | displaced %d (%d vertices), %d deferred | surfaces %d, merged MultiMeshes %d, deformed %d, LOD views %d, materials %d, dedicated UBOs %d | hit groups %d, pipeline swaps %d | video %d MB",
+				RSG::rasterizer->get_frame_number(), tlas_instance_count, rt_blas_builds, rt_blas_refits,
+				displaced_evaluated, int64_t(displaced_vertices), displaced_deferred,
+				live_surfaces, merged_mm_pool.get_rid_count(), deformed_pool.get_rid_count(), lod_views.size(), live_materials, mat_ubo_dedicated_buffers.size(),
+				rt_shader->get_hit_group_slot_count(), rt_shader->get_pipeline_swap_count(),
+				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TOTAL) / (1024 * 1024))));
+	}
+#endif
+
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 
 	RD::get_singleton()->compute_list_end();
 
-	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
+	// After the merges: the displaced positions overwrite the merged ones before the BLAS builds read them.
+	_displace_merged_multimeshes();
+
+	// The records first: the instances written on the GPU add theirs after these.
 	finalize_buffers(state);
+	// The cut-outs baked into opacity micromaps and the micromaps built, before the BLASes that use them.
+	_omm_dispatch_bakes();
+	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 
 	return state;
 }
@@ -2786,6 +4667,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights) {
 	uint32_t rt_light_count = 0;
+	rt_directional_projector = RID();
 
 	if (!p_render_data || !p_render_data->lights) {
 		return rt_light_count;
@@ -2896,6 +4778,32 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.spot_direction[0] = 0.0f;
 		ld.spot_direction[1] = 0.0f;
 		ld.spot_direction[2] = 0.0f;
+		ld.cull_mask = ls->light_get_cull_mask(base);
+		ld.shadow_opacity = ls->light_has_shadow(base) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_OPACITY) : 0.0f;
+
+		// The projector, as raster's update_light_buffers() maps it (in view space there): the first directional light
+		// with one has the texture binding.
+		memset(ld.projector_uv_x, 0, sizeof(ld.projector_uv_x));
+		memset(ld.projector_uv_y, 0, sizeof(ld.projector_uv_y));
+		ld.projector_enabled = 0;
+		ld.pad[0] = ld.pad[1] = ld.pad[2] = 0;
+		const RID projector = ls->light_get_projector(base);
+		if (projector.is_valid() && rt_directional_projector.is_null()) {
+			const RID projector_texture = RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(projector, true);
+			if (projector_texture.is_valid()) {
+				const Transform3D world_to_light = xform.orthonormalized().affine_inverse();
+				const Vector2 size = ls->light_directional_get_projector_size(base);
+				const Vector2 offset = ls->light_directional_get_projector_offset(base);
+				for (int k = 0; k < 3; k++) {
+					ld.projector_uv_x[k] = world_to_light.basis.rows[0][k] / size.x;
+					ld.projector_uv_y[k] = -world_to_light.basis.rows[1][k] / size.y;
+				}
+				ld.projector_uv_x[3] = (world_to_light.origin.x - offset.x) / size.x + 0.5f;
+				ld.projector_uv_y[3] = 0.5f - (world_to_light.origin.y - offset.y) / size.y;
+				ld.projector_enabled = 1;
+				rt_directional_projector = projector_texture;
+			}
+		}
 		rt_light_count++;
 	}
 
@@ -2944,6 +4852,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			ld.max_range_squared = 0.0f;
 		}
 		ld.specular_amount = ls->light_get_param(base, RSE::LIGHT_PARAM_SPECULAR) * 2.0f; // Matches rasterizer convention (light_storage.cpp), normalizes 0.5 default to 1.0.
+		ld.cull_mask = ls->light_get_cull_mask(base);
+		ld.shadow_opacity = ls->light_has_shadow(base) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SHADOW_OPACITY) : 0.0f;
 		ld.indirect_energy = ls->light_get_param(base, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
 
 		if (type == RSE::LIGHT_SPOT) {
@@ -2961,10 +4871,292 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			ld.spot_direction[1] = 0.0f;
 			ld.spot_direction[2] = 0.0f;
 		}
+		memset(ld.projector_uv_x, 0, sizeof(ld.projector_uv_x));
+		memset(ld.projector_uv_y, 0, sizeof(ld.projector_uv_y));
+		ld.projector_enabled = 0;
+		ld.pad[0] = ld.pad[1] = ld.pad[2] = 0;
 		rt_light_count++;
 	}
 
 	return rt_light_count;
+}
+
+// ---------------------------------------------------------------------------
+// Decals
+// ---------------------------------------------------------------------------
+
+// Same as rt_decal_grid_hash() in raytracing_decals_inc.glsl.
+static _FORCE_INLINE_ uint32_t _rt_decal_grid_hash(int32_t p_x, int32_t p_y, int32_t p_z) {
+	return (uint32_t(p_x) * 73856093u) ^ (uint32_t(p_y) * 19349663u) ^ (uint32_t(p_z) * 83492791u);
+}
+
+// A transform as three vec4 rows (dot products in GLSL).
+static void _rt_store_rows(const Transform3D &p_xform, float *r_rows) {
+	for (int i = 0; i < 3; i++) {
+		r_rows[i * 4 + 0] = p_xform.basis.rows[i][0];
+		r_rows[i * 4 + 1] = p_xform.basis.rows[i][1];
+		r_rows[i * 4 + 2] = p_xform.basis.rows[i][2];
+		r_rows[i * 4 + 3] = p_xform.origin[i];
+	}
+}
+
+static void _rt_store_rect(const Rect2 &p_rect, float *r_rect) {
+	r_rect[0] = p_rect.position.x;
+	r_rect[1] = p_rect.position.y;
+	r_rect[2] = p_rect.size.x;
+	r_rect[3] = p_rect.size.y;
+}
+
+// Uploads p_size bytes when they differ from what r_uploaded holds, growing the buffer as needed.
+template <typename T>
+static void _rt_upload_if_changed(RID &r_buffer, uint32_t &r_capacity, LocalVector<T> &r_uploaded, const LocalVector<T> &p_data, const char *p_name) {
+	const uint32_t size = p_data.size() * sizeof(T);
+	if (r_buffer.is_valid() && r_uploaded.size() == p_data.size() && memcmp(r_uploaded.ptr(), p_data.ptr(), size) == 0) {
+		return;
+	}
+	if (r_capacity < size) {
+		if (r_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(r_buffer);
+		}
+		r_capacity = Math::next_power_of_2(size);
+		r_buffer = RD::get_singleton()->storage_buffer_create(r_capacity);
+		RD::get_singleton()->set_resource_name(r_buffer, p_name);
+	}
+	RD::get_singleton()->buffer_update(r_buffer, 0, size, p_data.ptr());
+	r_uploaded = p_data;
+}
+
+uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data) {
+	decal_data.clear();
+	decal_grid.clear();
+	if (!p_render_data || !p_render_data->rt_decals) {
+		return 0;
+	}
+
+	RendererRD::TextureStorage *ts = RendererRD::TextureStorage::get_singleton();
+	const Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin;
+
+	// The decals raster would draw (TextureStorage::update_decal_buffer()), around the camera as well.
+	struct DecalSort {
+		RID instance;
+		RID decal;
+		float depth = 0.0;
+		float fade = 1.0;
+		bool operator<(const DecalSort &p_other) const { return depth < p_other.depth; }
+	};
+	LocalVector<DecalSort> sorted;
+	const PagedArray<RID> &decals = *p_render_data->rt_decals;
+	for (uint64_t i = 0; i < decals.size(); i++) {
+		DecalSort ds;
+		ds.instance = decals[i];
+		if (!ts->owns_decal_instance(ds.instance)) {
+			continue;
+		}
+		ds.decal = ts->decal_instance_get_base(ds.instance);
+		if (!ts->owns_decal(ds.decal)) {
+			continue;
+		}
+		if (!ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_ALBEDO).is_valid() && !ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_EMISSION).is_valid()) {
+			continue; // No albedo, no emission, no decal.
+		}
+		const float distance = cam_pos.distance_to(ts->decal_instance_get_transform(ds.instance).origin);
+		if (ts->decal_is_distance_fade_enabled(ds.decal)) {
+			const float fade_begin = ts->decal_get_distance_fade_begin(ds.decal);
+			const float fade_length = ts->decal_get_distance_fade_length(ds.decal);
+			if (distance > fade_begin) {
+				if (distance > fade_begin + fade_length) {
+					continue;
+				}
+				ds.fade = Math::smoothstep(0.0f, 1.0f, 1.0f - float(distance - fade_begin) / fade_length);
+			}
+		}
+		ds.depth = distance - ts->decal_instance_get_sorting_offset(ds.instance);
+		sorted.push_back(ds);
+	}
+	if (sorted.is_empty()) {
+		return 0;
+	}
+	// The nearest RT_DECALS_MAX.
+	sorted.sort();
+	if (sorted.size() > RT_DECALS_MAX) {
+		sorted.resize(RT_DECALS_MAX);
+	}
+
+	const uint32_t count = sorted.size();
+	decal_data.resize(count);
+	LocalVector<AABB> aabbs;
+	aabbs.resize(count);
+
+	Transform3D uv_xform;
+	uv_xform.basis.scale(Vector3(2.0, 1.0, 2.0));
+	uv_xform.origin = Vector3(-1.0, 0.0, -1.0);
+
+	// Farthest first: the hit shaders apply them in index order, and raster draws the nearest decal on top.
+	for (uint32_t i = 0; i < count; i++) {
+		const DecalSort &ds = sorted[count - 1 - i];
+		RT_DecalData &dd = decal_data[i];
+		memset(&dd, 0, sizeof(RT_DecalData));
+
+		const Transform3D xform = ts->decal_instance_get_transform(ds.instance);
+		const Vector3 extents = ts->decal_get_size(ds.decal) / 2;
+		Transform3D scale_xform;
+		scale_xform.basis.scale(extents);
+		_rt_store_rows((xform * scale_xform * uv_xform).affine_inverse(), dd.xform);
+		aabbs[i] = xform.xform(AABB(-extents, extents * 2.0));
+
+		const Vector3 normal = xform.basis.get_column(Vector3::AXIS_Y).normalized();
+		dd.normal[0] = normal.x;
+		dd.normal[1] = normal.y;
+		dd.normal[2] = normal.z;
+		dd.normal_fade = ts->decal_get_normal_fade(ds.decal);
+
+		const RID albedo_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_ALBEDO);
+		const RID normal_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_NORMAL);
+		const RID orm_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_ORM);
+		const RID emission_tex = ts->decal_get_texture(ds.decal, RSE::DECAL_TEXTURE_EMISSION);
+		if (albedo_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(albedo_tex), dd.albedo_rect);
+		}
+		if (normal_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(normal_tex), dd.normal_rect);
+			Transform3D normal_xform;
+			normal_xform.basis = xform.basis.orthonormalized();
+			_rt_store_rows(normal_xform, dd.normal_xform);
+		}
+		if (orm_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(orm_tex), dd.orm_rect);
+		}
+		if (emission_tex.is_valid()) {
+			_rt_store_rect(ts->decal_atlas_get_texture_rect(emission_tex), dd.emission_rect);
+		}
+
+		const Color modulate = ts->decal_get_modulate(ds.decal).srgb_to_linear();
+		dd.modulate[0] = modulate.r;
+		dd.modulate[1] = modulate.g;
+		dd.modulate[2] = modulate.b;
+		dd.modulate[3] = modulate.a * ds.fade;
+		dd.emission_energy = ts->decal_get_emission_energy(ds.decal) * ds.fade;
+		dd.albedo_mix = ts->decal_get_albedo_mix(ds.decal);
+		dd.mask = ts->decal_get_cull_mask(ds.decal);
+		dd.upper_fade = ts->decal_get_upper_fade(ds.decal);
+		dd.lower_fade = ts->decal_get_lower_fade(ds.decal);
+	}
+
+	// A hashed grid, raster's clusters in world space: every bucket lists the decals whose box touches one of its cells, and
+	// a hit tests those of its cell's bucket. The cells are as large as the median decal, which then spans 2x2x2 of them at
+	// most; a decal over too many cells is tested at every hit instead.
+	LocalVector<float> sizes;
+	sizes.resize(count);
+	for (uint32_t i = 0; i < count; i++) {
+		sizes[i] = aabbs[i].get_longest_axis_size();
+	}
+	sizes.sort();
+	const float cell_size = MAX(sizes[count / 2], 0.01f);
+	const float inv_cell_size = 1.0f / cell_size;
+
+	struct CellRange {
+		int32_t from[3];
+		int32_t to[3];
+		bool global = false;
+	};
+	LocalVector<CellRange> ranges;
+	ranges.resize(count);
+	LocalVector<uint32_t> global_decals;
+	uint64_t entry_bound = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		CellRange &range = ranges[i];
+		// The hit shader floors its position times inv_cell_size in float: the same here, with a margin for the difference
+		// between a hit point and the box.
+		const AABB box = aabbs[i].grow(cell_size * 0.01f);
+		uint64_t cells = 1;
+		for (int a = 0; a < 3; a++) {
+			const double from = Math::floor(float(box.position[a]) * inv_cell_size);
+			const double to = Math::floor(float(box.position[a] + box.size[a]) * inv_cell_size);
+			if (!(from >= double(INT32_MIN) && to <= double(INT32_MAX - 1)) || to - from + 1.0 > double(RT_DECAL_GRID_MAX_CELLS)) {
+				range.global = true;
+				break;
+			}
+			range.from[a] = int32_t(from);
+			range.to[a] = int32_t(to);
+			cells *= uint64_t(range.to[a] - range.from[a] + 1);
+		}
+		if (range.global || cells > RT_DECAL_GRID_MAX_CELLS) {
+			range.global = true;
+			global_decals.push_back(i);
+		} else {
+			entry_bound += cells;
+		}
+	}
+
+	const uint32_t bucket_count = CLAMP(Math::next_power_of_2(uint32_t(MAX<uint64_t>(entry_bound * 2, 64))), 64u, uint32_t(RT_DECAL_GRID_MAX_BUCKETS));
+	const uint32_t bucket_mask = bucket_count - 1;
+	const uint32_t offsets_base = RT_DECAL_GRID_HEADER + global_decals.size();
+	const uint32_t entries_base = offsets_base + bucket_count + 1;
+
+	LocalVector<uint32_t> last_decal; // Two cells of a decal can share a bucket: listed once.
+	last_decal.resize(bucket_count);
+	LocalVector<uint32_t> bucket_entries;
+	bucket_entries.resize(bucket_count);
+	auto visit_buckets = [&](uint32_t p_decal, bool p_fill) {
+		const CellRange &range = ranges[p_decal];
+		for (int32_t z = range.from[2]; z <= range.to[2]; z++) {
+			for (int32_t y = range.from[1]; y <= range.to[1]; y++) {
+				for (int32_t x = range.from[0]; x <= range.to[0]; x++) {
+					const uint32_t bucket = _rt_decal_grid_hash(x, y, z) & bucket_mask;
+					if (last_decal[bucket] == p_decal) {
+						continue;
+					}
+					last_decal[bucket] = p_decal;
+					if (p_fill) {
+						decal_grid[bucket_entries[bucket]++] = p_decal;
+					} else {
+						bucket_entries[bucket]++;
+					}
+				}
+			}
+		}
+	};
+
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		last_decal[b] = UINT32_MAX;
+		bucket_entries[b] = 0;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (!ranges[i].global) {
+			visit_buckets(i, false);
+		}
+	}
+
+	uint32_t entry_count = 0;
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		entry_count += bucket_entries[b];
+	}
+	decal_grid.resize(entries_base + entry_count);
+	memcpy(&decal_grid[0], &inv_cell_size, sizeof(float));
+	decal_grid[1] = bucket_mask;
+	decal_grid[2] = global_decals.size();
+	decal_grid[3] = 0;
+	for (uint32_t i = 0; i < global_decals.size(); i++) {
+		decal_grid[RT_DECAL_GRID_HEADER + i] = global_decals[i];
+	}
+	uint32_t entry = entries_base;
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		decal_grid[offsets_base + b] = entry;
+		const uint32_t entries = bucket_entries[b];
+		bucket_entries[b] = entry; // Now the next entry to fill.
+		last_decal[b] = UINT32_MAX;
+		entry += entries;
+	}
+	decal_grid[offsets_base + bucket_count] = entry;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!ranges[i].global) {
+			visit_buckets(i, true);
+		}
+	}
+
+	_rt_upload_if_changed(p_state->decal_buffer, p_state->decal_buffer_capacity, p_state->uploaded_decals, decal_data, "RT Decal Buffer");
+	_rt_upload_if_changed(p_state->decal_grid_buffer, p_state->decal_grid_buffer_capacity, p_state->uploaded_decal_grid, decal_grid, "RT Decal Grid Buffer");
+	return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -3091,6 +5283,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
 		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRONT_LAYER_COUNT] = float(front_layer_instance_count);
 
 		// Unjittered VP for motion vectors (matches raster convention).
 		{
@@ -3111,6 +5304,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DECAL_COUNT] = float(gather_decals(p_state, p_render_data));
 
 		// Upload light buffer.
 		{
@@ -3212,6 +5406,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.append_id(dlss_rr_get_specular_hit_dist(rb));
 			uniforms.push_back(u);
 		}
+
+		// Binding 39: DLSS RR Depth (the raygen writes it, see dlss_rr_get_depth()).
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 39, dlss_rr_get_depth(rb)));
 	}
 
 	// Binding 13: Light buffer (SSBO).
@@ -3250,8 +5447,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 16-27: Material samplers (12 filter/repeat combinations for custom shaders).
-	RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default().append_uniforms(uniforms, 16);
+	// Bindings 16-27: Material samplers (12 filter/repeat combinations). The view's own, as raster's: they carry the mipmap
+	// bias of its 3D scaling (DLSS) and the project's anisotropic filtering level.
+	rb->get_samplers().append_uniforms(uniforms, 16);
+
+	// Binding 29: Front layer reflection output (RGBA16F: reflected radiance, view depth of the transparent surface).
+	{
+		rt_ensure_textures(rb);
+		RD::Uniform u;
+		u.binding = 29;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rt_get_front_layer_texture(rb));
+		uniforms.push_back(u);
+	}
 
 	// Binding 28: Velocity output (RG16F). Past the 16-27 sampler range.
 	{
@@ -3261,6 +5469,46 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb->get_velocity_buffer(false));
 		uniforms.push_back(u);
+	}
+
+	// Bindings 33-37: the decals, their grid, the decal atlas (linear and sRGB views) and raster's decal sampler.
+	{
+		RID default_buffer = RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer();
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 33, p_state->decal_buffer.is_valid() ? p_state->decal_buffer : default_buffer));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 34, p_state->decal_grid_buffer.is_valid() ? p_state->decal_grid_buffer : default_buffer));
+
+		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
+		RID default_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		RID decal_atlas = texture_storage->decal_atlas_get_texture();
+		RID decal_atlas_srgb = texture_storage->decal_atlas_get_texture_srgb();
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 35, decal_atlas.is_valid() ? decal_atlas : default_texture));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 36, decal_atlas_srgb.is_valid() ? decal_atlas_srgb : default_texture));
+
+		RSE::CanvasItemTextureFilter decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS;
+		switch (owner->decals_get_filter()) {
+			case RSE::DECAL_FILTER_NEAREST: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST;
+			} break;
+			case RSE::DECAL_FILTER_LINEAR: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR;
+			} break;
+			case RSE::DECAL_FILTER_NEAREST_MIPMAPS: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS;
+			} break;
+			case RSE::DECAL_FILTER_LINEAR_MIPMAPS: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS;
+			} break;
+			case RSE::DECAL_FILTER_NEAREST_MIPMAPS_ANISOTROPIC: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC;
+			} break;
+			case RSE::DECAL_FILTER_LINEAR_MIPMAPS_ANISOTROPIC: {
+				decal_filter = RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC;
+			} break;
+		}
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_SAMPLER, 37, rb->get_samplers().get_sampler(decal_filter, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED)));
+
+		// Binding 38: the directional light projector (gather_lights()), white when none.
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 38, rt_directional_projector.is_valid() ? rt_directional_projector : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE)));
 	}
 
 	RID shader_rd = shader ? shader->get_pipeline_shader_rd(p_rt_flags) : RID();
@@ -3293,6 +5541,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			bindless_block->finalize(shader_rd, 1);
 			bindless_uniform_set = bindless_block->get_uniform_set();
 		}
+		if (bindless_array_block && bindless_array_block->is_initialized()) {
+			bindless_array_block->finalize(shader_rd, 2);
+			bindless_array_uniform_set = bindless_array_block->get_uniform_set();
+		}
 	}
 
 	return result;
@@ -3304,17 +5556,30 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingListID p_list) {
 	RD *rd = RD::get_singleton();
+	thread_local LocalVector<RID> buffers;
+	buffers.clear();
+	get_buffers_read_by_address(buffers);
+	for (const RID &buffer : buffers) {
+		rd->raytracing_list_add_buffer_dependency(p_list, buffer, /*p_writable=*/false);
+	}
+}
 
+void RenderRaytracing::get_buffers_read_by_address(LocalVector<RID> &r_buffers) {
 	// The hit shader reads vertex / attribute / index data via BDA stored in
 	// RT_GeometryData. The draw graph cannot infer those reads from the BDA, so
 	// every per-frame-written buffer that the trace will touch via BDA must be
-	// declared here -- otherwise the producing copy/dispatch may not be visible
+	// declared -- otherwise the producing copy/dispatch may not be visible
 	// to the trace. (Static mesh VB/AB/IB are uploaded once via the transfer
 	// worker and don't need per-frame barriers.)
 
 	// Mat UBO pool buffer dependency.
 	if (mat_ubo_pool_buffer.is_valid()) {
-		rd->raytracing_list_add_buffer_dependency(p_list, mat_ubo_pool_buffer, /*p_writable=*/false);
+		r_buffers.push_back(mat_ubo_pool_buffer);
+	}
+	// Materials too large for a pool slot: their buffers can be created this frame, the upload of their data
+	// must come before the trace.
+	for (const RID &buffer : mat_ubo_dedicated_buffers) {
+		r_buffers.push_back(buffer);
 	}
 
 	// Deformed surface buffer dependencies.
@@ -3324,10 +5589,13 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 			continue;
 		}
 		if (e->owned_vb_full.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->owned_vb_full, /*p_writable=*/false);
+			r_buffers.push_back(e->owned_vb_full);
 		}
 		if (e->prev_pos_vb.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->prev_pos_vb, /*p_writable=*/false);
+			r_buffers.push_back(e->prev_pos_vb);
+		}
+		if (e->displaced_vb.is_valid()) {
+			r_buffers.push_back(e->displaced_vb);
 		}
 	}
 
@@ -3338,20 +5606,84 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 			continue;
 		}
 		if (e->merged_vtx_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_vtx_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->merged_vtx_buffer);
 		}
 		if (e->merged_attr_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->merged_attr_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->merged_attr_buffer);
 		}
 		if (e->replicated_idx_buffer.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->replicated_idx_buffer, /*p_writable=*/false);
+			r_buffers.push_back(e->replicated_idx_buffer);
 		}
+		if (e->displaced && e->merged_prev_buffer.is_valid()) {
+			r_buffers.push_back(e->merged_prev_buffer);
+		}
+	}
+	// MultiMesh buffers, written by every change of their instances.
+	for (const RID &buffer : multimesh_buffers_read_this_frame) {
+		r_buffers.push_back(buffer);
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Output copy
 // ---------------------------------------------------------------------------
+
+void RenderRaytracing::apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+	if (!rb->has_custom_data(RB_SCOPE_FOG) || !rt_has_texture(rb.ptr()) || !rt_has_depth_texture(rb.ptr())) {
+		return;
+	}
+	Ref<RendererRD::Fog::VolumetricFog> fog = rb->get_custom_data(RB_SCOPE_FOG);
+
+	// The same parameters as the scene shader's (RenderForwardClustered::_setup_environment()).
+	VolumetricFogShader::PushConstant push_constant = {};
+	RendererRD::MaterialStorage::store_camera(p_render_data->scene_data->get_cam_projection().inverse(), push_constant.inv_projection);
+	const Size2i size = rb->get_internal_size();
+	push_constant.size[0] = size.width;
+	push_constant.size[1] = size.height;
+	push_constant.inv_length = fog->length > 0.0 ? 1.0 / fog->length : 1.0;
+	push_constant.detail_spread = fog->spread > 0.0 ? 1.0 / fog->spread : 1.0;
+	push_constant.legacy_blending = p_legacy_blending;
+
+	RD::Uniform color(RD::UNIFORM_TYPE_IMAGE, 0, rt_get_texture(rb.ptr()));
+	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
+	RD::Uniform fog_map(RD::UNIFORM_TYPE_TEXTURE, 2, fog->fog_map);
+	RD::Uniform sampler(RD::UNIFORM_TYPE_SAMPLER, 3, RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED));
+
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, volumetric_fog_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(volumetric_fog_shader.version_shader, 0, color, depth, fog_map, sampler), 0);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(VolumetricFogShader::PushConstant));
+	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+	rd->compute_list_end();
+}
+
+void RenderRaytracing::dlss_rr_write_background_albedo(const RenderDataRD *p_render_data) {
+	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
+	ERR_FAIL_COND(rb.is_null());
+	if (!dlss_rr_has_buffers(rb.ptr()) || !rt_has_depth_texture(rb.ptr())) {
+		return;
+	}
+
+	SkyGuideShader::PushConstant push_constant = {};
+	const Size2i size = rb->get_internal_size();
+	push_constant.size[0] = size.width;
+	push_constant.size[1] = size.height;
+
+	RD::Uniform color(RD::UNIFORM_TYPE_TEXTURE, 0, rb->get_internal_texture());
+	RD::Uniform depth(RD::UNIFORM_TYPE_IMAGE, 1, rt_get_depth_texture(rb.ptr()));
+	RD::Uniform albedo(RD::UNIFORM_TYPE_IMAGE, 2, dlss_rr_get_diffuse_albedo(rb.ptr()));
+
+	RD *rd = RD::get_singleton();
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, sky_guide_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_guide_shader.version_shader, 0, color, depth, albedo), 0);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SkyGuideShader::PushConstant));
+	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+	rd->compute_list_end();
+}
 
 void RenderRaytracing::copy_output_texture(const RenderDataRD *p_render_data) {
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;

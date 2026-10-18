@@ -330,6 +330,8 @@ public:
 		RID sky_uniform_set;
 
 		int last_shadow_filter = -1;
+		// The directional light projector the process sets bind: they are recreated when it changes.
+		RID bound_directional_projector;
 
 		// If the device doesn't support image atomics, use storage buffers instead.
 		RD::UniformType atomic_type = RD::UNIFORM_TYPE_IMAGE;
@@ -361,6 +363,7 @@ public:
 		RID area_light_atlas;
 		RID directional_shadow_depth;
 		RID directional_light_buffer;
+		RID directional_light_projector; // LightStorage::get_directional_projector_texture(), or invalid.
 
 		// Objects related to our render buffer
 		Ref<VolumetricFog> vfog;

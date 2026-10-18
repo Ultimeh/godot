@@ -9,6 +9,8 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+#define PI 3.14159265359
+
 // Bakes the per-(MultiMesh, surface) merged BLAS inputs in a single dispatch:
 //   * world-space positions (per instance) into the merged vertex buffer,
 //   * rotated normals/tangents (if the source mesh has them),
@@ -51,6 +53,17 @@ layout(set = 0, binding = 4) restrict writeonly buffer DstIdxBuf {
 	uint v[];
 }
 dst_idx;
+
+// A LOD reduced to the vertices it uses (RTLodView), when push.use_lod_view is set: per merged vertex its source
+// vertex, and the LOD's indices into the merged ones.
+layout(set = 0, binding = 5) restrict readonly buffer LodVertexRemap {
+	uint v[];
+}
+lod_vertex_remap;
+layout(set = 0, binding = 6) restrict readonly buffer LodIndices {
+	uint v[];
+}
+lod_indices;
 #endif
 
 layout(push_constant, std430) uniform PC {
@@ -61,17 +74,28 @@ layout(push_constant, std430) uniform PC {
 	uint src_idx_hi;
 	uint index_count; // indices per instance
 	uint src_is_16bit; // 1 if source is packed uint16
+	uint use_lod_view; // 1: the vertices and indices come from lod_vertex_remap and lod_indices.
+	uint pad;
 #endif
-	uint vertex_count; // V (per instance)
+	uint vertex_count; // V (per instance, in the merged buffers)
 	uint instance_count; // N
-	uint pos_stride_words; // position stride in float words (3 for uncompressed)
+	uint pos_stride_words; // position stride in float words (3 for uncompressed, 2 for compressed)
 	uint src_tbn_base_words; // word offset of TBN section in source vertex buffer
-	uint src_tbn_stride_words; // 1 = normal only, 2 = normal + tangent (uint32 each)
-	uint dst_tbn_base_words; // N * V * 3 (word offset of TBN section in output)
+	uint tbn_stride_words; // 1 = normal only, 2 = normal + tangent (uint32 each), in the output (and an uncompressed source)
+	uint dst_tbn_base_words; // cap_vertices * 3 (word offset of TBN section in output)
 	uint mm_stride; // mm transform stride in floats
 	uint mm_offset; // mm current instance offset (motion vectors double-buffer)
 	uint has_tbn; // 1 if mesh has normals/tangents, 0 otherwise
 	uint attr_stride_words; // attribute stride in uint words (0 = mesh has no attribs)
+	// ARRAY_FLAG_COMPRESS_ATTRIBUTES: UNORM16x4 positions in the surface's AABB (w: the tangent's angle around the
+	// normal and the bitangent sign), one octahedral normal (UNORM16x2) per vertex. Written uncompressed.
+	uint compressed;
+	float aabb_pos_x, aabb_pos_y, aabb_pos_z;
+	float aabb_size_x, aabb_size_y, aabb_size_z;
+	// The merged buffers' capacity. Unused vertices are NaN, which makes inactive every triangle using one; unused
+	// indices point to the last vertex, always unused.
+	uint cap_vertices;
+	uint cap_indices;
 }
 push;
 
@@ -79,7 +103,8 @@ vec2 vec3_to_oct(vec3 v) {
 	float abs_sum = abs(v.x) + abs(v.y) + abs(v.z);
 	v.xy /= abs_sum;
 	if (v.z < 0.0) {
-		v.xy = (1.0 - abs(v.yx)) * sign(v.xy);
+		// Not sign(): (0, 0, -1) would come back as (0, 0, 1).
+		v.xy = (1.0 - abs(v.yx)) * vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
 	}
 	return v.xy;
 }
@@ -91,6 +116,21 @@ vec3 oct_to_vec3(vec2 e) {
 	return normalize(v);
 }
 
+// As raster decodes a compressed vertex (and fetch_tbn_compressed_vertex()).
+void axis_angle_to_tbn(vec3 axis, float angle, out vec3 tangent, out vec3 binormal, out vec3 normal) {
+	float c = cos(angle);
+	float s = sin(angle);
+	vec3 omc_axis = (1.0 - c) * axis;
+	vec3 s_axis = s * axis;
+	tangent = omc_axis.xxx * axis + vec3(c, -s_axis.z, s_axis.y);
+	binormal = omc_axis.yyy * axis + vec3(s_axis.z, c, -s_axis.x);
+	normal = omc_axis.zzz * axis + vec3(-s_axis.y, s_axis.x, c);
+}
+
+uint pack_oct(vec2 oct) {
+	return uint(oct.x * 32767.5 + 32767.5) | (uint(oct.y * 32767.5 + 32767.5) << 16u);
+}
+
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
 	uint total_v = push.vertex_count * push.instance_count;
@@ -99,12 +139,27 @@ void main() {
 	if (idx < total_v) {
 		uint inst = idx / push.vertex_count;
 		uint vtx = idx % push.vertex_count;
+#ifdef MODE_INDEXED
+		if (push.use_lod_view != 0u) {
+			vtx = lod_vertex_remap.v[vtx];
+		}
+#endif
 
 		SrcFloatBuf src = SrcFloatBuf(packUint2x32(uvec2(push.src_vtx_lo, push.src_vtx_hi)));
-		vec3 p = vec3(
-				src.v[vtx * push.pos_stride_words + 0u],
-				src.v[vtx * push.pos_stride_words + 1u],
-				src.v[vtx * push.pos_stride_words + 2u]);
+		SrcUintBuf src_u = SrcUintBuf(packUint2x32(uvec2(push.src_vtx_lo, push.src_vtx_hi)));
+		vec3 p;
+		uint pos_word1 = 0u;
+		if (push.compressed != 0u) {
+			uint pos_word0 = src_u.v[vtx * 2u];
+			pos_word1 = src_u.v[vtx * 2u + 1u];
+			vec3 unorm = vec3(float(pos_word0 & 0xFFFFu), float(pos_word0 >> 16u), float(pos_word1 & 0xFFFFu)) / 65535.0;
+			p = unorm * vec3(push.aabb_size_x, push.aabb_size_y, push.aabb_size_z) + vec3(push.aabb_pos_x, push.aabb_pos_y, push.aabb_pos_z);
+		} else {
+			p = vec3(
+					src.v[vtx * push.pos_stride_words + 0u],
+					src.v[vtx * push.pos_stride_words + 1u],
+					src.v[vtx * push.pos_stride_words + 2u]);
+		}
 
 		// MM buffer stores a row-major 3x4 transform per instance.
 		// Read the three rows, then transpose so GLSL's column-major mat3
@@ -127,31 +182,45 @@ void main() {
 		}
 
 		if (push.has_tbn != 0u) {
-			SrcUintBuf src_u = SrcUintBuf(packUint2x32(uvec2(push.src_vtx_lo, push.src_vtx_hi)));
-			uint tbn_src = push.src_tbn_base_words + vtx * push.src_tbn_stride_words;
-			uint n_packed = src_u.v[tbn_src];
+			vec3 n;
+			vec3 tangent;
+			float bitan_sign = 1.0;
+			if (push.compressed != 0u) {
+				uint axis_packed = src_u.v[push.src_tbn_base_words + vtx];
+				vec3 axis = oct_to_vec3(vec2(float(axis_packed & 0xFFFFu), float(axis_packed >> 16u)) / 65535.0 * 2.0 - 1.0);
+				float angle_raw = float(pos_word1 >> 16u) / 65535.0;
+				bitan_sign = angle_raw > 0.5 ? 1.0 : -1.0;
+				vec3 binormal;
+				axis_angle_to_tbn(axis, abs(angle_raw * 2.0 - 1.0) * PI, tangent, binormal, n);
+			} else {
+				uint tbn_src = push.src_tbn_base_words + vtx * push.tbn_stride_words;
+				uint n_packed = src_u.v[tbn_src];
+				n = oct_to_vec3(vec2(float(n_packed & 0xFFFFu), float(n_packed >> 16u)) / 65535.0 * 2.0 - 1.0);
+				if (push.tbn_stride_words >= 2u) {
+					// Tangent encodes the bitangent sign in sign(t_raw.y).
+					uint t_packed = src_u.v[tbn_src + 1u];
+					vec2 t_raw = vec2(float(t_packed & 0xFFFFu), float(t_packed >> 16u)) / 65535.0 * 2.0 - 1.0;
+					bitan_sign = sign(t_raw.y);
+					tangent = oct_to_vec3(vec2(t_raw.x, abs(t_raw.y) * 2.0 - 1.0));
+				}
+			}
 
-			vec2 n_oct = vec2(float(n_packed & 0xFFFFu), float(n_packed >> 16u)) / 65535.0 * 2.0 - 1.0;
-			vec3 rn = normalize(rot * oct_to_vec3(n_oct));
-			vec2 rn_oct = vec3_to_oct(rn);
-			uint rn_packed = uint(rn_oct.x * 32767.5 + 32767.5) | (uint(rn_oct.y * 32767.5 + 32767.5) << 16u);
+			uint tbn_dst = push.dst_tbn_base_words + idx * push.tbn_stride_words;
+			dst_vtx.v[tbn_dst] = pack_oct(vec3_to_oct(normalize(rot * n)));
 
-			uint tbn_dst = push.dst_tbn_base_words + idx * push.src_tbn_stride_words;
-			dst_vtx.v[tbn_dst] = rn_packed;
-
-			if (push.src_tbn_stride_words >= 2u) {
-				// Tangent encodes the bitangent sign in sign(t_raw.y); preserve it.
-				uint t_packed = src_u.v[tbn_src + 1u];
-				vec2 t_raw = vec2(float(t_packed & 0xFFFFu), float(t_packed >> 16u)) / 65535.0 * 2.0 - 1.0;
-				float bitan_sign = sign(t_raw.y);
-				vec2 t_oct = vec2(t_raw.x, abs(t_raw.y) * 2.0 - 1.0);
-				vec3 rt = normalize(rot * oct_to_vec3(t_oct));
-				vec2 rt_oct = vec3_to_oct(rt);
-				float t_raw_y = (abs(rt_oct.y) * 0.5 + 0.5) * bitan_sign;
-				uint rt_packed = uint(rt_oct.x * 32767.5 + 32767.5) | (uint(t_raw_y * 32767.5 + 32767.5) << 16u);
-				dst_vtx.v[tbn_dst + 1u] = rt_packed;
+			if (push.tbn_stride_words >= 2u) {
+				// The inverse of the decoding above: abs(t_raw.y) * 2 - 1 gives the octahedral y back, sign(t_raw.y) the
+				// bitangent sign (Vector3::octahedron_tangent_encode(), its bias keeps t_raw.y away from 0).
+				vec2 rt_oct = vec3_to_oct(normalize(rot * tangent));
+				rt_oct.y = max(rt_oct.y * 0.5 + 0.5, 1.0 / 32767.0) * bitan_sign;
+				dst_vtx.v[tbn_dst + 1u] = pack_oct(rt_oct);
 			}
 		}
+	} else if (idx < push.cap_vertices) {
+		uint pos_base = idx * 3u;
+		dst_vtx.v[pos_base + 0u] = 0x7FC00000u; // NaN.
+		dst_vtx.v[pos_base + 1u] = 0u;
+		dst_vtx.v[pos_base + 2u] = 0u;
 	}
 
 #ifdef MODE_INDEXED
@@ -161,17 +230,22 @@ void main() {
 		uint inst_i = idx / push.index_count;
 		uint local_pos = idx % push.index_count;
 
-		SrcUintBuf src_i = SrcUintBuf(packUint2x32(uvec2(push.src_idx_lo, push.src_idx_hi)));
 		uint src_idx;
-		if (push.src_is_16bit != 0u) {
+		if (push.use_lod_view != 0u) {
+			src_idx = lod_indices.v[local_pos];
+		} else if (push.src_is_16bit != 0u) {
+			SrcUintBuf src_i = SrcUintBuf(packUint2x32(uvec2(push.src_idx_lo, push.src_idx_hi)));
 			uint byte_off = local_pos * 2u;
 			uint word = src_i.v[byte_off >> 2u];
 			src_idx = ((byte_off & 2u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
 		} else {
+			SrcUintBuf src_i = SrcUintBuf(packUint2x32(uvec2(push.src_idx_lo, push.src_idx_hi)));
 			src_idx = src_i.v[local_pos];
 		}
 
 		dst_idx.v[idx] = src_idx + inst_i * push.vertex_count;
+	} else if (idx < push.cap_indices) {
+		dst_idx.v[idx] = push.cap_vertices - 1u;
 	}
 #endif
 }

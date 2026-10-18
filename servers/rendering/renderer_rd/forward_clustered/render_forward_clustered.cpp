@@ -336,6 +336,9 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, render_base_uniform_set, SCENE_UNIFORM_SET);
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, p_params->render_pass_uniform_set, RENDER_PASS_UNIFORM_SET);
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, scene_shader.default_vec4_xform_uniform_set, TRANSFORMS_UNIFORM_SET);
+	if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_RT_SHADOWS) != 0) {
+		RD::get_singleton()->draw_list_bind_uniform_set(draw_list, p_params->rt_shadow_texture_uniform_set, RT_SHADOW_TEXTURES_UNIFORM_SET);
+	}
 
 	RID prev_material_uniform_set;
 
@@ -494,6 +497,10 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_MULTIVIEW) != 0) {
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MULTIVIEW;
+				}
+
+				if constexpr ((p_color_pass_flags & COLOR_PASS_FLAG_RT_SHADOWS) != 0) {
+					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_RT_SHADOWS;
 				}
 
 				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_COLOR_PASS;
@@ -740,6 +747,7 @@ void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_lis
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_MOTION_VECTORS);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_SEPARATE_SPECULAR | COLOR_PASS_FLAG_MULTIVIEW | COLOR_PASS_FLAG_MOTION_VECTORS);
 				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_MULTIVIEW | COLOR_PASS_FLAG_MOTION_VECTORS);
+				VALID_FLAG_COMBINATION(COLOR_PASS_FLAG_TRANSPARENT | COLOR_PASS_FLAG_RT_SHADOWS);
 				default: {
 					ERR_FAIL_MSG("Invalid color pass flag combination " + itos(p_params->color_pass_flags));
 				}
@@ -781,6 +789,11 @@ void RenderForwardClustered::_render_list_with_draw_list(RenderListParameters *p
 	p_params->framebuffer_format = fb_format;
 
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_framebuffer, p_draw_flags, p_clear_color_values, p_clear_depth_value, p_clear_stencil_value, p_region);
+	if (p_params->buffer_dependencies != nullptr) {
+		for (const RID &buffer : *p_params->buffer_dependencies) {
+			RD::get_singleton()->draw_list_add_buffer_dependency(draw_list, buffer);
+		}
+	}
 	const uint32_t split_count = _render_list_get_split_count(p_params);
 	if (split_count > 1) {
 		_render_list_split(p_params, split_count);
@@ -1128,6 +1141,9 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 					ss_flags |= (rb_data.is_valid() && !rb_data->ss_effects_data.ssr.half_size) ? (1 << 3) : 0;
 				}
 			}
+		}
+		if (front_layer_reflection.is_valid()) {
+			ss_flags |= 1 << 4;
 		}
 		scene_state.ubo.ss_effects_flags = ss_flags;
 	} else {
@@ -2222,6 +2238,7 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
 		settings.directional_shadow_depth = RendererRD::LightStorage::get_singleton()->directional_shadow_get_texture();
 		settings.directional_light_buffer = RendererRD::LightStorage::get_singleton()->get_directional_light_buffer();
+		settings.directional_light_projector = RendererRD::LightStorage::get_singleton()->get_directional_projector_texture();
 
 		settings.vfog = fog;
 		settings.cluster_builder = rb_data->cluster_builder;
@@ -2725,6 +2742,12 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 				params.dlss_rr_specular_albedo = p_dlss_rr.specular_albedo;
 				params.dlss_rr_normal_roughness = p_dlss_rr.normal_roughness;
 				params.dlss_rr_specular_hit_dist = p_dlss_rr.specular_hit_dist;
+				params.dlss_rr_color_before_transparency = p_dlss_rr.color_before_transparency;
+				if (p_dlss_rr.depth.is_valid()) {
+					// The same depth with a transparent surface's where its reflection dominates (DLSS-RR Integration Guide,
+					// 3.4.1). The motion vector decode reads it too, so static pixels move as that surface does.
+					params.depth = p_dlss_rr.depth;
+				}
 			}
 
 			Projection correction;
@@ -5717,6 +5740,9 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 			}
 		}
 
+		if (p_render_list == RENDER_LIST_ALPHA && front_layer_reflection.is_valid()) {
+			ssr = front_layer_reflection;
+		}
 		RID texture = ssr.is_valid() ? ssr : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
 		uniforms.push_back(u);
@@ -5730,6 +5756,27 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		RID texture = ssr_mip_level.is_valid() ? ssr_mip_level : texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		u.append_id(texture);
 		uniforms.push_back(u);
+	}
+
+	{
+		RD::Uniform u;
+		u.binding = 42;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		const RID projector = light_storage->get_directional_projector_texture();
+		u.append_id(projector.is_valid() ? projector : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE));
+		uniforms.push_back(u);
+	}
+
+	if (p_render_list == RENDER_LIST_ALPHA && rt_shadow_tlas.is_valid()) {
+		// The USE_RT_SHADOWS variants' TLAS, which the other variants do not declare.
+		RD::Uniform u;
+		u.binding = 39;
+		u.uniform_type = RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE;
+		u.append_id(rt_shadow_tlas);
+		uniforms.push_back(u);
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 40, rt_shadow_geometry_buffer));
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 41, rt_shadow_material_buffer));
+		return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rt_shadows_rd, RENDER_PASS_UNIFORM_SET, uniforms);
 	}
 
 	return UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rd, RENDER_PASS_UNIFORM_SET, uniforms);
@@ -6710,6 +6757,13 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 				uint32_t view_count = multiview ? 2 : 1;
 				pipeline_key.framebuffer_format_id = _get_color_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false, view_count);
 				_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+
+				if (alpha && !multiview && p_global.use_rt_shadows && scene_shader.is_rt_shadows_shader_group_enabled()) {
+					// The path tracer's transparent pass.
+					SceneShaderForwardClustered::ShaderData::PipelineKey rt_shadows_key = pipeline_key;
+					rt_shadows_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_RT_SHADOWS;
+					_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, rt_shadows_key, r_pipeline_pairs);
+				}
 
 				// Generate all the possible variants used during the advanced color passes.
 				const uint32_t separate_specular_iterations = p_global.use_separate_specular ? 2 : 1;

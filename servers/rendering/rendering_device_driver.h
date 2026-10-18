@@ -178,6 +178,9 @@ public:
 		BUFFER_USAGE_DEVICE_ADDRESS_BIT = (1 << 17),
 		BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 19),
 		BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT = (1 << 20),
+		// Opacity micromap build inputs: addresses aligned to 256 bytes (Vulkan and D3D12).
+		BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT = (1 << 23),
+		BUFFER_USAGE_OPACITY_MICROMAP_STORAGE_BIT = (1 << 24),
 		// There are no Vulkan-equivalent. Try to use unused/unclaimed bits.
 		BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT = (1 << 31),
 	};
@@ -776,6 +779,16 @@ public:
 			uint32_t index_offset;
 			uint32_t index_count;
 			IndexBufferFormat index_format;
+			// An opacity micromap (opacity_micromap_create()), or none: each triangle's entry index (or special index) in
+			// opacity_micromap_index_buffer, added to opacity_micromap_base_triangle; how many triangles reference entries
+			// of each subdivision level and format.
+			AccelerationStructureID opacity_micromap;
+			BufferID opacity_micromap_index_buffer;
+			uint32_t opacity_micromap_index_offset;
+			IndexBufferFormat opacity_micromap_index_format;
+			uint32_t opacity_micromap_base_triangle;
+			const OpacityMicromapUsage *opacity_micromap_usages;
+			uint32_t opacity_micromap_usage_count;
 		};
 
 		// Procedural geometry: each AABB is two float3 (min, max), packed
@@ -814,6 +827,11 @@ public:
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) = 0;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) = 0;
 
+	// An opacity micromap of the entries p_usages counts, described in p_triangle_buffer (8 bytes each) with their states in
+	// p_data_buffer (buffers made with BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT). Freed with
+	// acceleration_structure_free(), built with command_build_opacity_micromap() before the BLASes that reference it.
+	virtual AccelerationStructureID opacity_micromap_create(VectorView<OpacityMicromapUsage> p_usages, BufferID p_data_buffer, uint64_t p_data_offset, BufferID p_triangle_buffer, uint64_t p_triangle_offset) { return AccelerationStructureID(); }
+
 	// ----- PIPELINE -----
 
 	struct PipelineShader {
@@ -835,11 +853,12 @@ public:
 
 	// ----- COMMANDS -----
 
-	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) = 0;
+	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) = 0;
 	// In-place refit of a BLAS previously built with ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT.
 	// Geometry topology / counts must be unchanged; only vertex positions may differ.
-	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) = 0;
-	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) = 0;
+	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) = 0;
+	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, VectorView<AccelerationStructureID> p_blases) = 0;
+	virtual void command_build_opacity_micromap(CommandBufferID p_cmd_buffer, AccelerationStructureID p_opacity_micromap, BufferID p_scratch_buffer, uint64_t p_scratch_offset) {}
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) = 0;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) = 0;
 
@@ -963,6 +982,10 @@ public:
 		API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS,
 		API_TRAIT_TEXTURE_OUTPUTS_REQUIRE_CLEARS,
 		API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE,
+		// An instance is VkAccelerationStructureInstanceKHR / D3D12_RAYTRACING_INSTANCE_DESC: a row-major 3x4 transform, then
+		// the custom index (24 bits) and mask (8), the hit group offset (24) and flags (8), the BLAS address (64), so that a
+		// shader can write instances.
+		API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT,
 		API_TRAIT_SHADER_GROUP_HANDLE_SIZE,
 		API_TRAIT_SHADER_GROUP_BASE_ALIGNMENT,
 		API_TRAIT_SHADER_GROUP_HANDLE_ALIGNMENT,

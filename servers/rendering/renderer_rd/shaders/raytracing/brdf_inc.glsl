@@ -1176,9 +1176,11 @@ float3 DLSSRR_computeSpecularAlbedo(float3 baseColor, float metalness, float die
 	return DLSSRR_envBRDFApprox(F0, roughness, NdotV);
 }
 
-// Fudges diffuse albedo so that is	never zero. Needed for stable demodulation.
+// Fudges diffuse albedo so that it is never zero, for a stable demodulation. Kept well below real materials: a floor of
+// 0.04 (a dielectric's F0) flattened every darker texture in the guide (dark stone, linear albedo ~0.02), which Ray
+// Reconstruction then smoothed as lighting noise.
 float3 DLSSRR_encodeDiffuseAlbedo(float3 diffuseAlbedo) {
-	return max(diffuseAlbedo, float3(0.04f));
+	return max(diffuseAlbedo, float3(0.001f));
 }
 
 #endif // BRDF_HLSLI

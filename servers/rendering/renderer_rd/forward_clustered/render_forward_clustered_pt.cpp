@@ -30,6 +30,7 @@
 
 #include "render_forward_clustered_pt.h"
 
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -58,12 +59,23 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	if (!use_rt) {
 		_age_out_motion_vectors(p_render_data);
 
-		// Path tracing is off for this view: drop any DLSS Ray Reconstruction state
+		// Path tracing is off for this view: drop its state, its textures and the DLSS Ray Reconstruction ones, then,
+		// once no view has traced for a while, every acceleration structure and cache, for the raster effects
+		// (SDFGI, SSIL...) that take their place.
+		// GODOT_RT_KEEP_CACHES=1 keeps everything but the DLSS Ray Reconstruction textures.
+		static const bool keep_caches = OS::get_singleton()->get_environment("GODOT_RT_KEEP_CACHES") == "1";
 		if (rb_data.is_valid()) {
-			if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
-				raytracing->dlss_rr_free_buffers(rb.ptr());
+			if (raytracing && keep_caches) {
+				if (raytracing->dlss_rr_has_buffers(rb.ptr())) {
+					raytracing->dlss_rr_free_buffers(rb.ptr());
+				}
+			} else if (raytracing) {
+				_free_rt_viewport_state(rb.ptr());
 			}
 			rb->set_depth_reconstruct_requested(false);
+		}
+		if (raytracing && !is_reflection_probe && !keep_caches) {
+			raytracing->free_caches_if_unused();
 		}
 		RenderForwardClustered::_render_scene(p_render_data, p_default_bg_color);
 		return;
@@ -83,6 +95,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	p_render_data->voxel_gi_count = 0;
 
 	ERR_FAIL_NULL(current_cluster_builder);
+
+	// As raster: the volumetric fog and the transparent pass read the VoxelGI textures (white defaults without any).
+	gi.setup_voxel_gi_instances(p_render_data, p_render_data->render_buffers, p_render_data->scene_data->cam_transform, *p_render_data->voxel_gi_instances, p_render_data->voxel_gi_count);
 
 	p_render_data->cluster_buffer = current_cluster_builder->get_cluster_buffer();
 	p_render_data->cluster_size = current_cluster_builder->get_cluster_size();
@@ -165,7 +180,26 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// Captured from build_tlas/update_uniform_set so the trace-dispatch block
 	// below can bind without RenderRaytracing keeping hidden "current" state.
 	RID rt_uniform_set;
+	RTViewportState *rt_state = nullptr;
 	bool using_depth_reconstruct = false;
+
+	// The path tracer produces the opaque color, but transparents are still
+	// rasterized on top, which needs the reflection-probe / light / decal buffers
+	// and the cluster grid to be valid for the current frame. Before the acceleration structures, as raster renders its
+	// shadows before the opaque pass: the shadow passes recorded between the TLAS build and the trace left the TLAS
+	// faulty (VK_NV_ray_tracing_validation FAULTY_AS, then a device loss) whenever the volumetric fog was on.
+	if (rb_data.is_valid() && is_environment(p_render_data->environment) && environment_get_volumetric_fog_enabled(p_render_data->environment)) {
+		// The volumetric fog lights its volume through the shadow maps, as in raster: render them, then update it.
+		_pre_opaque_render(p_render_data, false, false, false, false, nullptr, RID());
+	} else {
+		uint32_t pt_directional_light_count = 0;
+		uint32_t pt_positional_light_count = 0;
+		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
+		if (rb_data.is_valid()) {
+			// Frees the volume of a fog just turned off.
+			_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, false, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes);
+		}
+	}
 
 	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
 		RENDER_TIMESTAMP("Build Acceleration Structures");
@@ -181,10 +215,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			raytracing->dlss_rr_free_buffers(rb.ptr());
 		}
 
-		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
-		if (rt_state) {
-			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
-		}
+		rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 	} else if (rb_data.is_valid() && raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
 		// No RT shader available: free DLSS RR buffers so DLSS falls back to SR.
 		raytracing->dlss_rr_free_buffers(rb.ptr());
@@ -197,6 +228,13 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	if (scene_state.used_lightmap || scene_state.lightmaps_used > 0) {
 		scene_shader.enable_advanced_shader_group(p_render_data->scene_data->view_count > 1);
 		global_pipeline_data_required.use_lightmaps = true;
+	}
+
+	// The transparent surfaces are shadowed by rays through the TLAS, as the path traced ones.
+	const bool rt_shadows = rt_state && rt_state->tlas.is_valid() && p_render_data->scene_data->view_count == 1 && _transparent_pass_traces_shadows();
+	if (rt_shadows) {
+		scene_shader.enable_rt_shadows_shader_group();
+		global_pipeline_data_required.use_rt_shadows = true;
 	}
 
 	// Recompile pipelines if any of the requirements changed this frame.
@@ -311,22 +349,18 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
 	}
 
-	// The path tracer produces the opaque color, but transparents are still
-	// rasterized on top, which needs the reflection-probe / light / decal buffers
-	// and the cluster grid to be valid for the current frame.
-	{
-		uint32_t pt_directional_light_count = 0;
-		uint32_t pt_positional_light_count = 0;
-		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
+	// The trace's uniform set is made last, with its output textures: the sky setup above can create the radiance texture,
+	// and freeing the previous one freed a set made with it ("uniform_set is null" on the first frames).
+	if (rt_state) {
+		raytracing->rt_ensure_textures(rb.ptr());
+		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
 	}
 
-	// Execute raytracing (replaces the opaque + motion vector pass).
-	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
+	// Execute raytracing (replaces the opaque + motion vector pass). Without a uniform set this frame (the pipeline was
+	// being rebuilt for a new material), nothing is traced: RenderingDevice only validates sets in debug builds.
+	if (rb_data.is_valid() && raytracing && raytracing->get_shader() && rt_uniform_set.is_valid()) {
 		RD::get_singleton()->draw_command_begin_label("Raytracing");
 		RENDER_TIMESTAMP("TLAS Build");
-
-		// Ensure raytracing output textures exist.
-		raytracing->rt_ensure_textures(rb.ptr());
 
 		RENDER_TIMESTAMP("Pathtracer");
 
@@ -345,6 +379,10 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		RID bindless_set = raytracing->get_bindless_uniform_set();
 		if (bindless_set.is_valid()) {
 			RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, bindless_set, 1);
+		}
+		RID bindless_array_set = raytracing->get_bindless_array_uniform_set();
+		if (bindless_array_set.is_valid()) {
+			RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, bindless_array_set, 2);
 		}
 
 		// Make sure BDA referenced buffers are registered as dependencies -- these cannot be inferred by the draw graph.
@@ -365,7 +403,22 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			RD::get_singleton()->draw_command_end_label();
 		}
 
+		raytracing->apply_volumetric_fog(p_render_data, fog_use_legacy_blending_get());
 		raytracing->copy_output_texture(p_render_data);
+	}
+
+	// The sky where the camera rays missed (their depth is the far plane), drawn as raster draws it: the miss shader only
+	// reads the radiance octmap, far too coarse for a background (a sky shader's stars become a grid of blotches).
+	if (draw_sky || draw_sky_fog_only) {
+		RENDER_TIMESTAMP("Render Sky");
+
+		RD::get_singleton()->draw_command_begin_label("Draw Sky");
+		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(color_only_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0u, p_render_data->render_region);
+
+		sky.draw_sky(draw_list, rb, p_render_data->environment, color_only_framebuffer, time, sky_luminance_multiplier, sky_brightness_multiplier);
+
+		RD::get_singleton()->draw_list_end();
+		RD::get_singleton()->draw_command_end_label();
 	}
 
 	{
@@ -431,24 +484,59 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_TRANSPARENT, p_render_data);
 	}
 
+	// DLSS RR's color before transparency guide: what the transparent pass is about to draw over. And its diffuse albedo
+	// where the camera rays missed: the background as drawn.
+	if (raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
+		raytracing->dlss_rr_write_background_albedo(p_render_data);
+		copy_effects->copy_to_rect(rb->get_internal_texture(), raytracing->dlss_rr_get_color_before_transparency(rb.ptr()), Rect2i(Point2i(), rb->get_internal_size()));
+	}
+
 	{
 		RENDER_TIMESTAMP("Render 3D Transparent Pass");
 
 		RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
+		// The path traced reflections of the transparent surfaces, in place of their probes and sky where they match.
+		front_layer_reflection = (raytracing && raytracing->get_front_layer_instance_count() > 0) ? raytracing->rt_get_front_layer_texture(rb.ptr()) : RID();
+
 		uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, false, screen_size, screen_size, p_default_bg_color, false);
 
+		RID rt_shadow_texture_set;
+		if (rt_shadows && scene_shader.is_rt_shadows_shader_group_enabled() && rt_state->geometry_buffer.is_valid() && rt_state->material_buffer.is_valid()) {
+			rt_shadow_texture_set = raytracing->get_fragment_texture_set(scene_shader.default_shader_rt_shadows_rd, RT_SHADOW_TEXTURES_UNIFORM_SET);
+		}
+		const bool use_rt_shadows = rt_shadow_texture_set.is_valid();
+		if (use_rt_shadows) {
+			rt_shadow_tlas = rt_state->tlas;
+			rt_shadow_geometry_buffer = rt_state->geometry_buffer;
+			rt_shadow_material_buffer = rt_state->material_buffer;
+		}
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
+		rt_shadow_tlas = RID();
+		rt_shadow_geometry_buffer = RID();
+		rt_shadow_material_buffer = RID();
 
 		{
 			uint32_t transparent_color_pass_flags = (color_pass_flags | uint32_t(COLOR_PASS_FLAG_TRANSPARENT)) & ~uint32_t(COLOR_PASS_FLAG_SEPARATE_SPECULAR);
 			// Motion vectors should not be overwritten by transparent objects.
 			transparent_color_pass_flags &= ~uint32_t(COLOR_PASS_FLAG_MOTION_VECTORS);
+			if (use_rt_shadows) {
+				transparent_color_pass_flags |= COLOR_PASS_FLAG_RT_SHADOWS;
+			}
 
 			RID alpha_framebuffer = rb_data->get_color_pass_fb(transparent_color_pass_flags);
 			RenderListParameters render_list_params(render_list[RENDER_LIST_ALPHA].elements.ptr(), render_list[RENDER_LIST_ALPHA].element_info.ptr(), render_list[RENDER_LIST_ALPHA].elements.size(), reverse_cull, PASS_MODE_COLOR, transparent_color_pass_flags, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+			render_list_params.rt_shadow_texture_uniform_set = rt_shadow_texture_set;
+			// The alpha test reads the vertices through their addresses.
+			thread_local LocalVector<RID> rt_shadow_buffers;
+			rt_shadow_buffers.clear();
+			if (use_rt_shadows) {
+				raytracing->get_buffers_read_by_address(rt_shadow_buffers);
+				render_list_params.buffer_dependencies = &rt_shadow_buffers;
+			}
 			_render_list_with_draw_list(&render_list_params, alpha_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0u, p_render_data->render_region);
 		}
+		front_layer_reflection = RID();
 
 		RD::get_singleton()->draw_command_end_label();
 	}
@@ -482,6 +570,8 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			dlss_rr_guides.specular_albedo = raytracing->dlss_rr_get_specular_albedo(rb.ptr());
 			dlss_rr_guides.normal_roughness = raytracing->dlss_rr_get_normal_roughness(rb.ptr());
 			dlss_rr_guides.specular_hit_dist = raytracing->dlss_rr_get_specular_hit_dist(rb.ptr());
+			dlss_rr_guides.color_before_transparency = raytracing->dlss_rr_get_color_before_transparency(rb.ptr());
+			dlss_rr_guides.depth = raytracing->dlss_rr_get_depth(rb.ptr());
 		}
 		_render_3d_upscaling(p_render_data, scale_type, using_taa, time_step, dlss_rr_guides);
 	}
@@ -505,6 +595,17 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 // Raytracing methods
 
+bool RenderForwardClusteredPT::_transparent_pass_traces_shadows() {
+	// GODOT_RT_TRANSPARENT_SHADOWS=0: the shadow maps instead, rendered for every light again (comparisons).
+	static const bool off = OS::get_singleton()->get_environment("GODOT_RT_TRANSPARENT_SHADOWS") == "0";
+	return RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) && !off;
+}
+
+bool RenderForwardClusteredPT::environment_pathtracing_replaces_shadow_maps(RID p_env) const {
+	// Until the path tracer is set up (its first frame), the transparent pass may still read the shadow maps.
+	return environment_get_pathtracing_enabled(p_env) && raytracing && raytracing->get_shader() && raytracing->get_shader()->is_usable() && _transparent_pass_traces_shadows();
+}
+
 bool RenderForwardClusteredPT::_setup_rt() {
 	if (!RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE)) {
 		WARN_PRINT_ONCE("Raytracing not supported on this device.");
@@ -521,10 +622,19 @@ bool RenderForwardClusteredPT::_setup_rt() {
 		if (is_using_radiance_octmap_array()) {
 			rt_defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
+		if (RD::get_singleton()->has_feature(RD::SUPPORTS_OPACITY_MICROMAP)) {
+			// The ray queries may meet opacity micromaps (D3D12 then allocates them with AllocateRayQuery2).
+			rt_defines += "\n#define RT_OPACITY_MICROMAPS\n";
+		}
 		raytracing->shader->init(rt_defines);
+		if (!raytracing->shader->is_usable()) {
+			// Nothing else of the path tracer is compiled or run: a driver whose shader translation cannot handle its
+			// shaders (missing ray tracing features) rasterizes instead of rendering nothing or failing further on.
+			ERR_PRINT("Path tracing is unavailable on this device: its base ray tracing pipeline could not be built. Rendering with rasterization instead.");
+		}
 	}
 
-	return true;
+	return raytracing->get_shader()->is_usable();
 }
 
 void RenderForwardClusteredPT::_age_out_motion_vectors(const RenderDataRD *p_render_data) {
@@ -558,7 +668,12 @@ void RenderForwardClusteredPT::_age_out_motion_vectors(const RenderDataRD *p_ren
 
 void RenderForwardClusteredPT::_free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) {
 	ERR_FAIL_NULL(p_render_buffers);
-	p_render_buffers->clear_context(RB_SCOPE_DLSS_RR);
+	if (p_render_buffers->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO)) {
+		p_render_buffers->clear_context(RB_SCOPE_DLSS_RR);
+	}
+	if (p_render_buffers->has_texture(RB_SCOPE_RAYTRACING, RB_TEX_RAYTRACING)) {
+		p_render_buffers->clear_context(RB_SCOPE_RAYTRACING);
+	}
 	if (raytracing) {
 		raytracing->free_viewport_state(p_render_buffers);
 	}

@@ -46,6 +46,8 @@ class RenderForwardClusteredPT : public RenderForwardClustered {
 
 	bool _setup_rt();
 	void _age_out_motion_vectors(const RenderDataRD *p_render_data);
+	// The transparent pass traces its lights' shadows through the TLAS (USE_RT_SHADOWS) on this device.
+	static bool _transparent_pass_traces_shadows();
 
 protected:
 	virtual void _render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) override;
@@ -53,6 +55,8 @@ protected:
 	virtual void _free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) override;
 
 public:
+	virtual bool environment_pathtracing_replaces_shadow_maps(RID p_env) const override;
+
 	RenderForwardClusteredPT();
 	~RenderForwardClusteredPT();
 };

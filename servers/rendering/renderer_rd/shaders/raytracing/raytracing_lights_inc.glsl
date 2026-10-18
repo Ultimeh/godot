@@ -16,7 +16,7 @@
 #endif
 
 // ============================================================================
-// Light Data (matches C++ RT_LightData, 80 bytes, std430)
+// Light Data (matches C++ RT_LightData, 128 bytes, std430)
 // ============================================================================
 
 struct RTLightData {
@@ -31,9 +31,16 @@ struct RTLightData {
 	float indirect_energy; // Godot indirect energy multiplier.
 	float inv_spot_attenuation; // Spot cone softness.
 	float cos_spot_angle; // Cosine of spot cone half-angle.
-	float _pad0;
+	uint cull_mask; // Layers this light lights (Light3D.light_cull_mask).
 	vec3 spot_direction; // Spot direction (normalized, world space).
-	float _pad1;
+	float shadow_opacity; // 0 when the light casts no shadow (no shadow ray), as raster.
+	// Directional: world position (w = 1) to the UV of rt_directional_light_projector (raster's projector).
+	vec4 projector_uv_x;
+	vec4 projector_uv_y;
+	uint projector_enabled;
+	uint pad0;
+	uint pad1;
+	uint pad2;
 };
 
 // Light buffer SSBO (binding provided by the including shader via RT_LIGHT_BUFFER_BINDING).
@@ -44,6 +51,19 @@ struct RTLightData {
 layout(set = 0, binding = RT_LIGHT_BUFFER_BINDING, std430) readonly buffer LightBuffer {
 	RTLightData rt_lights[];
 };
+
+// The projector of the directional light whose projector_enabled is set (white when none): it multiplies the light,
+// rgb * a, repeated beyond its size, as raster's directional_light_projector.
+layout(set = 0, binding = 38) uniform texture2D rt_directional_light_projector;
+
+vec3 lights_directional_projector(RTLightData light, vec3 hit_pos) {
+	if (light.projector_enabled == 0u) {
+		return vec3(1.0);
+	}
+	vec2 uv = vec2(dot(light.projector_uv_x, vec4(hit_pos, 1.0)), dot(light.projector_uv_y, vec4(hit_pos, 1.0)));
+	vec4 color = textureLod(sampler2D(rt_directional_light_projector, SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0);
+	return color.rgb * color.a;
+}
 
 // ============================================================================
 // Unified Cone Sampling (for sphere, directional, spot lights)
@@ -159,27 +179,7 @@ float lights_get_specular_multiplier(float specular_amount, float roughness) {
 	}
 }
 
-// ============================================================================
-// Inline Alpha Test (shared by all ray query proceed loops)
-// ============================================================================
-
-/// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= 0.5).
-/// Mirrors the any-hit shader logic for use with inline ray queries.
-bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_bary) {
-	vec3 bary = vec3(1.0 - candidate_bary.x - candidate_bary.y, candidate_bary.x, candidate_bary.y);
-
-	GeometryData geom = geometries[geometry_idx];
-	uint i0, i1, i2;
-	get_triangle_indices_ex(geom, primitive_id, i0, i1, i2);
-	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
-
-	MaterialData mat = materials[geometry_idx];
-	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
-	alpha *= mat.albedo_color.a;
-
-	return alpha >= 0.5;
-}
+#include "raytracing_alpha_test_inc.glsl"
 
 // ============================================================================
 // Shadow Ray (traceRayEXT pipeline)
@@ -198,8 +198,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	// Ray queries are significantly faster, but can not handle complex alpha materials
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, origin, 0.001, direction, max_dist - 0.001);
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
 
 	while (rayQueryProceedEXT(shadow_rq)) {
 		if (rayQueryGetIntersectionTypeEXT(shadow_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -218,8 +218,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 #elif defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	return !(hitObjectIsHitEXT(hitObject));
@@ -240,8 +240,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).
@@ -258,16 +258,39 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 // Next Event Estimation (NEE) - Direct Light Sampling
 // ============================================================================
 
+// The light reaching the point: no shadow ray for a light without shadows, and its shadow opacity, as raster.
+float lights_shadow_visibility(RTLightData p_light, vec3 p_origin, vec3 p_direction, float p_max_dist, inout uint rng_state) {
+	if (p_light.shadow_opacity <= 0.0) {
+		return 1.0;
+	}
+	return lights_trace_shadow_ray(p_origin, p_direction, p_max_dist, rng_state) ? 1.0 : 1.0 - p_light.shadow_opacity;
+}
+
+// BACKLIGHT as raster's light_compute() adds it: light_color * (1 / PI - diffuse_brdf_NL) * backlight, times the
+// diffuse albedo raster multiplies all its diffuse light by.
+vec3 lights_backlight_term(vec3 p_brdf_diffuse, MaterialProperties p_material, vec3 p_backlight) {
+	vec3 diffuse_reflectance = baseColorToDiffuseReflectance(p_material.baseColor, p_material.metalness);
+	return max(diffuse_reflectance * ONE_OVER_PI - p_brdf_diffuse, vec3(0.0)) * p_backlight;
+}
+
 // Evaluate direct lighting using NEE with stochastic light selection.
 // Uses mini-batch reservoir sampling for importance-weighted light selection.
+// A light behind the surface reaches it only through BACKLIGHT, and its shadow ray then leaves from hit_pos_back, on
+// that side of the surface.
 vec3 lights_evaluate_direct_lighting(
 		vec3 hit_pos,
+		vec3 hit_pos_back,
+		vec3 geometry_normal,
 		vec3 N,
 		vec3 V,
 		MaterialProperties material,
+		vec3 backlight,
+		bool specular_disabled,
 		inout uint rng_state,
 		bool is_indirect_bounce,
-		uint light_count) {
+		uint light_count,
+		uint layer_mask) {
+	bool has_backlight = any(greaterThan(backlight, vec3(0.0)));
 	if (light_count == 0u) {
 		return vec3(0.0);
 	}
@@ -281,9 +304,12 @@ vec3 lights_evaluate_direct_lighting(
 		uint idx = min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
 		RTLightData test_light = rt_lights[idx];
 
-		// Range check for positional lights.
+		// Range check for positional lights; a light lights only the layers of its cull mask.
 		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT);
 		bool is_valid = !is_positional;
+		if ((test_light.cull_mask & layer_mask) == 0u) {
+			continue;
+		}
 		if (!is_valid) {
 			vec3 to_l = test_light.position - hit_pos;
 			float d2 = dot(to_l, to_l);
@@ -350,7 +376,9 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
+		bool through = has_backlight && dot(geometry_normal, L) < 0.0;
+		float visibility = lights_shadow_visibility(light, through ? hit_pos_back : hit_pos, L, shadow_dist, rng_state);
+		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
 
@@ -363,13 +391,16 @@ vec3 lights_evaluate_direct_lighting(
 		ls_atten.distance_sq = dist_sq;
 		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation) * spot_atten;
 
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+		float spec_mul = specular_disabled ? 0.0 : lights_get_specular_multiplier(light.specular_amount, material.roughness);
 		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+		if (has_backlight) {
+			brdf_value += lights_backlight_term(brdf_diffuse, material, backlight);
+		}
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
+		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * visibility;
 		return contribution / max(light_select_pdf, 1e-10);
 	}
 	// === CONE LIGHT PATH (directional) ===
@@ -378,23 +409,33 @@ vec3 lights_evaluate_direct_lighting(
 		float light_pdf;
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
 
-		float NdotL = dot(N, L);
-		if (NdotL <= 0.0) {
+		if (!has_backlight && dot(N, L) <= 0.0) {
 			return vec3(0.0);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
+		// Before the shadow ray: where the projector is black (a cloud's full shadow) there is nothing to trace.
+		vec3 projector = lights_directional_projector(light, hit_pos);
+		if (all(lessThanEqual(projector, vec3(0.0)))) {
+			return vec3(0.0);
+		}
+
+		bool through = has_backlight && dot(geometry_normal, L) < 0.0;
+		float visibility = lights_shadow_visibility(light, through ? hit_pos_back : hit_pos, L, ls.max_distance, rng_state);
+		if (visibility <= 0.0) {
 			return vec3(0.0);
 		}
 
 		vec3 brdf_diffuse, brdf_specular;
 		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
 
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+		float spec_mul = specular_disabled ? 0.0 : lights_get_specular_multiplier(light.specular_amount, material.roughness);
 		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+		if (has_backlight) {
+			brdf_value += lights_backlight_term(brdf_diffuse, material, backlight);
+		}
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * projector * indirect_mul * visibility / max(light_select_pdf, 1e-10);
 	}
 }

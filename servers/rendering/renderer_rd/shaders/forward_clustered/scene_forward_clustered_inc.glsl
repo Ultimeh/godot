@@ -222,6 +222,7 @@ layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 #define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSIL (1 << 1)
 #define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSR (1 << 2)
 #define SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR (1 << 3)
+#define SCREEN_SPACE_EFFECTS_FLAGS_FRONT_LAYER_REFLECTION (1 << 4)
 
 layout(set = 0, binding = 3, std430) restrict readonly buffer OmniLights {
 	LightData data[];
@@ -563,6 +564,11 @@ layout(set = 1, binding = 34) uniform texture2D ssil_buffer;
 layout(set = 1, binding = 35) uniform texture2D ssr_buffer;
 layout(set = 1, binding = 36) uniform texture2D ssr_mip_level_buffer;
 #endif // USE_MULTIVIEW
+
+// The projector of the directional light whose projector_enabled is set (white when none).
+layout(set = 1, binding = 42) uniform texture2D directional_light_projector;
+#define USE_DIRECTIONAL_LIGHT_PROJECTOR
+#include "../directional_light_projector_inc.glsl"
 
 #endif
 

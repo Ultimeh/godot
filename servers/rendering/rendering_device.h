@@ -946,6 +946,8 @@ public:
 		BUFFER_CREATION_AS_STORAGE_BIT = (1 << 1),
 		BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT = (1 << 2),
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 3),
+		// Read by an opacity micromap build (opacity_micromap_create()), storage buffers only. Not exposed to scripts.
+		BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT = (1 << 4),
 	};
 
 	enum StorageBufferUsage {
@@ -1422,7 +1424,7 @@ private:
 		HashSet<RID> acceleration_structure_dependencies;
 		bool invalidated = true;
 
-		// Scratch buffer used during build, owned by the AS.
+		// Scratch buffer used during build, owned by a TLAS (a BLAS's is a range of the frame's scratch).
 		RDD::BufferID scratch_buffer;
 
 		// --- Bottom Level ---
@@ -1443,6 +1445,23 @@ private:
 	};
 
 	Error _acceleration_structure_scratch_buffer_create(AccelerationStructure *p_acceleration_structure);
+
+	// The scratch memory of the BLAS builds and refits recorded in a frame: each takes a range of its own (concurrent builds
+	// need disjoint scratch memory), and the frame slot's ranges are free again once the GPU finished it. A buffer per BLAS
+	// was a GPU allocation per build (most of the render thread's time when merged MultiMeshes change every frame), and
+	// every refit BLAS kept its own for its whole life.
+	struct AccelerationStructureScratch {
+		LocalVector<RDD::BufferID> chunks;
+		LocalVector<uint64_t> chunk_sizes;
+		uint32_t chunk = 0; // The one the next range comes from.
+		uint64_t offset = 0; // In it.
+		uint64_t used = 0; // Since the slot was last reset, in all chunks.
+		uint64_t next_chunk_size = 0; // At least, for the next chunk made: the capacity of those consolidated into it.
+		uint32_t underused_frames = 0;
+	};
+	Error _acceleration_structure_scratch_allocate(uint64_t p_size, RDD::BufferID &r_buffer, uint64_t &r_offset);
+	void _acceleration_structure_scratch_reset(AccelerationStructureScratch &r_scratch);
+	void _acceleration_structure_scratch_free(AccelerationStructureScratch &r_scratch);
 	void _blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id);
 	void _tlas_remove_blas_dependencies(AccelerationStructure *p_tlas, RID p_tlas_id);
 
@@ -1467,6 +1486,17 @@ public:
 			RID index_buffer;
 			uint32_t index_offset = 0;
 			uint32_t index_count = 0;
+			// An opacity micromap (opacity_micromap_create()), or none. Each triangle's entry index (or
+			// OpacityMicromapSpecialIndex), plus opacity_micromap_base_triangle, in a storage buffer made with
+			// BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT, or
+			// without one the triangle's own index; how many triangles reference entries of each subdivision level and
+			// format (the special indices not counted).
+			RID opacity_micromap;
+			RID opacity_micromap_index_buffer;
+			uint32_t opacity_micromap_index_offset = 0;
+			IndexBufferFormat opacity_micromap_index_format = INDEX_BUFFER_FORMAT_UINT32;
+			uint32_t opacity_micromap_base_triangle = 0;
+			Vector<OpacityMicromapUsage> opacity_micromap_usages;
 		};
 
 		// Procedural geometry: buffer of float3 (min, max) AABB pairs.
@@ -1495,6 +1525,14 @@ public:
 	RID blas_create(Span<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags);
 	RID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags);
 
+	// An opacity micromap (SUPPORTS_OPACITY_MICROMAP): the entries p_usages counts, each described by 8 bytes in
+	// p_triangle_buffer (see OpacityMicromapFormat), their states in p_data_buffer; both storage buffers made with
+	// BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT, both offsets
+	// multiples of OPACITY_MICROMAP_INPUT_ALIGNMENT. Build it (opacity_micromap_build()) before the BLASes that
+	// reference it; freeing it (or one of its buffers) frees them.
+	RID opacity_micromap_create(Span<OpacityMicromapUsage> p_usages, RID p_data_buffer, uint32_t p_data_offset, RID p_triangle_buffer, uint32_t p_triangle_offset);
+	Error opacity_micromap_build(RID p_opacity_micromap);
+
 	typedef int64_t HitShaderBindingTableRange;
 
 	struct AccelerationStructureInstance {
@@ -1507,8 +1545,21 @@ public:
 	};
 
 	Error blas_build(RID p_blas);
+	// False once freed, including by a freed dependency (a mesh buffer the BLAS was built from).
+	bool acceleration_structure_is_valid(RID p_acceleration_structure);
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
+
+	// Instances in a buffer of the caller's: a storage buffer made with BUFFER_CREATION_DEVICE_ADDRESS_BIT and
+	// BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT, filled by buffer_update() with
+	// tlas_instances_encode()'s bytes, or by a shader when tlas_instance_layout_is_standard().
+	uint32_t tlas_get_instance_size() const;
+	// The Vulkan / D3D12 instance layout (RDD::API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT).
+	bool tlas_instance_layout_is_standard() const;
+	// p_instances in the driver's layout, tlas_get_instance_size() bytes each; their BLASes must be built.
+	Error tlas_instances_encode(Span<AccelerationStructureInstance> p_instances, uint8_t *r_data);
+	// The first p_instance_count instances of p_instance_buffer; p_blases: every BLAS they reference.
+	Error tlas_build_from_buffer(RID p_tlas, RID p_instance_buffer, uint32_t p_instance_count, Span<RID> p_blases);
 
 private:
 	/**********************************/
@@ -1704,6 +1755,9 @@ public:
 	void draw_list_bind_vertex_array(DrawListID p_list, RID p_vertex_array);
 	void draw_list_bind_vertex_buffers_format(DrawListID p_list, VertexFormatID p_vertex_format, uint32_t p_vertex_count, const Span<RID> &p_vertex_buffers, const Span<uint64_t> &p_offsets = Vector<uint64_t>());
 	void draw_list_bind_index_array(DrawListID p_list, RID p_index_array);
+	// A buffer the draw list's shaders read without a binding (through its address): its writes recorded earlier come
+	// before the draw list.
+	void draw_list_add_buffer_dependency(DrawListID p_list, RID p_buffer);
 	void draw_list_set_line_width(DrawListID p_list, float p_width);
 	void draw_list_set_push_constant(DrawListID p_list, const void *p_data, uint32_t p_data_size);
 
@@ -1846,6 +1900,8 @@ public:
 	void compute_list_dispatch_threads(ComputeListID p_list, uint32_t p_x_threads, uint32_t p_y_threads, uint32_t p_z_threads);
 	void compute_list_dispatch_indirect(ComputeListID p_list, RID p_buffer, uint32_t p_offset);
 	void compute_list_add_barrier(ComputeListID p_list);
+	// A buffer the list's shaders read or write through its device address, which no uniform set declares.
+	void compute_list_add_buffer_dependency(ComputeListID p_list, RID p_buffer, bool p_writable = false);
 
 	void compute_list_end();
 
@@ -1964,6 +2020,8 @@ private:
 		List<ComputePipeline> compute_pipelines_to_dispose_of;
 		List<AccelerationStructure> acceleration_structures_to_dispose_of;
 		List<RaytracingPipeline> raytracing_pipelines_to_dispose_of;
+
+		AccelerationStructureScratch acceleration_structure_scratch;
 
 		// Pending asynchronous data transfer for buffers.
 		LocalVector<RDD::BufferID> download_buffer_staging_buffers;

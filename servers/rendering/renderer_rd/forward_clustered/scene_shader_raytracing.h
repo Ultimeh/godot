@@ -33,6 +33,8 @@
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h" // IWYU pragma: keep
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_displace.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_omm_bake.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl.gen.h"
 
 namespace RendererSceneRenderImplementation {
@@ -98,7 +100,9 @@ public:
 	static constexpr int RT_PARAM_SAMPLE_COUNT = 1;
 	static constexpr int RT_PARAM_MAX_BOUNCES = 2;
 	static constexpr int RT_PARAM_DENOISER = 3;
-	// Indices 4-13 reserved for future use.
+	static constexpr int RT_PARAM_FRONT_LAYER_COUNT = 4;
+	static constexpr int RT_PARAM_DECAL_COUNT = 5;
+	// Indices 6-13 reserved for future use.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 
@@ -347,11 +351,13 @@ public:
 		ShaderLanguage::ShaderNode::Uniform::Hint hint = ShaderLanguage::ShaderNode::Uniform::HINT_NONE;
 		bool use_color = false;
 		bool is_global = false;
+		bool is_array = false; // sampler2DArray: index into the texture array table.
 		uint32_t buffer_offset = 0; // Stored as bindless index in UBO
 	};
 
 	// Preprocessed custom HG GLSL (templates filled per compile). One entry per slot, all variants.
 	struct CustomShaderEntry {
+		String defines; // The compiler's defines the RT templates honor (vertex space).
 		String vertex_code;
 		String fragment_code;
 		String fragment_globals;
@@ -363,8 +369,16 @@ public:
 		HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniforms;
 		Vector<TextureUniformInfo> texture_uniforms; // Sampler2D packed as bindless indices after UBO
 		bool uses_alpha_clip = false; // Writes ALPHA_SCISSOR_THRESHOLD; needs per-HG any-hit
+		bool writes_vertex = false; // vertex() moves VERTEX or writes MODELVIEW_MATRIX: the BLAS needs the displaced positions.
+		bool writes_modelview = false; // vertex() writes MODELVIEW_MATRIX (billboards): raster draws VERTEX through it.
+		bool uses_vertex_time = false;
+		bool vertex_reads_camera = false; // vertex() reads the view or projection.
+		Vector<ShaderCompiler::GeneratedCode::Varying> varyings; // Interpolated by the hit shaders on displaced geometry.
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
+		// Its cut-out can be baked into an opacity micromap per surface (rt_alpha_dependencies()); COLOR reaches it.
+		bool alpha_bakeable = false;
+		bool alpha_reads_color = false;
 	};
 
 	// 128-bit identity (dual hash64 with distinct salt). Treated as source equality.
@@ -397,6 +411,8 @@ public:
 	};
 
 	LocalVector<HitGroupSlot> hit_group_slots;
+	uint32_t pipeline_swap_count = 0; // Pipelines rebuilt and swapped in (GODOT_RT_LOG_CACHES).
+	bool usable = false;
 	HashMap<SourceHash128, uint32_t, SourceHash128Hasher> source_hash_to_slot;
 
 	// One RD RT pipeline variant (rt_flags key). Owns base + per-slot HG shaders (RG+miss baked in per HG).
@@ -415,6 +431,8 @@ public:
 
 		bool dirty = false;
 		bool initial_pipeline_built = false;
+		// The frame a view last traced with it (-1: never, as init()'s probe); only bundles in use are rebuilt.
+		int64_t last_used_frame = -1;
 	};
 
 	HashMap<uint32_t, PipelineBundle> pipeline_bundles;
@@ -432,12 +450,21 @@ public:
 
 	const CustomShaderEntry *get_custom_shader_entry(uint32_t p_slot_index) const;
 	uint32_t get_hit_group_slot_count() const { return hit_group_slots.size(); }
+	uint32_t get_pipeline_swap_count() const { return pipeline_swap_count; }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+
+	// Compute pipeline running the slot's vertex() on every vertex (raytracing_displace.glsl); invalid if the slot
+	// does not displace or failed to compile. Compiled on first use.
+	RID get_displace_pipeline(uint32_t p_slot_index, RID &r_shader);
+	// The program baking a slot's cut-out into opacity micromaps (raytracing_omm_bake.glsl); invalid when the slot's
+	// cut-out cannot be baked (CustomShaderEntry::alpha_bakeable) or failed to compile.
+	RID get_omm_bake_pipeline(uint32_t p_slot_index, RID &r_shader);
 	void drain_completed_compiles();
 	void finalize_custom_shaders();
 
-	const PipelineBundle &ensure_pipeline_bundle(uint32_t p_rt_flags);
+	// p_mark_used: a view traces with it this frame (its hit groups are then compiled first).
+	const PipelineBundle &ensure_pipeline_bundle(uint32_t p_rt_flags, bool p_mark_used = true);
 
 	RID get_raytracing_pipeline(uint32_t p_rt_flags) { return ensure_pipeline_bundle(p_rt_flags).pipeline; }
 	RID get_hit_sbt(uint32_t p_rt_flags) { return ensure_pipeline_bundle(p_rt_flags).hit_sbt; }
@@ -451,7 +478,7 @@ private:
 	uint32_t _register_slot(uint32_t p_shader_id, RID p_material, bool p_is_procedural);
 	bool _preprocess_shader(RID p_material, bool p_is_procedural, CustomShaderEntry &r_entry);
 	void _strip_texture_globals(String &r_globals, const String &p_tex_name);
-	void _finalize_uniforms_with_textures(CustomShaderEntry &r_entry, const ShaderCompiler::GeneratedCode &p_gen_code, const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, bool p_strip_intersection_globals);
+	bool _finalize_uniforms_with_textures(CustomShaderEntry &r_entry, const ShaderCompiler::GeneratedCode &p_gen_code, const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, bool p_strip_intersection_globals);
 
 	// Bundle build / rebuild.
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
@@ -463,6 +490,8 @@ private:
 	void _dispatch_next_locked(); // CompileLane::mutex MUST be held.
 	void _build_pipeline_worker(PipelineBuildTask *p_task);
 	static void _build_pipeline_worker_static(void *p_userdata);
+	void _load_hit_group_from_cache(uint32_t p_index, PipelineBuildTask *p_task);
+	void _compile_hit_group(uint32_t p_index, PipelineBuildTask *p_task);
 	void _finalize_pipeline_build(PipelineBuildTask *p_task);
 	void _drain_lane_inline_main_thread();
 	void _join_lane_for_shutdown();
@@ -470,9 +499,10 @@ private:
 
 	// Eager/late stage assembly bits cached per variant for compile workers.
 	struct VariantCompileContext {
-		Vector<RD::ShaderStageSPIRVData> base_non_hit_stages; // RAYGEN + MISS spirv.
-		RD::ShaderStageSPIRVData base_any_hit_stage; // Used when slot doesn't override AH.
-		bool base_any_hit_valid = false;
+		// The variant's stages (CH and AH: hit group 0's); their SPIR-V (RAYGEN + MISS, and the AH of hit groups without
+		// their own) is compiled by the first worker that misses the binary cache.
+		Vector<String> base_sources;
+		String base_sources_key; // Their hash, part of every hit group's cache key.
 		String ch_template; // Template GLSL with /* RT_CUSTOM_* */ markers.
 		String ah_template;
 		String is_template;
@@ -481,9 +511,36 @@ private:
 
 	bool _ensure_variant_compile_context(uint32_t p_rt_flags);
 
+	RaytracingDisplaceShaderRD displace_shader;
+	RID displace_shader_version;
+	String displace_template;
+	struct DisplaceProgram {
+		RID shader;
+		RID pipeline;
+		bool failed = false;
+	};
+	LocalVector<DisplaceProgram> displace_programs; // Parallel to hit_group_slots.
+
+	// Opacity micromap bakes: the template, and its program per hit group slot (slot 0: BaseMaterial3D's alpha).
+	RaytracingOmmBakeShaderRD omm_bake_shader;
+	RID omm_bake_shader_version;
+	String omm_bake_template;
+	LocalVector<DisplaceProgram> omm_bake_programs; // Parallel to hit_group_slots.
+
 	bool async_compilation_enabled = true;
-	Mutex spirv_compile_mutex; // Serialize glslang calls (RD::shader_compile_spirv_from_source).
 	CompileLane compile_lane;
+
+	// The binaries compiled from material code (hit groups, displacement and opacity micromap bake programs) and the
+	// variants' base, which ShaderRD does not cache: in <shader cache>/SceneShaderRaytracing, keyed on their full
+	// sources, the engine version and the API, as ShaderRD keys its own. Translating them (Mesa's SPIR-V to DXIL on
+	// D3D12) took seconds at every launch, the materials traced with a neutral fallback meanwhile.
+	String binary_cache_dir; // Empty: no cache (shader cache disabled).
+	String binary_cache_api; // In the file names, as ShaderRD's.
+	static String _binary_cache_key(const String &p_name, const Vector<String> &p_sources, const String &p_extra = String());
+	Vector<uint8_t> _binary_cache_load(const String &p_key) const;
+	void _binary_cache_save(const String &p_key, const Vector<uint8_t> &p_binary) const;
+	// One compute program from p_source, through the cache.
+	Vector<uint8_t> _compile_compute_binary(const String &p_source, const String &p_name) const;
 
 public:
 	void invalidate_pipeline_bundles();
@@ -521,6 +578,9 @@ public:
 	~SceneShaderRaytracing();
 
 	void init(const String p_defines);
+	// False when the base ray tracing pipeline could not be built (shader translation or pipeline creation failed):
+	// the path tracer then stays off and the views are rasterized.
+	bool is_usable() const { return usable; }
 	void set_default_specialization(const ShaderSpecialization &p_specialization);
 	void enable_advanced_shader_group(bool p_needs_multiview = false);
 	bool is_multiview_shader_group_enabled() const;

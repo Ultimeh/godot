@@ -573,15 +573,21 @@ void vertex_shader(in vec3 vertex,
 			if (directional_lights.data[i].bake_mode == LIGHT_BAKE_STATIC && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_LIGHTMAP)) {
 				continue; // Statically baked light and object uses lightmap, skip.
 			}
+			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
+#ifdef USE_DIRECTIONAL_LIGHT_PROJECTOR
+			if (directional_lights.data[i].projector_enabled != 0u) {
+				directional_color *= directional_light_projector_color_lod(directional_lights.data[i].projector_uv_x, directional_lights.data[i].projector_uv_y, vertex);
+			}
+#endif
 			if (i == 0) {
 				light_compute_vertex(normal, hvec3(directional_lights.data[0].direction), view,
-						hvec3(directional_lights.data[0].color * directional_lights.data[0].energy),
+						hvec3(directional_color),
 						true, roughness,
 						directional_diffuse,
 						directional_specular);
 			} else {
 				light_compute_vertex(normal, hvec3(directional_lights.data[i].direction), view,
-						hvec3(directional_lights.data[i].color * directional_lights.data[i].energy),
+						hvec3(directional_color),
 						true, roughness,
 						diffuse_light.rgb,
 						specular_light.rgb);
@@ -2134,8 +2140,15 @@ void main() {
 
 			float size_A = sc_use_light_soft_shadows() ? directional_lights.data[i].size : 0.0;
 
+			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
+#ifdef USE_DIRECTIONAL_LIGHT_PROJECTOR
+			if (directional_lights.data[i].projector_enabled != 0u) {
+				directional_color *= directional_light_projector_color(directional_lights.data[i].projector_uv_x, directional_lights.data[i].projector_uv_y, vertex, vertex_ddx, vertex_ddy);
+			}
+#endif
+
 			light_compute(normal, hvec3(directional_lights.data[i].direction), view, saturateHalf(size_A),
-					hvec3(directional_lights.data[i].color * directional_lights.data[i].energy * tint),
+					hvec3(directional_color * tint),
 					true, shadow, f0, roughness, metallic, half(directional_lights.data[i].specular), albedo, alpha,
 					screen_uv, hvec3(1.0),
 #ifdef LIGHT_BACKLIGHT_USED

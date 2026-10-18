@@ -18,6 +18,13 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
+// A shadow ray goes toward the light: the faces raster's shadow pass draws, turned to the light, are hit from behind.
+#define RT_SHADOW_RAY_FLAGS gl_RayFlagsCullFrontFacingTrianglesEXT
+
+// TLAS instance masks (RT_INSTANCE_MASK_* in render_raytracing.h).
+#define RT_MASK_CAMERA 0x01
+#define RT_MASK_SHADOW 0x02
+#define RT_MASK_FRONT_LAYER 0x04
 
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;
@@ -26,7 +33,7 @@ layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 scene_data_block;
 
 layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
-	vec4 data[256];
+	vec4 data[];
 }
 global_shader_uniforms;
 
@@ -53,6 +60,8 @@ layout(set = 0, binding = 9, rgba16f) uniform image2D dlss_rr_diffuse_albedo;
 layout(set = 0, binding = 10, rgba16f) uniform image2D dlss_rr_specular_albedo;
 layout(set = 0, binding = 11, rgba16f) uniform image2D dlss_rr_normal_roughness;
 layout(set = 0, binding = 12, r16f) uniform image2D dlss_rr_specular_hit_dist;
+// NDC depth for Ray Reconstruction (RenderRaytracing::dlss_rr_get_depth()), written by the raygen.
+layout(set = 0, binding = 39, r32f) uniform image2D dlss_rr_depth;
 #endif
 
 // Binding 14 is reserved for GlobalShaderUniformData (declared above).

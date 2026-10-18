@@ -3262,22 +3262,50 @@
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/displacement_update_distance" type="float" setter="" getter="" default="30.0">
+			Distance from the camera within which the path tracer updates every frame a mesh surface whose material's [code]vertex()[/code] function keeps moving it: it uses [code]TIME[/code], reads the moving camera, or has a shader parameter set every frame (such as a terrain's geomorphing). Beyond this distance the surface is updated once every [code]N[/code] frames, [code]N[/code] being its distance divided by this value, up to 8, which saves the evaluation of its vertices and the rebuild of its acceleration structure on the other frames. Set to [code]0.0[/code] to update every such surface every frame.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/multimesh_blas_cache_ttl_frames" type="int" setter="" getter="" default="3600">
 			Number of frames a merged MultiMesh BLAS is kept alive in the path tracer cache after its last visible frame. At 60 fps, the default of 3600 corresponds to approximately one minute. Once this threshold is exceeded the BLAS and all merged vertex, attribute, and index buffers are freed. Decrease this value to reclaim GPU memory when MultiMeshes disappear from the scene.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/multimesh_blas_cache_unused_size_mb" type="int" setter="" getter="" default="256">
+			Size in mebibytes of the merged vertex, attribute and index buffers the path tracer keeps for MultiMeshes no view traced in the last 60 frames, so that they need not be merged and built again when the camera comes back (their BLASes take about as much memory again). Beyond it the least recently traced are freed first, before [member rendering/pathtracing/multimesh_blas_cache_ttl_frames] expires. Increase it when the camera often returns to scenes with many MultiMeshes and video memory allows; decrease it to reclaim video memory.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/multimesh_cache_cpu_transforms" type="bool" setter="" getter="" default="false">
-			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. This lets the path tracer read the per-instance transforms of a MultiMesh it cannot merge into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]; meshes with compressed attributes are never merged) without copying the GPU buffer back: that copy is asynchronous, and the MultiMesh is traced from the next frame on.
+			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. With a rendering driver that cannot write acceleration structure instances on the GPU (Vulkan and Direct3D 12 can), this lets the path tracer read the per-instance transforms of a MultiMesh it traces as one TLAS instance per instance without copying the GPU buffer back. That copy is asynchronous, and the MultiMesh is traced from the next frame on; when [member MultiMesh.buffer] is set again before the copy arrives, the MultiMesh keeps a CPU-side mirror from then on, as with this setting.
 			[b]Warning:[/b] Enabling this setting increases CPU memory usage. Every [MultiMesh] that assigns [member MultiMesh.buffer] will maintain a full duplicate of its transform data in RAM.
 			Enable this only when such a [MultiMesh] must be traced on the very frame it appears.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/multimesh_displacement_distance" type="float" setter="" getter="" default="30.0">
+			Distance from the camera within which the path tracer runs the [code]vertex()[/code] function of a [MultiMesh]'s material on its instances, as the rasterizer does, so that effects such as grass swaying in the wind are traced. The MultiMesh's acceleration structure is then refitted every frame its shader uses [code]TIME[/code] or reads the moving camera. Within this distance such a MultiMesh is merged into a single BLAS (see [member rendering/pathtracing/multimesh_merged_blas_max_triangles]), which holds the displaced vertices; beyond it, its instances are traced at their rest positions, one TLAS instance each. Set to [code]0.0[/code] to disable.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/multimesh_lod_switch_triangles_per_frame" type="int" setter="" getter="" default="1048576">
+			Number of triangles the path tracer builds again per frame for merged MultiMeshes that only switch to another LOD. A zoom switches many of them at once, each a full build of its acceleration structure on the GPU: beyond this budget, the next ones keep their current LOD for another frame, spreading the work over the following frames. A MultiMesh whose instance count changes is built again anyway and switches its LOD regardless. Decrease it to smooth the GPU load during zooms; increase it to make distant MultiMeshes reach their new LOD sooner.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/multimesh_merged_blas_max_triangles" type="int" setter="" getter="" default="65536">
-			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. When the combined triangle count exceeds this value, the path tracer falls back to one TLAS entry per instance sharing a common BLAS instead. Lower this value to reduce peak GPU memory for large MultiMeshes; raise it to prefer the merged path (which avoids per-instance TLAS overhead).
+			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. The path tracer traces a MultiMesh as one TLAS instance per instance, sharing its mesh's BLAS, the instances written on the GPU from the MultiMesh's buffer; it merges only a MultiMesh whose material moves its vertices within [member rendering/pathtracing/multimesh_displacement_distance], since only a merged BLAS holds displaced vertices. Beyond this triangle count, such a MultiMesh is traced as one TLAS instance per instance too, at its rest positions. Lower this value to reduce peak GPU memory for large displaced MultiMeshes.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/opacity_micromap_subdivision_level" type="int" setter="" getter="" default="6">
+			Subdivision level of the opacity micromaps the path tracer bakes (see [member rendering/pathtracing/opacity_micromaps]): each triangle is divided into [code]4^level[/code] micro-triangles, each known opaque, known transparent or left to the material's alpha test. Higher levels skip more alpha tests along detailed cut-outs, at [code]4^level / 4[/code] bytes per alpha-tested triangle (1 KiB at the default of 6) and a longer bake. A surface of many triangles is subdivided less, so that its micromap stays within 16 MiB.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/opacity_micromaps" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the path tracer bakes the cut-out of alpha-tested surfaces (alpha scissor, [code]discard[/code]) into opacity micromaps when the rendering device supports them, so that rays skip the alpha test wherever a part of a triangle is known to be opaque or transparent. A material's cut-out is baked only when it depends on nothing but the surface's vertex attributes, the material's parameters and textures, and constants: not on time, the camera, the instance or global shader parameters. The decision is taken at the textures' full resolution: a distant ray reading a smaller mipmap may see the edges of a cut-out slightly differently than without micromaps.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/static_cache_ttl_frames" type="int" setter="" getter="" default="3600">
+			Number of frames the path tracer keeps the BLAS of a static mesh surface, and the data of a material, after the last frame it traced them. At 60 fps, the default of 3600 corresponds to approximately one minute. A level left behind, or meshes and materials a game rebuilds, are freed after that instead of staying until no view path traces anymore. Decrease this value to reclaim GPU memory sooner; increase it to avoid rebuilding acceleration structures when returning to a place.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
-			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
+			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SER reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SER, nor where the rendering device cannot use it (Direct3D 12 for now).
 		</member>
 		<member name="rendering/pathtracing/use_simple_shadows" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], shadow rays use Ray Queries instead of fully traced rays. Ray Queries are significantly cheaper but rely on a quick alpha texture fetch, which can produce incorrect shadows on materials with generated/animated alpha textures. Fully traced shadow rays are more accurate but incur a higher GPU cost.
@@ -3328,12 +3356,12 @@
 		<member name="rendering/renderer/rendering_method.web" type="String" setter="" getter="" default="&quot;gl_compatibility&quot;">
 			Override for [member rendering/renderer/rendering_method] on web.
 		</member>
-		<member name="rendering/rendering_device/d3d12/agility_sdk_version" type="int" setter="" getter="" default="618">
+		<member name="rendering/rendering_device/d3d12/agility_sdk_version" type="int" setter="" getter="" default="619">
 			Version code of the [url=https://devblogs.microsoft.com/directx/directx12agility/]Direct3D 12 Agility SDK[/url] to use ([code]D3D12SDKVersion[/code]). This must match the [i]minor[/i] version that is installed next to the editor binary and in the export templates directory for the current editor version. For example, if you have [code]1.618.5[/code] installed, you need to input [code]618[/code] here.
 		</member>
-		<member name="rendering/rendering_device/d3d12/max_resource_descriptors" type="int" setter="" getter="" default="65536">
+		<member name="rendering/rendering_device/d3d12/max_resource_descriptors" type="int" setter="" getter="" default="262144">
 			The number of entries in the resource descriptor heap the Direct3D 12 rendering driver uses for most rendering operations.
-			Depending on the complexity of scenes, this value may be lowered or may need to be raised.
+			Depending on the complexity of scenes, this value may be lowered or may need to be raised. Path tracing holds descriptors for the buffers its shaders read by address and for each merged [MultiMesh]: a scene with thousands of MultiMeshes needs more than the 65536 raster scenes do.
 		</member>
 		<member name="rendering/rendering_device/d3d12/max_sampler_descriptors" type="int" setter="" getter="" default="1024">
 			The number of entries in the sampler descriptor heap the Direct3D 12 rendering driver uses for most rendering operations.

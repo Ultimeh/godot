@@ -369,6 +369,8 @@ void *Streamline::get_internal_parameter(StreamlineInternalParameterType p_inter
 			return StreamlineContext::get().func_D3D12GetInterface;
 		case STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12CreateDevice:
 			return StreamlineContext::get().func_D3D12CreateDevice;
+		case STREAMLINE_INTERNAL_PARAMETER_FUNC_slUpgradeInterface:
+			return StreamlineContext::get().func_slUpgradeInterface;
 		case STREAMLINE_INTERNAL_PARAMETER_FUNC_DXGIGetDebugInterface1:
 			return StreamlineContext::get().func_DXGIGetDebugInterface1;
 		case STREAMLINE_INTERNAL_PARAMETER_FUNC_CreateDXGIFactory:

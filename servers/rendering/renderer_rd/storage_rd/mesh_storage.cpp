@@ -1840,6 +1840,10 @@ const float *MeshStorage::multimesh_get_local_data_ptr_async(RID p_multimesh) {
 }
 
 void MeshStorage::_multimesh_local_data_arrived(const Vector<uint8_t> &p_data, RID p_multimesh, RID p_buffer, uint64_t p_version) {
+	// RenderingDevice delivers the copies still on their way when the screen is freed, after the storage is gone.
+	if (!get_singleton()) {
+		return;
+	}
 	MultiMesh *multimesh = get_singleton()->multimesh_owner.get_or_null(p_multimesh);
 	if (!multimesh) {
 		return;
@@ -2261,7 +2265,17 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 	}
 
 	if (multimesh->data_cache.is_empty()) {
-		multimesh->gpu_data_version++; // A copy of the buffer on its way (multimesh_get_local_data_ptr_async()) is stale.
+		if (multimesh->local_data_requested) {
+			// The path tracer waits for a copy of the buffer (multimesh_get_local_data_ptr_async()) that this call makes
+			// stale: a buffer set every frame would never be traced. The data is here; it keeps a CPU copy from now on.
+			// The previous instances are the current ones for this first frame (no motion), copied below.
+			_multimesh_make_local_from(multimesh, nullptr, 0);
+			if (multimesh->motion_vectors_enabled) {
+				memcpy(multimesh->data_cache.ptrw() + multimesh->motion_vectors_previous_offset * multimesh->stride_cache, p_buffer.ptr(), p_buffer.size() * sizeof(float));
+			}
+		} else {
+			multimesh->gpu_data_version++; // A copy of the buffer on its way (multimesh_get_local_data_ptr_async()) is stale.
+		}
 	}
 	if (multimesh->data_cache.size()) {
 		float *cache_data = multimesh->data_cache.ptrw();

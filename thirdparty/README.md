@@ -450,6 +450,8 @@ Patches:
 
 - `0001-apple-disable-absolute-paths.patch` ([GH-92010](https://github.com/godotengine/godot/pull/92010))
 - `0002-apple-m1-msaa-fix.patch` ([GH-115893](https://github.com/godotengine/godot/issues/115893))
+- `0004-opacity-micromap-ray-queries.patch` (fork: `GL_EXT_opacity_micromap` declares `RayTracingOpacityMicromapEXT`
+  for ray queries in any stage, which D3D12's translation needs to allocate them with opacity micromaps allowed)
 
 
 ## graphite

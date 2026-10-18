@@ -71,6 +71,7 @@ protected:
 		RENDER_PASS_UNIFORM_SET = 1,
 		TRANSFORMS_UNIFORM_SET = 2,
 		MATERIAL_UNIFORM_SET = 3,
+		RT_SHADOW_TEXTURES_UNIFORM_SET = 4, // The path tracer's material textures, in its transparent pass (USE_RT_SHADOWS).
 	};
 
 	enum {
@@ -228,6 +229,7 @@ protected:
 		COLOR_PASS_FLAG_SEPARATE_SPECULAR = 1 << 1,
 		COLOR_PASS_FLAG_MULTIVIEW = 1 << 2,
 		COLOR_PASS_FLAG_MOTION_VECTORS = 1 << 3,
+		COLOR_PASS_FLAG_RT_SHADOWS = 1 << 4, // The path tracer's transparent pass, with rt_shadow_tlas.
 	};
 
 	struct RenderElementInfo;
@@ -250,6 +252,8 @@ protected:
 		uint32_t element_offset = 0;
 		bool use_directional_soft_shadow = false;
 		SceneShaderForwardClustered::ShaderSpecialization base_specialization = {};
+		RID rt_shadow_texture_uniform_set; // COLOR_PASS_FLAG_RT_SHADOWS: RT_SHADOW_TEXTURES_UNIFORM_SET.
+		const LocalVector<RID> *buffer_dependencies = nullptr; // Read through their addresses (RD::draw_list_add_buffer_dependency()).
 
 		RenderListParameters() = default;
 		RenderListParameters(GeometryInstanceSurfaceDataCache **p_elements, RenderElementInfo *p_element_info, int p_element_count, bool p_reverse_cull, PassMode p_pass_mode, uint32_t p_color_pass_flags, bool p_no_gi, bool p_use_directional_soft_shadows, RID p_render_pass_uniform_set, bool p_force_wireframe = false, const Vector2 &p_uv_offset = Vector2(), float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, uint32_t p_view_count = 1, uint32_t p_element_offset = 0, SceneShaderForwardClustered::ShaderSpecialization p_base_specialization = {}) {
@@ -634,6 +638,14 @@ protected:
 	} scene_state;
 
 	static RenderForwardClustered *singleton;
+
+	// The path tracer's front layer reflection (rgb, view depth in alpha), read by its transparent pass in place of SSR.
+	RID front_layer_reflection;
+	// The path tracer's TLAS, which the lights of its transparent pass trace their shadows through (USE_RT_SHADOWS), and
+	// the geometry and materials of its instances, for the alpha test.
+	RID rt_shadow_tlas;
+	RID rt_shadow_geometry_buffer;
+	RID rt_shadow_material_buffer;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
 	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
@@ -1043,6 +1055,7 @@ protected:
 				uint32_t use_32_bit_shadows : 1;
 				uint32_t use_shadow_cubemaps : 1;
 				uint32_t use_shadow_dual_paraboloid : 1;
+				uint32_t use_rt_shadows : 1;
 			};
 		};
 	};
@@ -1403,6 +1416,9 @@ protected:
 		RID specular_albedo;
 		RID normal_roughness;
 		RID specular_hit_dist;
+		RID color_before_transparency;
+		// In place of the depth buffer: a transparent surface's where its reflection dominates (RenderRaytracing::dlss_rr_get_depth()).
+		RID depth;
 	};
 
 	Scale3DMode _resolve_scale_3d_mode(Ref<RenderSceneBuffersRD> p_render_buffers) const;

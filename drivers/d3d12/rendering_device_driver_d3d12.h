@@ -111,6 +111,14 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 		bool aniso_filter_with_point_mip_supported = false;
 	};
 
+	struct RaytracingCapabilities {
+		bool ray_query_supported = false;
+		bool raytracing_pipeline_supported = false;
+		bool shader_execution_reordering_supported = false;
+		// Ray tracing tier 1.2 and Shader Model 6.9, whose ray queries (AllocateRayQuery2) may meet opacity micromaps.
+		bool opacity_micromap_supported = false;
+	};
+
 	RenderingContextDriverD3D12 *context_driver = nullptr;
 	RenderingContextDriver::Device context_device;
 	Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
@@ -127,6 +135,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	BarrierCapabilities barrier_capabilities;
 	MiscFeaturesSupport misc_features_support;
 	SamplerCapabilities sampler_capabilities;
+	RaytracingCapabilities raytracing_capabilities;
 	RenderingShaderContainerFormatD3D12 shader_container_format;
 	String pipeline_cache_id;
 	D3D12_HEAP_TYPE dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_UPLOAD;
@@ -148,9 +157,49 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 		// thread (uniform sets) and by the graph replay (clears), which may run on another thread: they lock this.
 		Mutex *mutex = nullptr;
 
+		// For get_descriptor_report(): the most descriptors allocated at once, and the allocations that did not fit (a
+		// range must be contiguous, so one can fail with enough room in total).
+		uint64_t peak_used = 0;
+		uint32_t failed_allocations = 0;
+		uint32_t last_failed_count = 0;
+		uint64_t last_failed_largest_free = 0;
+
+		// Single descriptors (the GPU pointers of buffers, one per buffer: thousands in a big path traced scene) come from
+		// slabs of contiguous descriptors. Scattered one by one through the heap, they left no free range of the few dozen
+		// descriptors a uniform set needs with a third of the heap free: every failed allocation searched all of it.
+		static constexpr uint32_t SINGLE_SLAB_SIZE = 256;
+		static constexpr uint64_t SINGLE_SLAB_HANDLE_BIT = 1ULL << 63; // In Allocation::virtual_alloc_handle: slab index below.
+		struct SingleSlab {
+			uint64_t virtual_alloc_handle = 0;
+			uint32_t offset = 0;
+			LocalVector<uint16_t> free_slots;
+		};
+		LocalVector<SingleSlab> single_slabs;
+		uint32_t single_slab_with_room = 0; // Where the next single descriptor is looked for first.
+
+		// The uniform sets of a linear pool (one frame's: RenderingDevice resets its pool once the frame is done) take
+		// their descriptors one after the other from chunks kept for that pool, as Vulkan's linear descriptor pools do.
+		// Allocated and freed one by one, hundreds every frame in path tracing searched a heap they fragmented.
+		static constexpr uint32_t LINEAR_CHUNK_SIZE = 4096;
+		static constexpr uint64_t LINEAR_HANDLE_BIT = 1ULL << 62; // In Allocation::virtual_alloc_handle: freed by the pool reset.
+		struct LinearChunk {
+			uint64_t virtual_alloc_handle = 0;
+			uint32_t offset = 0;
+			uint32_t size = 0;
+		};
+		struct LinearPool {
+			LocalVector<LinearChunk> chunks;
+			uint32_t chunk = 0; // The one being filled.
+			uint32_t used = 0; // In it.
+		};
+		LocalVector<LinearPool> linear_pools;
+
 		Error initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible);
 
 		Error allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
+		Error allocate_single(Allocation &r_allocation);
+		Error allocate_linear(uint32_t p_pool_index, uint32_t p_descriptor_count, Allocation &r_allocation);
+		void reset_linear(uint32_t p_pool_index);
 		Error _allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
 		void free(const Allocation &p_allocation);
 	};
@@ -175,6 +224,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 
 	DescriptorHeap resource_descriptor_heap;
 	uint32_t resource_descriptor_heap_capacity = 0; // Its size, for get_descriptor_report().
+	uint32_t device_address_descriptor_count = 0; // Buffers with a GPU pointer descriptor, for get_descriptor_report().
 	DescriptorHeap sampler_descriptor_heap;
 	CPUDescriptorHeapPool resource_descriptor_heap_pool;
 	CPUDescriptorHeapPool rtv_descriptor_heap_pool;
@@ -257,6 +307,10 @@ private:
 
 	struct BufferInfo : public ResourceInfo {
 		D3D12_GPU_VIRTUAL_ADDRESS gpu_virtual_address = {};
+		// A raw UAV of the whole buffer in the shader-visible heap, made the first time its device address is asked for:
+		// a shader reads a GPU pointer (heap index << 32 | offset) through the heap (dxil_spirv_nir_lower_buffer_device_address).
+		DescriptorHeap::Allocation device_address_descriptor;
+		bool has_device_address_descriptor = false;
 		DataFormat texel_format = DATA_FORMAT_MAX;
 		uint64_t size = 0;
 		struct {
@@ -504,11 +558,13 @@ private:
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> cmd_list;
 		D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> cmd_list_1;
+		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd_list_4;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList5> cmd_list_5;
 		Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> cmd_list_7;
 
 		ID3D12PipelineState *graphics_pso = nullptr;
 		ID3D12PipelineState *compute_pso = nullptr;
+		ID3D12StateObject *raytracing_pso = nullptr;
 
 		uint32_t nir_graphics_runtime_data_root_param_idx = UINT32_MAX;
 		uint32_t nir_compute_runtime_data_root_param_idx = UINT32_MAX;
@@ -639,6 +695,7 @@ private:
 			UniformType type = UNIFORM_TYPE_MAX;
 			uint32_t length = UINT32_MAX;
 			bool writable = false;
+			bool unbounded = false; // Runtime-sized array: last of its set, as many descriptors as the uniform set gives.
 			uint32_t resource_descriptor_offset = UINT32_MAX;
 			uint32_t sampler_descriptor_offset = UINT32_MAX;
 			uint32_t root_param_idx = UINT32_MAX;
@@ -669,7 +726,20 @@ private:
 		Microsoft::WRL::ComPtr<ID3D12RootSignatureDeserializer> root_signature_deserializer;
 		const D3D12_ROOT_SIGNATURE_DESC *root_signature_desc = nullptr; // Owned by the deserializer.
 		uint32_t root_signature_crc = 0;
+
+		struct ShaderConfig {
+			uint32_t payload_size_in_bytes = 0;
+			uint32_t attribute_size_in_bytes = 0;
+		};
+
+		HashMap<ShaderStage, ShaderConfig> stages_shader_config;
 	};
+
+	bool _shader_apply_specialization_constants(
+			const ShaderInfo *p_shader_info,
+			VectorView<PipelineSpecializationConstant> p_specialization_constants,
+			ShaderStage p_stage,
+			Vector<uint8_t> &r_bytecode);
 
 	bool _shader_apply_specialization_constants(
 			const ShaderInfo *p_shader_info,
@@ -710,6 +780,7 @@ private:
 
 public:
 	virtual UniformSetID uniform_set_create(VectorView<BoundUniform> p_uniforms, ShaderID p_shader, uint32_t p_set_index, int p_linear_pool_index) override final;
+	virtual void linear_uniform_set_pools_reset(int p_linear_pool_index) override final;
 	virtual void uniform_set_free(UniformSetID p_uniform_set) override final;
 	virtual uint32_t uniform_sets_get_dynamic_offsets(VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count) const override final;
 
@@ -871,24 +942,56 @@ public:
 
 	// ---- ACCELERATION STRUCTURES ----
 
+private:
+	struct AccelerationStructureInfo {
+		TightLocalVector<D3D12_RAYTRACING_GEOMETRY_DESC> geometries;
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc = {};
+		BufferID buffer;
+		uint32_t scratch_buffer_size = 0;
+		LocalVector<BufferInfo *> input_buffer_infos; // For legacy barriers.
+
+		// An opacity micromap array (Inputs.pOpacityMicromapArrayDesc points to omm_array_desc), or the micromaps a BLAS's
+		// geometries reference (their D3D12_RAYTRACING_GEOMETRY_OMM_TRIANGLES_DESC point into omm_triangles / omm_linkages).
+		D3D12_RAYTRACING_OPACITY_MICROMAP_ARRAY_DESC omm_array_desc = {};
+		TightLocalVector<D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY> omm_histogram;
+		TightLocalVector<D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC> omm_triangles;
+		TightLocalVector<D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC> omm_linkages;
+	};
+
+	bool _acceleration_structure_create(AccelerationStructureInfo *r_acceleration_structure_info);
+
+public:
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual AccelerationStructureID tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) override final;
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) override final;
+	virtual AccelerationStructureID opacity_micromap_create(VectorView<OpacityMicromapUsage> p_usages, BufferID p_data_buffer, uint64_t p_data_offset, BufferID p_triangle_buffer, uint64_t p_triangle_offset) override final;
 
 	// ----- PIPELINE -----
+private:
+	struct RaytracingPipelineInfo {
+		Microsoft::WRL::ComPtr<ID3D12StateObject> pso;
+		const ShaderInfo *layout_defining_shader_info = nullptr;
+		TightLocalVector<const void *> shader_identifiers;
+	};
 
+public:
 	virtual RaytracingPipelineID raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) override final;
 	virtual void raytracing_pipeline_free(RaytracingPipelineID p_pipeline) override final;
 
 	virtual bool raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) override final;
 
-	// ----- COMMANDS -----
+private:
+	D3D12_GPU_VIRTUAL_ADDRESS_RANGE _sbt_to_gpu_virtual_address_range(const ShaderBindingTable &p_sbt);
+	D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE _sbt_to_gpu_virtual_address_range_and_stride(const ShaderBindingTable &p_sbt);
 
-	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
-	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
-	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) override final;
+public:
+	// ----- COMMANDS -----
+	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) override final;
+	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) override final;
+	virtual void command_build_opacity_micromap(CommandBufferID p_cmd_buffer, AccelerationStructureID p_opacity_micromap, BufferID p_scratch_buffer, uint64_t p_scratch_offset) override final;
+	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, VectorView<AccelerationStructureID> p_blases) override final;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) override final;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;
@@ -987,6 +1090,8 @@ private:
 			ShaderInfo,
 			UniformSetInfo,
 			RenderPassInfo,
+			AccelerationStructureInfo,
+			RaytracingPipelineInfo,
 			TimestampQueryPoolInfo>;
 	PagedAllocator<VersatileResource, true> resources_allocator;
 

@@ -32,6 +32,7 @@
 
 #ifdef AFTERMATH_ENABLED
 #include "core/config/engine.h"
+#include "core/os/os.h"
 #include "drivers/aftermath/aftermath_context.h"
 #endif
 
@@ -51,7 +52,10 @@ Aftermath::~Aftermath() {
 
 bool Aftermath::is_active() {
 #ifdef AFTERMATH_ENABLED
-	return Engine::get_singleton()->is_generate_spirv_debug_info_enabled();
+	// GODOT_AFTERMATH=1 captures crash dumps without the shaders' debug information, which slows the game down enough to
+	// hide some crashes; the dumps then name shaders by hash only.
+	static const bool forced = OS::get_singleton()->get_environment("GODOT_AFTERMATH") == "1";
+	return forced || Engine::get_singleton()->is_generate_spirv_debug_info_enabled();
 #else
 	return false;
 #endif

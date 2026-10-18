@@ -747,6 +747,7 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 				geom->geometry_instance->set_use_lightmap(RID(), instance->lightmap_uv_scale, instance->lightmap_slice_index);
 				geom->geometry_instance->set_instance_shader_uniforms_offset(instance->instance_uniforms.location());
 				geom->geometry_instance->set_cast_double_sided_shadows(instance->cast_shadows == RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED);
+				geom->geometry_instance->set_rt_cast_shadows_setting(instance->cast_shadows);
 				if (instance->lightmap_sh.size() == 9) {
 					geom->geometry_instance->set_lightmap_capture(instance->lightmap_sh.ptr());
 				}
@@ -1375,6 +1376,7 @@ void RendererSceneCull::instance_geometry_set_cast_shadows_setting(RID p_instanc
 		ERR_FAIL_NULL(geom->geometry_instance);
 
 		geom->geometry_instance->set_cast_double_sided_shadows(instance->cast_shadows == RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED);
+		geom->geometry_instance->set_rt_cast_shadows_setting(instance->cast_shadows);
 	}
 
 	_instance_queue_update(instance, false, true);
@@ -3321,7 +3323,7 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 			// RT: collect ALL instances inside the camera AABB for TLAS and light gathering.
 			// Frustum-visible instances are guaranteed to be inside the AABB (superset),
 			// so skip the AABB test for them. Only test AABB for non-frustum instances.
-			// Mask out editor-only layers (20+) so gizmos/grid don't enter the TLAS.
+			// Only the camera's layers (Camera3D.cull_mask), without the editor-only ones (20+) so gizmos/grid don't enter the TLAS.
 			//
 			// Visibility-range parity: instances that failed VIS_CHECK for raster (i.e. they
 			// have NEEDS_CHECK flags and are off-frustum) must be re-checked here, otherwise
@@ -3332,7 +3334,7 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 			// Prefer the parent: exclude the child from RT until the parent becomes
 			// HIDDEN_CLOSE_RANGE (fully faded out), matching the point where raster
 			// switches over. In-frustum children are subject to the same rule.
-			if (cull_data.cull->rt_enabled && (idata.layer_mask & ((1 << 20) - 1))) {
+			if (cull_data.cull->rt_enabled && (LAYER_CHECK & ((1 << 20) - 1))) {
 				// For off-frustum instances, also run VIS_CHECK to match raster gating.
 				bool rt_in_range = in_frustum || (cull_data.scenario->instance_aabbs[i].in_aabb(cull_data.cull->rt_aabb) && VIS_CHECK);
 				// Out of view (outside the frustum, or hidden by occlusion culling), what is near or looks large stays: it
@@ -3357,8 +3359,9 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						uint32_t base_type = idata.flags & InstanceData::FLAG_BASE_TYPE_MASK;
 						if (base_type == RSE::INSTANCE_LIGHT) {
 							cull_result.rt_light_instances.push_back(RID::from_uint64(idata.instance_data_rid));
-						} else if ((base_type == RSE::INSTANCE_MESH || base_type == RSE::INSTANCE_MULTIMESH) &&
-								!(idata.flags & InstanceData::FLAG_CAST_SHADOWS_ONLY)) {
+						} else if (base_type == RSE::INSTANCE_DECAL) {
+							cull_result.rt_decal_instances.push_back(RID::from_uint64(idata.instance_data_rid));
+						} else if (base_type == RSE::INSTANCE_MESH || base_type == RSE::INSTANCE_MULTIMESH) {
 							cull_result.rt_geometry_instances.push_back(idata.instance_geometry);
 							mesh_visible = true; // For skinned/deformed meshes..
 						}
@@ -3484,6 +3487,21 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		cull.rt_culling_tan_half_angle = Math::tan(Math::deg_to_rad(scene_render->environment_get_pathtracing_culling_angle(p_environment)) * 0.5f);
 	}
 
+	// A path traced view traces its shadows, its transparent pass's too: only the volumetric fog reads shadow maps then,
+	// those of the lights it scatters (volumetric fog energy), within its length.
+	const bool rt_shadow_maps_for_fog_only = cull.rt_enabled && p_reflection_probe.is_null() && p_camera_data->view_count == 1 && scene_render->environment_pathtracing_replaces_shadow_maps(p_environment);
+	const bool rt_volumetric_fog = rt_shadow_maps_for_fog_only && scene_render->environment_get_volumetric_fog_enabled(p_environment);
+	// The fog's froxels reach this view depth, and this distance from the camera at the frustum's corners.
+	const real_t rt_fog_depth = rt_volumetric_fog ? scene_render->environment_get_volumetric_fog_length(p_environment) : 0.0;
+	real_t rt_fog_distance = rt_fog_depth;
+	if (rt_volumetric_fog && !p_camera_data->is_orthogonal) {
+		const Vector2 corner = p_camera_data->main_projection.get_viewport_half_extents() / p_camera_data->main_projection.get_z_near();
+		rt_fog_distance *= Math::sqrt(1.0 + corner.length_squared());
+	}
+	auto needs_shadow_map = [&](RID p_light) {
+		return !rt_shadow_maps_for_fog_only || (rt_volumetric_fog && RSG::light_storage->light_get_param(p_light, RSE::LIGHT_PARAM_VOLUMETRIC_FOG_ENERGY) > 0.001);
+	};
+
 	Vector<RID> directional_lights;
 	// directional lights
 	{
@@ -3505,7 +3523,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			//check shadow..
 
 			if (light) {
-				if (p_using_shadows && p_shadow_atlas.is_valid() && RSG::light_storage->light_has_shadow(E->base) && !(RSG::light_storage->light_get_type(E->base) == RSE::LIGHT_DIRECTIONAL && RSG::light_storage->light_directional_get_sky_mode(E->base) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY)) {
+				if (p_using_shadows && p_shadow_atlas.is_valid() && RSG::light_storage->light_has_shadow(E->base) && !(RSG::light_storage->light_get_type(E->base) == RSE::LIGHT_DIRECTIONAL && RSG::light_storage->light_directional_get_sky_mode(E->base) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) && needs_shadow_map(E->base)) {
 					lights_with_shadow.push_back(E);
 				}
 				//add to list
@@ -3517,6 +3535,15 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 		for (int i = 0; i < lights_with_shadow.size(); i++) {
 			_light_instance_setup_directional_shadow(i, lights_with_shadow[i], p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect);
+			if (rt_shadow_maps_for_fog_only) {
+				// The cascades that begin beyond the fog are neither culled nor drawn.
+				Cull::Shadow &shadow = cull.shadows[i];
+				uint32_t needed = 1;
+				while (needed < shadow.cascade_count && shadow.cascades[needed - 1].split < rt_fog_depth) {
+					needed++;
+				}
+				shadow.cascade_count = needed;
+			}
 		}
 	}
 
@@ -3748,6 +3775,23 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 			// so that we can turn off tighter caster culling.
 			light->detect_light_intersects_multiple_cameras(Engine::get_singleton()->get_frames_drawn());
 
+			bool fog_reads_map = needs_shadow_map(ins->base);
+			if (fog_reads_map && rt_shadow_maps_for_fog_only) {
+				real_t reach = RSG::light_storage->light_get_param(ins->base, RSE::LIGHT_PARAM_RANGE);
+				if (RSG::light_storage->light_get_type(ins->base) == RSE::LIGHT_AREA) {
+					reach += RSG::light_storage->light_area_get_size(ins->base).length();
+				}
+				fog_reads_map = ins->transform.origin.distance_to(camera_position) - reach < rt_fog_distance;
+			}
+			if (!fog_reads_map) {
+				// Its place in the atlas still gives it its (traced) shadow, but nothing reads the map: it is drawn once
+				// a view rasterizes the light again, the light staying dirty until then.
+				if (RSG::light_storage->shadow_atlas_update_light(p_shadow_atlas, light->instance, coverage, light->last_version)) {
+					light->make_shadow_dirty();
+				}
+				continue;
+			}
+
 			if (light->is_shadow_dirty()) {
 				// Dirty shadows have no need to be drawn if
 				// the light volume doesn't intersect the camera frustum.
@@ -3847,7 +3891,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	}
 
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, &scene_cull_result.rt_geometry_instances, &scene_cull_result.rt_light_instances);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, &scene_cull_result.rt_geometry_instances, &scene_cull_result.rt_light_instances, &scene_cull_result.rt_decal_instances);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);

@@ -144,6 +144,12 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		PFN_vkGetRayTracingShaderGroupHandlesKHR GetRayTracingShaderGroupHandlesKHR = nullptr;
 		PFN_vkCmdTraceRaysKHR CmdTraceRaysKHR = nullptr;
 
+		// Opacity micromaps (VK_EXT_opacity_micromap).
+		PFN_vkCreateMicromapEXT CreateMicromapEXT = nullptr;
+		PFN_vkDestroyMicromapEXT DestroyMicromapEXT = nullptr;
+		PFN_vkGetMicromapBuildSizesEXT GetMicromapBuildSizesEXT = nullptr;
+		PFN_vkCmdBuildMicromapsEXT CmdBuildMicromapsEXT = nullptr;
+
 		// Reflex sleep (VK_NV_low_latency2, enabled by Streamline).
 		PFN_vkLatencySleepNV LatencySleepNV = nullptr;
 		PFN_vkWaitSemaphores WaitSemaphores = nullptr;
@@ -176,6 +182,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	bool vulkan_memory_model_device_scope_support = false;
 	AccelerationStructureCapabilities acceleration_structure_capabilities;
 	bool ray_query_support = false;
+	bool opacity_micromap_support = false;
 	RaytracingCapabilities raytracing_capabilities;
 	DescriptorIndexingCapabilities descriptor_indexing_capabilities;
 	bool pipeline_cache_control_support = false;
@@ -747,6 +754,13 @@ public:
 		TightLocalVector<VkAccelerationStructureGeometryKHR> geometries;
 		VkAccelerationStructureBuildGeometryInfoKHR build_info;
 		TightLocalVector<VkAccelerationStructureBuildRangeInfoKHR> range_infos;
+
+		// An opacity micromap (vk_acceleration_structure stays null), or the micromaps a BLAS's geometries reference:
+		// one link per geometry in their pNext (null micromap when it has none), pointing into micromap_usages.
+		VkMicromapEXT vk_micromap = VK_NULL_HANDLE;
+		VkMicromapBuildInfoEXT micromap_build_info = {};
+		TightLocalVector<VkMicromapUsageEXT> micromap_usages;
+		TightLocalVector<VkAccelerationStructureTrianglesOpacityMicromapEXT> micromap_links;
 	};
 
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
@@ -754,6 +768,7 @@ public:
 	virtual void acceleration_structure_instance_write(uint8_t *r_driver_instance, const AccelerationStructureInstance &p_instance) override final;
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) override final;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) override final;
+	virtual AccelerationStructureID opacity_micromap_create(VectorView<OpacityMicromapUsage> p_usages, BufferID p_data_buffer, uint64_t p_data_offset, BufferID p_triangle_buffer, uint64_t p_triangle_offset) override final;
 
 private:
 	void _acceleration_structure_create(VkAccelerationStructureTypeKHR p_type, VkAccelerationStructureBuildSizesInfoKHR p_size_info, AccelerationStructureInfo *r_accel_info);
@@ -763,9 +778,10 @@ private:
 
 public:
 	// ----- COMMANDS -----
-	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
-	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
-	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) override final;
+	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) override final;
+	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) override final;
+	virtual void command_build_opacity_micromap(CommandBufferID p_cmd_buffer, AccelerationStructureID p_opacity_micromap, BufferID p_scratch_buffer, uint64_t p_scratch_offset) override final;
+	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, VectorView<AccelerationStructureID> p_blases) override final;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) override final;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;

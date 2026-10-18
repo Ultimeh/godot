@@ -284,6 +284,74 @@ Error RenderingDevice::_acceleration_structure_scratch_buffer_create(Acceleratio
 	return OK;
 }
 
+static const uint64_t AS_SCRATCH_RANGE_ALIGNMENT = 256; // D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT; Vulkan's size includes its own.
+static const uint64_t AS_SCRATCH_MIN_CHUNK_SIZE = 16 * 1024 * 1024;
+static const uint32_t AS_SCRATCH_SHRINK_DELAY_FRAMES = 600; // Used under a quarter of its capacity this long: freed.
+
+Error RenderingDevice::_acceleration_structure_scratch_allocate(uint64_t p_size, RDD::BufferID &r_buffer, uint64_t &r_offset) {
+	AccelerationStructureScratch &scratch = frames[frame].acceleration_structure_scratch;
+	const uint64_t size = STEPIFY(p_size, AS_SCRATCH_RANGE_ALIGNMENT);
+	while (scratch.chunk < scratch.chunks.size()) {
+		if (scratch.offset + size <= scratch.chunk_sizes[scratch.chunk]) {
+			r_buffer = scratch.chunks[scratch.chunk];
+			r_offset = scratch.offset;
+			scratch.offset += size;
+			scratch.used += size;
+			return OK;
+		}
+		scratch.chunk++;
+		scratch.offset = 0;
+	}
+
+	// A new chunk, at least as large as the others together: once consolidated, the slot needs a single one.
+	uint64_t capacity = 0;
+	for (uint64_t existing : scratch.chunk_sizes) {
+		capacity += existing;
+	}
+	const uint64_t chunk_size = MAX(MAX(size, AS_SCRATCH_MIN_CHUNK_SIZE), MAX(scratch.next_chunk_size, capacity));
+	const RDD::BufferID buffer = driver->buffer_create(chunk_size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	ERR_FAIL_COND_V(!buffer, ERR_CANT_CREATE);
+	buffer_memory.add(chunk_size);
+	scratch.next_chunk_size = 0;
+	scratch.chunks.push_back(buffer);
+	scratch.chunk_sizes.push_back(chunk_size);
+	scratch.chunk = scratch.chunks.size() - 1;
+	scratch.offset = size;
+	scratch.used += size;
+	r_buffer = buffer;
+	r_offset = 0;
+	return OK;
+}
+
+void RenderingDevice::_acceleration_structure_scratch_reset(AccelerationStructureScratch &r_scratch) {
+	uint64_t capacity = 0;
+	for (uint64_t size : r_scratch.chunk_sizes) {
+		capacity += size;
+	}
+	r_scratch.underused_frames = r_scratch.used * 4 < capacity ? r_scratch.underused_frames + 1 : 0;
+	if (r_scratch.chunks.size() > 1) {
+		// One chunk as large as all of them, made when next needed.
+		_acceleration_structure_scratch_free(r_scratch);
+		r_scratch.next_chunk_size = capacity;
+	} else if (r_scratch.underused_frames > AS_SCRATCH_SHRINK_DELAY_FRAMES) {
+		// A burst (a level loading) left it larger than the builds need since.
+		_acceleration_structure_scratch_free(r_scratch);
+	}
+	r_scratch.chunk = 0;
+	r_scratch.offset = 0;
+	r_scratch.used = 0;
+}
+
+void RenderingDevice::_acceleration_structure_scratch_free(AccelerationStructureScratch &r_scratch) {
+	for (uint32_t i = 0; i < r_scratch.chunks.size(); i++) {
+		buffer_memory.sub(r_scratch.chunk_sizes[i]);
+		driver->buffer_free(r_scratch.chunks[i]);
+	}
+	r_scratch.chunks.clear();
+	r_scratch.chunk_sizes.clear();
+	r_scratch.underused_frames = 0;
+}
+
 void RenderingDevice::_blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id) {
 	for (RID id : p_blas->acceleration_structure_dependencies) {
 		AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(id);
@@ -383,6 +451,49 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 					t_out.index_count = 0;
 					t_out.index_format = {};
 				}
+
+				t_out.opacity_micromap = RDD::AccelerationStructureID();
+				t_out.opacity_micromap_index_buffer = RDD::BufferID();
+				t_out.opacity_micromap_index_offset = 0;
+				t_out.opacity_micromap_index_format = INDEX_BUFFER_FORMAT_UINT32;
+				t_out.opacity_micromap_base_triangle = 0;
+				t_out.opacity_micromap_usages = nullptr;
+				t_out.opacity_micromap_usage_count = 0;
+				if (t_in.opacity_micromap.is_valid()) {
+					ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The current rendering device has no opacity micromap support.");
+					AccelerationStructure *micromap = acceleration_structure_owner.get_or_null(t_in.opacity_micromap);
+					ERR_FAIL_COND_V_MSG(micromap == nullptr || micromap->type != RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP, RID(), "The opacity micromap is not valid.");
+					// Without an index buffer, each triangle uses the entry of its own index (plus the base triangle).
+					Buffer *micromap_index_buffer = nullptr;
+					if (t_in.opacity_micromap_index_buffer.is_valid()) {
+						micromap_index_buffer = storage_buffer_owner.get_or_null(t_in.opacity_micromap_index_buffer);
+						ERR_FAIL_NULL_V_MSG(micromap_index_buffer, RID(), "The opacity micromap index buffer must be a valid storage buffer.");
+						ERR_FAIL_COND_V_MSG(!micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT), RID(),
+								"The opacity micromap index buffer must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT.");
+						const uint32_t triangle_count = t_in.index_buffer.is_valid() ? t_in.index_count / 3 : t_in.vertex_count / 3;
+						const uint32_t micromap_index_stride = t_in.opacity_micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+						ERR_FAIL_COND_V_MSG(t_in.opacity_micromap_index_offset + uint64_t(triangle_count) * micromap_index_stride > micromap_index_buffer->size, RID(), "The opacity micromap index buffer is smaller than the triangles' indices.");
+					}
+
+					t_out.opacity_micromap = micromap->driver_id;
+					t_out.opacity_micromap_index_buffer = micromap_index_buffer ? micromap_index_buffer->driver_id : RDD::BufferID();
+					t_out.opacity_micromap_index_offset = t_in.opacity_micromap_index_offset;
+					t_out.opacity_micromap_index_format = t_in.opacity_micromap_index_format;
+					t_out.opacity_micromap_base_triangle = t_in.opacity_micromap_base_triangle;
+					t_out.opacity_micromap_usages = t_in.opacity_micromap_usages.ptr();
+					t_out.opacity_micromap_usage_count = t_in.opacity_micromap_usages.size();
+
+					// The BLAS build reads both.
+					draw_trackers.push_back(micromap->draw_tracker);
+					if (micromap_index_buffer) {
+						if (micromap_index_buffer->draw_tracker != nullptr) {
+							draw_trackers.push_back(micromap_index_buffer->draw_tracker);
+						} else {
+							untracked_buffers.insert(t_in.opacity_micromap_index_buffer);
+						}
+						_check_transfer_worker_buffer(micromap_index_buffer);
+					}
+				}
 			} break;
 
 			case AccelerationStructureGeometry::TYPE_AABBS: {
@@ -438,6 +549,12 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 				_add_dependency(id, geometry.geometry.triangles.vertex_buffer);
 				if (geometry.geometry.triangles.index_buffer.is_valid()) {
 					_add_dependency(id, geometry.geometry.triangles.index_buffer);
+				}
+				if (geometry.geometry.triangles.opacity_micromap.is_valid()) {
+					_add_dependency(id, geometry.geometry.triangles.opacity_micromap);
+					if (geometry.geometry.triangles.opacity_micromap_index_buffer.is_valid()) {
+						_add_dependency(id, geometry.geometry.triangles.opacity_micromap_index_buffer);
+					}
 				}
 			} break;
 			case AccelerationStructureGeometry::TYPE_AABBS: {
@@ -497,6 +614,81 @@ RID RenderingDevice::tlas_create(uint32_t p_max_instance_count, BitField<Acceler
 	return id;
 }
 
+RID RenderingDevice::opacity_micromap_create(Span<OpacityMicromapUsage> p_usages, RID p_data_buffer, uint32_t p_data_offset, RID p_triangle_buffer, uint32_t p_triangle_offset) {
+	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The current rendering device has no opacity micromap support.");
+	ERR_FAIL_COND_V_MSG(p_usages.is_empty(), RID(), "An opacity micromap needs at least one entry.");
+
+	uint64_t entry_count = 0;
+	for (const OpacityMicromapUsage &usage : p_usages) {
+		entry_count += usage.count;
+	}
+	Buffer *data_buffer = storage_buffer_owner.get_or_null(p_data_buffer);
+	ERR_FAIL_NULL_V_MSG(data_buffer, RID(), "The opacity micromap data buffer must be a valid storage buffer.");
+	ERR_FAIL_COND_V_MSG(p_data_offset >= data_buffer->size, RID(), "The opacity micromap data offset is outside its buffer.");
+	Buffer *triangle_buffer = storage_buffer_owner.get_or_null(p_triangle_buffer);
+	ERR_FAIL_NULL_V_MSG(triangle_buffer, RID(), "The opacity micromap triangle buffer must be a valid storage buffer.");
+	ERR_FAIL_COND_V_MSG(p_triangle_offset + entry_count * 8 > triangle_buffer->size, RID(), "The opacity micromap triangle buffer is smaller than its entries' descriptions (8 bytes each).");
+	for (const Buffer *buffer : { data_buffer, triangle_buffer }) {
+		ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !buffer->usage.has_flag(RDD::BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT), RID(),
+				"The opacity micromap buffers must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT.");
+	}
+	ERR_FAIL_COND_V_MSG((p_data_offset % OPACITY_MICROMAP_INPUT_ALIGNMENT) != 0 || (p_triangle_offset % OPACITY_MICROMAP_INPUT_ALIGNMENT) != 0, RID(),
+			vformat("The opacity micromap data and triangle offsets must be multiples of %d bytes.", OPACITY_MICROMAP_INPUT_ALIGNMENT));
+
+	AccelerationStructure micromap;
+	micromap.type = RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP;
+	micromap.driver_id = driver->opacity_micromap_create(VectorView<OpacityMicromapUsage>(p_usages.ptr(), p_usages.size()), data_buffer->driver_id, p_data_offset, triangle_buffer->driver_id, p_triangle_offset);
+	ERR_FAIL_COND_V_MSG(!micromap.driver_id, RID(), "Failed to create the opacity micromap.");
+
+	micromap.draw_tracker = RDG::resource_tracker_create();
+	micromap.draw_tracker->acceleration_structure_driver_id = micromap.driver_id;
+	micromap.draw_tracker->usage = RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
+	for (Buffer *buffer : { data_buffer, triangle_buffer }) {
+		if (buffer->draw_tracker != nullptr) {
+			micromap.draw_trackers.push_back(buffer->draw_tracker);
+		}
+		_check_transfer_worker_buffer(buffer);
+	}
+	if (data_buffer->draw_tracker == nullptr) {
+		micromap.untracked_buffers.insert(p_data_buffer);
+	}
+	if (triangle_buffer->draw_tracker == nullptr) {
+		micromap.untracked_buffers.insert(p_triangle_buffer);
+	}
+
+	RID id = acceleration_structure_owner.make_rid(micromap);
+#ifdef DEV_ENABLED
+	set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+	_add_dependency(id, p_data_buffer);
+	_add_dependency(id, p_triangle_buffer);
+	return id;
+}
+
+Error RenderingDevice::opacity_micromap_build(RID p_opacity_micromap) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building an opacity micromap is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building an opacity micromap is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building an opacity micromap is forbidden during creation of a raytracing list.");
+
+	AccelerationStructure *micromap = acceleration_structure_owner.get_or_null(p_opacity_micromap);
+	ERR_FAIL_COND_V_MSG(micromap == nullptr || micromap->type != RDD::ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP, ERR_INVALID_PARAMETER, "Opacity micromap argument is not valid.");
+
+	RDD::BufferID scratch_buffer;
+	uint64_t scratch_offset = 0;
+	Error err = _acceleration_structure_scratch_allocate(driver->acceleration_structure_get_scratch_size_bytes(micromap->driver_id), scratch_buffer, scratch_offset);
+	ERR_FAIL_COND_V(err != OK, err);
+
+	draw_graph->add_opacity_micromap_build(micromap->driver_id, scratch_buffer, scratch_offset, micromap->draw_tracker, micromap->draw_trackers);
+	micromap->invalidated = false;
+	return OK;
+}
+
+bool RenderingDevice::acceleration_structure_is_valid(RID p_acceleration_structure) {
+	return acceleration_structure_owner.owns(p_acceleration_structure);
+}
+
 Error RenderingDevice::blas_build(RID p_blas) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
@@ -507,10 +699,12 @@ Error RenderingDevice::blas_build(RID p_blas) {
 	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
 	ERR_FAIL_NULL_V_MSG(blas, ERR_INVALID_PARAMETER, "BLAS argument is not valid.");
 
-	Error err = _acceleration_structure_scratch_buffer_create(blas);
+	RDD::BufferID scratch_buffer;
+	uint64_t scratch_offset = 0;
+	Error err = _acceleration_structure_scratch_allocate(driver->acceleration_structure_get_scratch_size_bytes(blas->driver_id), scratch_buffer, scratch_offset);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	draw_graph->add_blas_build(blas->driver_id, scratch_buffer, scratch_offset, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -528,10 +722,12 @@ Error RenderingDevice::blas_update(RID p_blas) {
 	AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
 	ERR_FAIL_NULL_V_MSG(blas, ERR_INVALID_PARAMETER, "BLAS argument is not valid.");
 
-	Error err = _acceleration_structure_scratch_buffer_create(blas);
+	RDD::BufferID scratch_buffer;
+	uint64_t scratch_offset = 0;
+	Error err = _acceleration_structure_scratch_allocate(driver->acceleration_structure_get_scratch_size_bytes(blas->driver_id), scratch_buffer, scratch_offset);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph->add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	draw_graph->add_blas_update(blas->driver_id, scratch_buffer, scratch_offset, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -602,7 +798,9 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 	_tlas_remove_blas_dependencies(tlas, p_tlas);
 
+	thread_local LocalVector<RDD::AccelerationStructureID> blases;
 	thread_local LocalVector<RDG::ResourceTracker *> draw_trackers;
+	blases.clear();
 	draw_trackers.clear();
 
 	// Build instances into a CPU-side shadow buffer first then memcpy to the
@@ -634,6 +832,8 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 				tlas->acceleration_structure_dependencies.insert(rd_instance.blas);
 				blas->acceleration_structure_dependencies.insert(p_tlas);
 
+				blases.push_back(blas->driver_id);
+
 				if (blas->draw_tracker != nullptr) {
 					draw_trackers.push_back(blas->draw_tracker);
 				}
@@ -645,7 +845,102 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 	memcpy(instance_buffer.data_ptr + instance_buffer_offset, shadow_buffer.ptr(), instance_size * p_instances.size());
 
-	draw_graph->add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer.driver_id, instance_buffer_offset, p_instances.size(), tlas->draw_tracker, draw_trackers);
+	draw_graph->add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer.driver_id, instance_buffer_offset, p_instances.size(), blases, tlas->draw_tracker, draw_trackers);
+
+	tlas->invalidated = false;
+
+	return OK;
+}
+
+uint32_t RenderingDevice::tlas_get_instance_size() const {
+	return driver->api_trait_get(RDD::API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_SIZE);
+}
+
+bool RenderingDevice::tlas_instance_layout_is_standard() const {
+	return driver->api_trait_get(RDD::API_TRAIT_ACCELERATION_STRUCTURE_INSTANCE_STANDARD_LAYOUT);
+}
+
+Error RenderingDevice::tlas_instances_encode(Span<AccelerationStructureInstance> p_instances, uint8_t *r_data) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	const uint32_t instance_size = tlas_get_instance_size();
+	for (uint32_t i = 0; i < p_instances.size(); i++) {
+		const AccelerationStructureInstance &rd_instance = p_instances[i];
+
+		RDD::AccelerationStructureInstance rdd_instance;
+		rdd_instance.transform = rd_instance.transform;
+		rdd_instance.id = rd_instance.id;
+		rdd_instance.mask = rd_instance.mask;
+		rdd_instance.hit_sbt_offset = _decode_hit_sbt_range_offset(rd_instance.hit_sbt_range);
+		rdd_instance.flags = rd_instance.flags;
+
+		if (rd_instance.blas.is_valid()) {
+			ERR_FAIL_COND_V_MSG(!rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
+
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(rd_instance.blas);
+			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+			rdd_instance.blas = blas->driver_id;
+		}
+
+		driver->acceleration_structure_instance_write(r_data + instance_size * i, rdd_instance);
+	}
+
+	return OK;
+}
+
+Error RenderingDevice::tlas_build_from_buffer(RID p_tlas, RID p_instance_buffer, uint32_t p_instance_count, Span<RID> p_blases) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a raytracing list.");
+
+	AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(p_tlas);
+	ERR_FAIL_NULL_V_MSG(tlas, ERR_INVALID_PARAMETER, "TLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(p_instance_count > tlas->max_instance_count, ERR_INVALID_PARAMETER, "Exceeded the maximum amount of instances allowed in the TLAS.");
+
+	Buffer *instance_buffer = storage_buffer_owner.get_or_null(p_instance_buffer);
+	ERR_FAIL_NULL_V_MSG(instance_buffer, ERR_INVALID_PARAMETER, "The instance buffer must be a valid storage buffer.");
+	ERR_FAIL_COND_V_MSG(!instance_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT) || !instance_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT), ERR_INVALID_PARAMETER,
+			"The instance buffer must be created with BUFFER_CREATION_DEVICE_ADDRESS_BIT and BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT.");
+	ERR_FAIL_COND_V_MSG(uint64_t(p_instance_count) * tlas_get_instance_size() > instance_buffer->size, ERR_INVALID_PARAMETER, "The instance buffer is too small for the instance count.");
+
+	Error err = _acceleration_structure_scratch_buffer_create(tlas);
+	ERR_FAIL_COND_V(err != OK, err);
+
+	_tlas_remove_blas_dependencies(tlas, p_tlas);
+
+	thread_local LocalVector<RDD::AccelerationStructureID> blases;
+	thread_local LocalVector<RDG::ResourceTracker *> draw_trackers;
+	blases.clear();
+	draw_trackers.clear();
+
+	for (const RID &blas_rid : p_blases) {
+		AccelerationStructure *blas = acceleration_structure_owner.get_or_null(blas_rid);
+		ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+		if (tlas->acceleration_structure_dependencies.has(blas_rid)) {
+			continue;
+		}
+		tlas->acceleration_structure_dependencies.insert(blas_rid);
+		blas->acceleration_structure_dependencies.insert(p_tlas);
+		blases.push_back(blas->driver_id);
+		if (blas->draw_tracker != nullptr) {
+			draw_trackers.push_back(blas->draw_tracker);
+		}
+	}
+
+	// The build reads the instances after whatever wrote them (a copy, a shader).
+	if (_buffer_make_mutable(instance_buffer, p_instance_buffer)) {
+		draw_graph->add_synchronization();
+	}
+	draw_trackers.push_back(instance_buffer->draw_tracker);
+	_check_transfer_worker_buffer(instance_buffer);
+
+	draw_graph->add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer->driver_id, 0, p_instance_count, blases, tlas->draw_tracker, draw_trackers);
 
 	tlas->invalidated = false;
 
@@ -1607,6 +1902,10 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 				"The GPU doesn't support acceleration structure build input flag.");
 #endif
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	}
+	if (p_creation_bits.has_flag(BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT)) {
+		ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_OPACITY_MICROMAP), RID(), "The GPU doesn't support opacity micromaps.");
+		buffer.usage.set_flag(RDD::BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT);
 	}
 
 	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
@@ -6193,6 +6492,26 @@ void RenderingDevice::draw_list_bind_index_array(DrawListID p_list, RID p_index_
 	}
 }
 
+void RenderingDevice::draw_list_add_buffer_dependency(DrawListID p_list, RID p_buffer) {
+	ERR_DRAW_LIST_THREAD_GUARD(p_list);
+
+	DrawListSplit *split = nullptr;
+	DrawList *dl = _get_draw_list(p_list, split);
+	ERR_FAIL_NULL(dl);
+	RDG::DrawListSplit *graph_split = split != nullptr ? &split->graph : nullptr;
+
+	ERR_FAIL_COND(!dl->active);
+
+	Buffer *buffer = _get_buffer_from_owner(p_buffer);
+	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
+
+	// Unlike the compute and ray tracing lists, a draw list cannot make the buffer mutable (a synchronization in the middle
+	// of a draw list). Without a tracker, no recorded command wrote it: the commands that write a buffer make it mutable.
+	if (buffer->draw_tracker != nullptr) {
+		draw_graph->add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ, graph_split);
+	}
+}
+
 void RenderingDevice::draw_list_set_line_width(DrawListID p_list, float p_width) {
 	ERR_DRAW_LIST_THREAD_GUARD(p_list);
 
@@ -7043,6 +7362,16 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 	}
 #endif
 
+	// In every build: the binding below dereferences each set the pipeline expects. A set missing, of another format or
+	// freed since it was bound (the validation above is debug only) would crash a release build.
+	for (uint32_t i = 0; i < raytracing_list.state.set_count; i++) {
+		if (raytracing_list.state.sets[i].pipeline_expected_format == 0) {
+			continue;
+		}
+		ERR_FAIL_COND_MSG(raytracing_list.state.sets[i].pipeline_expected_format != raytracing_list.state.sets[i].uniform_set_format || !uniform_set_owner.owns(raytracing_list.state.sets[i].uniform_set),
+				"Uniform set (" + itos(i) + ") missing, freed or of another format: the rays were not traced.");
+	}
+
 	// Prepare descriptor sets if the API doesn't use pipeline barriers.
 	if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
 		for (uint32_t i = 0; i < raytracing_list.state.set_count; i++) {
@@ -7539,6 +7868,26 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 
 	if (buffer->draw_tracker != nullptr) {
 		draw_graph->add_compute_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+	}
+
+	_check_transfer_worker_buffer(buffer);
+}
+
+void RenderingDevice::compute_list_add_buffer_dependency(ComputeListID p_list, RID p_buffer, bool p_writable) {
+	ERR_RENDER_THREAD_GUARD();
+
+	ERR_FAIL_COND(p_list != ID_TYPE_COMPUTE_LIST);
+	ERR_FAIL_COND(!compute_list.active);
+
+	Buffer *buffer = _get_buffer_from_owner(p_buffer);
+	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
+
+	if (_buffer_make_mutable(buffer, p_buffer)) {
+		draw_graph->add_synchronization();
+	}
+
+	if (buffer->draw_tracker != nullptr) {
+		draw_graph->add_compute_list_usage(buffer->draw_tracker, p_writable ? RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ_WRITE : RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
 	}
 
 	_check_transfer_worker_buffer(buffer);
@@ -8210,6 +8559,10 @@ void RenderingDevice::_free_internal(RID p_id) {
 		acceleration_structure_owner.free(p_id);
 	} else if (raytracing_pipeline_owner.owns(p_id)) {
 		RaytracingPipeline *pipeline = raytracing_pipeline_owner.get_or_null(p_id);
+		// The SBT's upload goes through a transfer worker that is only submitted once a frame uses it. A pipeline freed
+		// before it was ever bound would otherwise have its buffer destroyed while the copy into it is still recorded.
+		_check_transfer_worker_buffer(&pipeline->sbt_buffer);
+
 		frames[frame].raytracing_pipelines_to_dispose_of.push_back(*pipeline);
 		raytracing_pipeline_owner.free(p_id);
 	} else if (hit_sbt_owner.owns(p_id)) {
@@ -8635,6 +8988,7 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	// Erase pending resources.
 	GodotProfileZoneGrouped(_profile_zone, "_free_pending_resources");
 	_free_pending_resources(frame);
+	_acceleration_structure_scratch_reset(frames[frame].acceleration_structure_scratch);
 
 	// Advance staging buffers if used.
 	if (upload_staging_buffers.used) {
@@ -9773,6 +10127,7 @@ void RenderingDevice::finalize() {
 	for (uint32_t i = 0; i < frames.size(); i++) {
 		int f = (frame + i) % frames.size();
 		_free_pending_resources(f);
+		_acceleration_structure_scratch_free(frames[i].acceleration_structure_scratch);
 		driver->command_pool_free(frames[i].command_pool);
 		driver->timestamp_query_pool_free(frames[i].timestamp_pool);
 		driver->semaphore_free(frames[i].semaphore);

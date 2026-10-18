@@ -343,6 +343,9 @@ public:
 	virtual bool light_directional_get_blend_splits(RID p_light) const override;
 	virtual void light_directional_set_sky_mode(RID p_light, RSE::LightDirectionalSkyMode p_mode) override;
 	virtual RSE::LightDirectionalSkyMode light_directional_get_sky_mode(RID p_light) const override;
+	// Directional projectors are not rendered by the Compatibility renderer.
+	virtual void light_directional_set_projector_size(RID p_light, const Vector2 &p_size) override {}
+	virtual void light_directional_set_projector_offset(RID p_light, const Vector2 &p_offset) override {}
 
 	virtual void light_area_set_size(RID p_light, const Vector2 &p_size) override;
 	virtual Vector2 light_area_get_size(RID p_light) const override;

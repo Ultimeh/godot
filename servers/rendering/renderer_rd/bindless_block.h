@@ -40,13 +40,26 @@ public:
 
 	uint32_t add_texture(RID p_texture);
 
-	void initialize(RenderingDevice *p_rd);
+	// p_default_texture fills unused slots and sets the type of the table: a texture of another type is replaced by it,
+	// as one wrong descriptor would invalidate the whole set.
+	void initialize(RenderingDevice *p_rd, RID p_default_texture);
 
 	void begin_frame();
 
 	void finalize(RID p_shader, uint32_t p_set_index);
 
 	RID get_uniform_set() const { return uniform_set; }
+
+	// The other set layouts of the table, for shaders whose stages differ from the finalized one's: every caller of a
+	// layout passes a shader of that layout.
+	enum SecondaryLayout {
+		SECONDARY_LAYOUT_COMPUTE, // The displacement passes.
+		SECONDARY_LAYOUT_FRAGMENT, // The path tracer's transparent pass (USE_RT_SHADOWS).
+		SECONDARY_LAYOUT_MAX,
+	};
+
+	// The same table in a second set, for shaders of another layout.
+	RID get_secondary_uniform_set(RID p_shader, uint32_t p_set_index, SecondaryLayout p_layout = SECONDARY_LAYOUT_COMPUTE);
 	uint32_t get_texture_count() const { return textures.size(); }
 	bool is_initialized() const { return rd != nullptr; }
 	bool is_finalized() const { return uniform_set.is_valid(); }
@@ -61,6 +74,13 @@ private:
 	LocalVector<uint32_t> free_indices;
 	uint32_t free_indices_count = 0; // logical top to avoid resize of free_indices array
 	RID default_texture;
+	RD::TextureType texture_type = RD::TEXTURE_TYPE_2D;
 	RID uniform_set;
 	bool needs_refinalize = false;
+
+	uint64_t textures_version = 0; // Bumped whenever the table changes.
+	RID secondary_uniform_sets[SECONDARY_LAYOUT_MAX];
+	uint64_t secondary_textures_versions[SECONDARY_LAYOUT_MAX] = {};
+
+	RID _create_uniform_set(RID p_shader, uint32_t p_set_index);
 };

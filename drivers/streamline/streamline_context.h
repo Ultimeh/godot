@@ -88,6 +88,7 @@ public:
 	// D3D12
 	void *func_D3D12GetInterface = nullptr;
 	void *func_D3D12CreateDevice = nullptr;
+	void *func_slUpgradeInterface = nullptr;
 	void *func_DXGIGetDebugInterface1 = nullptr;
 	void *func_CreateDXGIFactory = nullptr;
 	void *func_CreateDXGIFactory1 = nullptr;

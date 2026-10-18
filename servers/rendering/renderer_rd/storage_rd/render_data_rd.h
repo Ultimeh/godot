@@ -98,7 +98,8 @@ public:
 
 	uint32_t voxel_gi_count = 0;
 
-	/* RT-extra: AABB-culled instances/lights outside frustum for TLAS and light gathering. */
+	/* RT-extra: AABB-culled instances/lights/decals, the frustum's and those around it, for TLAS, lights and decals. */
 	const PagedArray<RenderGeometryInstance *> *rt_instances = nullptr;
 	const PagedArray<RID> *rt_lights = nullptr;
+	const PagedArray<RID> *rt_decals = nullptr;
 };

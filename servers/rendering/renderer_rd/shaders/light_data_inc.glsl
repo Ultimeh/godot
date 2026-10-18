@@ -72,7 +72,8 @@ struct DirectionalLightData {
 	float shadow_opacity;
 	float fade_from;
 	float fade_to;
-	uvec2 pad;
+	uint projector_enabled; // The light of directional_light_projector (one at most).
+	uint pad;
 	uint bake_mode;
 	float volumetric_fog_energy;
 	vec4 shadow_bias;
@@ -89,4 +90,7 @@ struct DirectionalLightData {
 	vec2 uv_scale2;
 	vec2 uv_scale3;
 	vec2 uv_scale4;
+	// View space position (w = 1) to the projector's UV: (dot(projector_uv_x, p), dot(projector_uv_y, p)).
+	vec4 projector_uv_x;
+	vec4 projector_uv_y;
 };

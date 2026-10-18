@@ -36,6 +36,12 @@
 		<member name="directional_shadow_split_3" type="float" setter="set_param" getter="get_param" default="0.5">
 			The distance from shadow split 2 to split 3. Relative to [member directional_shadow_max_distance]. Only used when [member directional_shadow_mode] is [constant SHADOW_PARALLEL_4_SPLITS].
 		</member>
+		<member name="light_projector_offset" type="Vector2" setter="set_projector_offset" getter="get_projector_offset" default="Vector2(0, 0)">
+			The center of the [member Light3D.light_projector] texture, in meters along the light's local X and Y axes from the light's position. Move it every frame to keep a projector drawn around the camera (such as cloud shadows) centered on the camera.
+		</member>
+		<member name="light_projector_size" type="Vector2" setter="set_projector_size" getter="get_projector_size" default="Vector2(100, 100)">
+			The size in meters of the [member Light3D.light_projector] texture over the light's local XY plane. The texture is projected along the light's direction, with its top towards the light's local +Y axis, and repeats beyond this size. Both components must be positive.
+		</member>
 		<member name="sky_mode" type="int" setter="set_sky_mode" getter="get_sky_mode" enum="DirectionalLight3D.SkyMode" default="0">
 			Whether this [DirectionalLight3D] is visible in the sky, in the scene, or both in the sky and in the scene.
 		</member>
