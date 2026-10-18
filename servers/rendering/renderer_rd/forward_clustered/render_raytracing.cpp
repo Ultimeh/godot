@@ -5366,8 +5366,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
 			RID env = p_render_data->environment;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VIS_MODE] = (float)env_storage->environment_get_pathtracing_debug_mode(env);
-			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SAMPLE_COUNT] = (float)env_storage->environment_get_pathtracing_samples_per_pixel(env);
-			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_BOUNCES] = (float)env_storage->environment_get_pathtracing_max_bounces(env);
+			// Read by the shaders instead of specialization constants: changing them keeps the pipeline.
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SAMPLE_COUNT] = (float)MAX(1, env_storage->environment_get_pathtracing_samples_per_pixel(env));
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_BOUNCES] = (float)CLAMP(env_storage->environment_get_pathtracing_max_bounces(env), 1, SceneShaderRaytracing::RT_MAX_BOUNCES);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DENOISER] = (float)(int)env_storage->environment_get_pathtracing_denoiser(env);
 		}
 

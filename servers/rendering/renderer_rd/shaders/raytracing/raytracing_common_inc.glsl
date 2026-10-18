@@ -2,19 +2,15 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-20: flags, 21-28: samples, 29-31: bounces).
+// Specialization constant: the flags that change the code (SceneShaderRaytracing::RaytracingFlags), one pipeline each.
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
 #define RT_FLAG_FOG_ENABLED (1u << 2)
 
-#define RT_SAMPLE_COUNT_SHIFT 21u
-#define RT_SAMPLE_COUNT_MASK 0xFFu
-#define RT_GET_SAMPLE_COUNT() max(1u, (RT_FLAGS >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK)
-
-#define RT_MAX_BOUNCES_SHIFT 29u
-#define RT_MAX_BOUNCES_MASK 0x7u
-#define RT_GET_MAX_BOUNCES() (((RT_FLAGS >> RT_MAX_BOUNCES_SHIFT) & RT_MAX_BOUNCES_MASK) + 1u)
+// From the parameters buffer (not in the any-hit stage): changing them does not build another pipeline.
+#define RT_GET_SAMPLE_COUNT() max(1u, uint(get_rt_param(RT_PARAM_SAMPLE_COUNT)))
+#define RT_GET_MAX_BOUNCES() clamp(uint(get_rt_param(RT_PARAM_MAX_BOUNCES)), 1u, 8u)
 
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT

@@ -70,10 +70,9 @@ public:
 		PIPELINE_COLOR_PASS_FLAG_NONE = 0 // Simplified: no flags needed
 	};
 
-	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines).
-	// Bits 0-20:  Feature flags
-	// Bits 21-28: Sample count
-	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
+	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines): each combination is a pipeline of its
+	// own, its hit groups compiled again. Only what changes the code goes here; the sample count and the bounces are read
+	// from the parameters buffer (RT_PARAM_*), so changing them keeps the pipeline.
 	enum RaytracingFlags {
 		RT_FLAG_NONE = 0,
 		RT_FLAG_DEBUG_VIS_ENABLED = (1 << 0),
@@ -82,12 +81,6 @@ public:
 		RT_FLAG_SER_ENABLED = (1 << 3),
 		RT_FLAG_RAY_QUERY_SHADOWS_ENABLED = (1 << 4),
 	};
-
-	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
-	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0xFF;
-
-	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 29;
-	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0x7;
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).
 	// 1: primary/bounce from raygen
@@ -106,15 +99,10 @@ public:
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 
-	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
-		uint32_t result = p_flags;
-		result |= (p_sample_count & RT_SAMPLE_COUNT_MASK) << RT_SAMPLE_COUNT_SHIFT;
-		// Max bounces is offset by 1 (0=1 bounce, 7=8 bounces)
-		result |= (MAX(1u, MIN(8u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
-		return result;
-	}
+	// The bounces a path may take (RT_PARAM_MAX_BOUNCES).
+	static constexpr int RT_MAX_BOUNCES = 8;
 
-	// Build the full packed rt_flags from pathtracing environment settings.
+	// The rt_flags from pathtracing environment settings.
 	// `p_environment` may be invalid (RT active with no pathtracing environment).
 	static uint32_t compute_rt_flags(RID p_environment, bool p_fog_enabled);
 
@@ -357,6 +345,7 @@ public:
 
 	// Preprocessed custom HG GLSL (templates filled per compile). One entry per slot, all variants.
 	struct CustomShaderEntry {
+		String name; // The shader's path, for messages.
 		String defines; // The compiler's defines the RT templates honor (vertex space).
 		String vertex_code;
 		String fragment_code;

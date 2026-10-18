@@ -428,10 +428,13 @@ struct SceneShaderRaytracing::PipelineBuildTask {
 		String ch_src;
 		String ah_src;
 		String is_src;
+		String name; // CustomShaderEntry::name, for --verbose.
 		// Worker output.
 		String cache_key;
 		Vector<uint8_t> binary;
 		RID shader;
+		uint64_t glslang_usec = 0; // GLSL to SPIR-V of its own stages.
+		uint64_t translate_usec = 0; // SPIR-V of every stage to the driver's binary (Mesa's DXIL on D3D12).
 	};
 	LocalVector<SlotInput> slots;
 	LocalVector<uint32_t> compile_indices; // The slots to compile, then those missing from the cache.
@@ -748,6 +751,7 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 	// New slot: preprocess here; heavy compile is on worker.
 	CustomShaderEntry entry;
 	entry.is_procedural = p_is_procedural;
+	entry.name = material_storage->material_get_shader_path_hint(p_material);
 	if (!_preprocess_shader(p_material, p_is_procedural, entry)) {
 		// Failed slot still occupies an index so hash lookups stay stable.
 		HitGroupSlot failed_slot;
@@ -1024,8 +1028,6 @@ bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_
 
 uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_enabled) {
 	uint32_t flags = RT_FLAG_NONE;
-	uint32_t sample_count = 1;
-	uint32_t max_bounces = 3;
 
 	if (p_environment.is_valid()) {
 		RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
@@ -1038,8 +1040,6 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 			flags |= RT_FLAG_RAY_QUERY_SHADOWS_ENABLED;
 		}
 
-		sample_count = MAX(1, env_storage->environment_get_pathtracing_samples_per_pixel(p_environment));
-		max_bounces = CLAMP(env_storage->environment_get_pathtracing_max_bounces(p_environment), 1, 8);
 		if (env_storage->environment_get_pathtracing_denoiser(p_environment) == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION) {
 			flags |= RT_FLAG_DLSS_RR_ENABLED;
 		}
@@ -1055,7 +1055,7 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		flags |= RT_FLAG_SER_ENABLED;
 	}
 
-	return rt_flags_pack(flags, sample_count, max_bounces);
+	return flags;
 }
 
 SceneShaderRaytracing *SceneShaderRaytracing::get_singleton() {
@@ -1407,6 +1407,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 
 		si.uses_alpha_clip = slot.entry.uses_alpha_clip;
 		si.is_procedural = slot.entry.is_procedural;
+		si.name = slot.entry.name;
 
 		if (slot.state != HGState::Ready) {
 			si.needs_compile = false;
@@ -1514,6 +1515,7 @@ void SceneShaderRaytracing::_compile_hit_group(uint32_t p_index, PipelineBuildTa
 	const uint32_t i = p_task->compile_indices[p_index];
 	PipelineBuildTask::SlotInput &si = p_task->slots[i];
 	String error;
+	const uint64_t glslang_begin = OS::get_singleton()->get_ticks_usec();
 
 	Vector<RD::ShaderStageSPIRVData> custom_stages = p_task->base_non_hit_stages;
 	{
@@ -1549,7 +1551,10 @@ void SceneShaderRaytracing::_compile_hit_group(uint32_t p_index, PipelineBuildTa
 		custom_stages.push_back(sd);
 	}
 
+	const uint64_t translate_begin = OS::get_singleton()->get_ticks_usec();
+	si.glslang_usec = translate_begin - glslang_begin;
 	si.binary = RD::get_singleton()->shader_compile_binary_from_spirv(custom_stages, vformat("RT_hg%d_v%x", i, p_task->rt_flags));
+	si.translate_usec = OS::get_singleton()->get_ticks_usec() - translate_begin;
 	_binary_cache_save(si.cache_key, si.binary);
 }
 
@@ -1623,9 +1628,13 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 		}
 	}
 	print_verbose(vformat("RT: variant 0x%x: %d hit groups to build, %d from the shader cache.", p_task->rt_flags, to_compile.size(), to_compile.size() - p_task->compile_indices.size()));
+	const uint64_t batch_begin = OS::get_singleton()->get_ticks_usec();
+	uint64_t base_usec = 0;
+	uint64_t hit_groups_usec = 0;
 	if (!p_task->compile_indices.is_empty() && !check_abort()) {
 		// The variant's ray generation and miss stages, which every hit group's binary holds.
 		const Vector<RD::ShaderStageSPIRVData> base_stages = ShaderRD::compile_stages(p_task->base_sources, {});
+		base_usec = OS::get_singleton()->get_ticks_usec() - batch_begin;
 		for (const RD::ShaderStageSPIRVData &sd : base_stages) {
 			if (sd.shader_stage == RD::SHADER_STAGE_RAYGEN || sd.shader_stage == RD::SHADER_STAGE_MISS) {
 				p_task->base_non_hit_stages.push_back(sd);
@@ -1635,8 +1644,17 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 			}
 		}
 		if (!base_stages.is_empty()) {
+			const uint64_t hit_groups_begin = OS::get_singleton()->get_ticks_usec();
 			WorkerThreadPool::GroupID group = WorkerThreadPool::get_singleton()->add_template_group_task(this, &SceneShaderRaytracing::_compile_hit_group, p_task, p_task->compile_indices.size(), -1, true, SNAME("RT hit group compile"));
 			WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group);
+			hit_groups_usec = OS::get_singleton()->get_ticks_usec() - hit_groups_begin;
+		}
+		if (OS::get_singleton()->is_stdout_verbose()) {
+			for (uint32_t i : p_task->compile_indices) {
+				const PipelineBuildTask::SlotInput &si = p_task->slots[i];
+				print_line(vformat("RT: variant 0x%x: hit group %d (%s): GLSL to SPIR-V %d ms, to the driver's binary %d ms%s.", p_task->rt_flags, i,
+						si.name.is_empty() ? String("no path") : si.name, int(si.glslang_usec / 1000), int(si.translate_usec / 1000), si.binary.is_empty() ? ", FAILED" : ""));
+			}
 		}
 	}
 
@@ -1691,10 +1709,15 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 	}
 	hit_groups[n] = empty_hg;
 
+	const uint64_t pipeline_begin = OS::get_singleton()->get_ticks_usec();
 	RID new_pipeline = RD::get_singleton()->raytracing_pipeline_create(
 			{ &base_ps, 1 }, { &base_ps, 1 },
 			{ hit_groups.ptr(), (uint64_t)hit_groups.size() },
 			RT_MAX_RECURSION_DEPTH);
+	const uint64_t batch_end = OS::get_singleton()->get_ticks_usec();
+	print_verbose(vformat("RT: variant 0x%x: %d hit groups compiled (base stages %d ms, hit groups in parallel %d ms), pipeline of %d hit groups created in %d ms, %d ms in all.",
+			p_task->rt_flags, p_task->compile_indices.size(), int(base_usec / 1000), int(hit_groups_usec / 1000), hit_groups.size(),
+			int((batch_end - pipeline_begin) / 1000), int((batch_end - batch_begin) / 1000)));
 	if (new_pipeline.is_null()) {
 		cleanup_created();
 		p_task->failed = true;
