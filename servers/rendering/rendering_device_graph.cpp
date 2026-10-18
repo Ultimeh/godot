@@ -666,7 +666,10 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 			} else {
 				// The index is just the latest command index that wrote to the resource.
 				if (search_tracker->write_command_or_list_index == p_command_index) {
-					ERR_FAIL_MSG("Command can't have itself as a dependency.");
+					ERR_FAIL_COND_MSG(!resource_has_parent, "Command can't have itself as a dependency.");
+					// The parent was used earlier in this command, which already depends on the previous writes. A slice can share the command
+					// only in the parent's usage: another layout would overlap the parent's.
+					ERR_FAIL_COND_MSG(different_usage, "A texture slice can't be used in another usage than its parent in the same command.");
 				} else {
 					_check_discardable_attachment_dependency(search_tracker, search_tracker->write_command_or_list_index, p_command_index);
 					_add_adjacent_command(search_tracker->write_command_or_list_index, p_command_index, r_command);
