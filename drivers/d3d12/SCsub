@@ -10,7 +10,7 @@ import methods
 from methods import print_error
 
 # Sync with `misc/scripts/install_d3d12_sdk_windows.py` when updating Mesa.
-# Check for latest version: https://github.com/godotengine/godot-nir-static/releases/latest
+# Check for latest version: https://github.com/Wagnard/godot-nir-static/releases/latest
 req_version_major = 25
 req_version_minor = 3
 
@@ -49,8 +49,10 @@ mesa_gen_absdir = Dir(mesa_dir + "/generated").abspath
 
 # The official Mesa emits integer division and modulo by a value that can be 0 as plain DXIL divisions (UDiv gives ~0 where
 # NIR says 0, imod became an unsigned remainder): this fork builds with a Mesa patched for it (MESA-DIV-BY-ZERO-FIXES).
+# The releases of Wagnard/godot-nir-static (what install_d3d12_sdk_windows.py downloads) are built with every patch and
+# ship no sources, so only a local godot-nir-static source tree can be checked.
 nir_to_dxil_path = Path(mesa_absdir + "/src/microsoft/compiler/nir_to_dxil.c")
-if not nir_to_dxil_path.is_file() or "emit_div_rem" not in nir_to_dxil_path.read_text(encoding="utf-8", errors="ignore"):
+if nir_to_dxil_path.is_file() and "emit_div_rem" not in nir_to_dxil_path.read_text(encoding="utf-8", errors="ignore"):
     methods.print_warning(
         f'The Mesa in "{mesa_libs}" lacks the integer division fix (emit_div_rem): D3D12 shaders may divide by 0 wrongly. '
         "Pass mesa_libs= a godot-nir-static built with godot-patches/05_div_by_zero.patch."
