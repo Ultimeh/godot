@@ -615,8 +615,9 @@ String ShaderRD::_get_cache_file_path(Version *p_version, int p_group, const Str
 void ShaderRD::_load_variant_from_cache(uint32_t p_variant, CompileData p_data) {
 	uint32_t variant = group_to_variant_map[p_data.group][p_variant];
 	if (!variants_enabled[variant]) {
-		p_data.version->variants.write[variant] = RID();
-		return; // Variant is disabled, return.
+		// Disabled: left as it is, like _compile_variant() does. A group enabled after the version was created holds
+		// placeholders, which only _clear_version() may free.
+		return;
 	}
 
 	p_data.version->variants.write[variant] = RD::get_singleton()->shader_create_from_bytecode_with_samplers(p_data.version->variant_data[variant], p_data.version->variants[variant], immutable_samplers);
