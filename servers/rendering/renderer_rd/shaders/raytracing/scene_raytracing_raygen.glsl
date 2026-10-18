@@ -324,7 +324,7 @@ void main() {
 		sky_color = vec3(get_rt_param(RT_PARAM_BACKGROUND_COLOR), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 1), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 2));
 	} else if (bool(scene_data_block.data.flags & (SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP | SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP))) {
 		sky_color = radiance_octmap_sample(sky_uv, 0.0);
-		sky_color *= scene_data_block.data.IBL_exposure_normalization;
+		sky_color *= scene_data_block.data.radiance_normalization;
 	} else if (bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT)) {
 		sky_color = scene_data_block.data.ambient_light_color_energy.rgb;
 	}
@@ -334,7 +334,7 @@ void main() {
 
 		if (scene_data_block.data.fog_aerial_perspective > 0.0) {
 			vec3 sky_fog = radiance_octmap_sample(sky_uv, 1.0 / MAX_ROUGHNESS_LOD);
-			sky_fog *= scene_data_block.data.IBL_exposure_normalization;
+			sky_fog *= scene_data_block.data.radiance_normalization;
 			fog_color = mix(fog_color, sky_fog, scene_data_block.data.fog_aerial_perspective);
 		}
 
