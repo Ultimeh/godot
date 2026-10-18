@@ -1858,16 +1858,7 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) {
 	HashMap<uint32_t, PipelineBundle>::Iterator bit = pipeline_bundles.find(p_task->rt_flags);
 	if (bit == pipeline_bundles.end()) {
-		for (uint32_t i = 0; i < p_task->slots.size(); i++) {
-			if (p_task->slots[i].existing_per_hg_shader.is_null() &&
-					i < p_task->new_per_hg_shaders.size() &&
-					p_task->new_per_hg_shaders[i].is_valid()) {
-				RD::get_singleton()->free_rid(p_task->new_per_hg_shaders[i]);
-			}
-		}
-		if (p_task->new_pipeline.is_valid()) {
-			RD::get_singleton()->free_rid(p_task->new_pipeline);
-		}
+		_free_unused_build_outputs(p_task);
 		return;
 	}
 	PipelineBundle &bundle = bit->value;
@@ -1970,6 +1961,21 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 	bundle.pipeline_group_count = n + 1;
 	bundle.empty_group = n;
 	pipeline_swap_count++;
+}
+
+// The pipeline and hit group shaders a task created, when no bundle takes them; the pipeline first, it uses the shaders.
+// An incremental task that added nothing returns its base pipeline, which is the bundle's.
+void SceneShaderRaytracing::_free_unused_build_outputs(PipelineBuildTask *p_task) {
+	if (p_task->new_pipeline.is_valid() && p_task->new_pipeline != p_task->base_pipeline) {
+		RD::get_singleton()->free_rid(p_task->new_pipeline);
+	}
+	p_task->new_pipeline = RID();
+	for (uint32_t i = 0; i < p_task->slots.size() && i < p_task->new_per_hg_shaders.size(); i++) {
+		if (p_task->slots[i].existing_per_hg_shader.is_null() && p_task->new_per_hg_shaders[i].is_valid()) {
+			RD::get_singleton()->free_rid(p_task->new_per_hg_shaders[i]);
+		}
+		p_task->new_per_hg_shaders[i] = RID();
+	}
 }
 
 // Single-lane rebuild dispatcher.
@@ -2091,9 +2097,8 @@ void SceneShaderRaytracing::_join_lane_for_shutdown() {
 		if (current->worker_id != WorkerThreadPool::INVALID_TASK_ID && WorkerThreadPool::get_singleton()) {
 			WorkerThreadPool::get_singleton()->wait_for_task_completion(current->worker_id);
 		}
-		if (current->new_pipeline.is_valid()) {
-			RD::get_singleton()->free_rid(current->new_pipeline);
-		}
+		// A build that finished before the abort was seen, never drained: its outputs are in no bundle.
+		_free_unused_build_outputs(current);
 		memdelete(current);
 	}
 	for (PipelineBuildTask *t : queued) {

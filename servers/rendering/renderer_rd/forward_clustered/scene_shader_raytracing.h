@@ -495,6 +495,7 @@ private:
 	void _load_hit_group_from_cache(uint32_t p_index, PipelineBuildTask *p_task);
 	void _compile_hit_group(uint32_t p_index, PipelineBuildTask *p_task);
 	void _finalize_pipeline_build(PipelineBuildTask *p_task);
+	void _free_unused_build_outputs(PipelineBuildTask *p_task);
 	void _drain_lane_inline_main_thread();
 	void _join_lane_for_shutdown();
 	PipelineBuildTask *_make_pipeline_build_task(uint32_t p_rt_flags, PipelineBundle &p_bundle);
