@@ -49,6 +49,7 @@ class RenderingContextDriverD3D12 : public RenderingContextDriver {
 	Microsoft::WRL::ComPtr<IDXGIFactory2> dxgi_factory;
 	TightLocalVector<Device> driver_devices;
 	bool tearing_supported = false;
+	bool debug_layer_enabled = false;
 
 	Error _init_device_factory();
 	Error _initialize_debug_layers();

@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/os/os.h"
 #include "core/string/ustring.h"
 #include "core/templates/local_vector.h"
@@ -123,8 +124,14 @@ Error RenderingContextDriverD3D12::_init_device_factory() {
 	ComPtr<ID3D12SDKConfiguration1> sdk_config;
 	HRESULT hr = d3d_D3D12GetInterface(CLSID_D3D12SDKConfigurationGodot, IID_PPV_ARGS(sdk_config.GetAddressOf()));
 	if (SUCCEEDED(hr)) {
-		hr = sdk_config->CreateDeviceFactory(agility_sdk_version, agility_sdk_path.ascii().get_data(), IID_PPV_ARGS(device_factory.GetAddressOf()));
-		if (FAILED(hr)) {
+		// The SDK path is relative to the executable (Microsoft's D3D12 redistributable spec, "D3D12SDKPath"). Only try the
+		// architecture folder (exported projects) when it holds D3D12Core.dll: a failed attempt prints "Unable to load
+		// D3D12Core.dll" to the debugger, which reads as the cause of any later failure.
+		const bool arch_folder = FileAccess::exists(OS::get_singleton()->get_executable_path().get_base_dir().path_join(Engine::get_singleton()->get_architecture_name()).path_join("D3D12Core.dll"));
+		if (arch_folder) {
+			hr = sdk_config->CreateDeviceFactory(agility_sdk_version, agility_sdk_path.ascii().get_data(), IID_PPV_ARGS(device_factory.GetAddressOf()));
+		}
+		if (!arch_folder || FAILED(hr)) {
 			hr = sdk_config->CreateDeviceFactory(agility_sdk_version, ".\\", IID_PPV_ARGS(device_factory.GetAddressOf()));
 		}
 		// If both calls failed, device factory is going to be nullptr, and D3D12CreateDevice is going to be used as fallback.
@@ -150,8 +157,12 @@ Error RenderingContextDriverD3D12::_initialize_debug_layers() {
 		res = d3d_D3D12GetDebugInterface(IID_PPV_ARGS(&debug_controller));
 	}
 
-	ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_QUERY_FAILED);
+	// Microsoft's D3D12 redistributable spec, "D3D12 Debug Layer": the debug layer requires the Windows optional feature
+	// "Graphics Tools" as well as the redistributable's D3D12SDKLayers.dll. Without it, D3D12Core.dll refuses the
+	// D3D12SDKLayers.dll next to it ("requires that the latest SDKLayers for Windows 10 is installed").
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_QUERY_FAILED, vformat("Direct3D 12: the debug layer is unavailable (0x%08ux). It requires the Windows optional feature \"Graphics Tools\" (Settings > System > Optional features), in addition to the Agility SDK's D3D12SDKLayers.dll next to D3D12Core.dll.", (uint64_t)res));
 	debug_controller->EnableDebugLayer();
+	debug_layer_enabled = true;
 
 	// GODOT_D3D12_GBV=1 adds GPU-based validation: resource states and descriptors checked as the GPU executes (slow).
 	if (OS::get_singleton()->get_environment("GODOT_D3D12_GBV") == "1") {
@@ -240,16 +251,22 @@ Error RenderingContextDriverD3D12::_initialize_devices() {
 }
 
 bool RenderingContextDriverD3D12::use_validation_layers() const {
-	return Engine::get_singleton()->is_validation_layers_enabled();
+	// What --gpu-validation got, not what it asked for: the DXGI debug factory and the device's info queue need the
+	// debug layer.
+	return debug_layer_enabled;
 }
 
 Error RenderingContextDriverD3D12::initialize() {
 	Error err = _init_device_factory();
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 
-	if (use_validation_layers()) {
+	// Without the debug layer, stay on Direct3D 12 (the error above says why): failing here would switch to Vulkan, and
+	// the run would validate another driver than the one asked for.
+	if (Engine::get_singleton()->is_validation_layers_enabled()) {
 		err = _initialize_debug_layers();
-		ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
+		if (err != OK) {
+			ERR_PRINT("Direct3D 12: --gpu-validation requested, but running WITHOUT the debug layer.");
+		}
 	}
 
 	err = _initialize_devices();
