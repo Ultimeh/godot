@@ -1355,6 +1355,7 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			sky->processing_layer = 1;
 		}
 		sky->baked_exposure = p_luminance_multiplier;
+		sky->baked_brightness = p_brightness_multiplier;
 		sky->reflection.dirty = false;
 
 	} else {
@@ -1628,6 +1629,13 @@ float SkyRD::sky_get_baked_exposure(RID p_sky) const {
 	ERR_FAIL_NULL_V(sky, 1.0);
 
 	return sky->baked_exposure;
+}
+
+float SkyRD::sky_get_baked_brightness(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 1.0);
+
+	return sky->baked_brightness;
 }
 
 RID SkyRD::allocate_sky_rid() {

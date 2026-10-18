@@ -1622,9 +1622,8 @@ void main() {
 		indirect_specular_light = hvec3(textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ref_uv, lod).rgb);
 #endif //USE_RADIANCE_OCTMAP_ARRAY
 		indirect_specular_light *= REFLECTION_MULTIPLIER;
-		indirect_specular_light *= half(scene_data.IBL_exposure_normalization);
+		indirect_specular_light *= half(scene_data.radiance_normalization);
 		indirect_specular_light *= horizon * horizon;
-		indirect_specular_light *= half(scene_data.ambient_light_color_energy.a);
 	}
 
 #if defined(CUSTOM_RADIANCE_USED)
@@ -1648,8 +1647,8 @@ void main() {
 			hvec3 octmap_ambient = hvec3(textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ambient_uv, roughness_lod).rgb);
 #endif //USE_RADIANCE_OCTMAP_ARRAY
 			octmap_ambient *= REFLECTION_MULTIPLIER;
-			octmap_ambient *= half(scene_data.IBL_exposure_normalization);
-			ambient_light = mix(ambient_light, octmap_ambient * half(scene_data.ambient_light_color_energy.a), half(scene_data.ambient_color_sky_mix));
+			octmap_ambient *= half(scene_data.radiance_normalization);
+			ambient_light = mix(ambient_light, octmap_ambient, half(scene_data.ambient_color_sky_mix));
 		}
 	}
 #endif // !USE_LIGHTMAP
@@ -1682,7 +1681,7 @@ void main() {
 		hvec3 clearcoat_light = hvec3(textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), ref_uv, roughness_lod).rgb);
 
 #endif //USE_RADIANCE_OCTMAP_ARRAY
-		cc_specular_light += clearcoat_light * half(scene_data.IBL_exposure_normalization) * half(scene_data.ambient_light_color_energy.a);
+		cc_specular_light += clearcoat_light * half(scene_data.radiance_normalization);
 	}
 #endif // LIGHT_CLEARCOAT_USED
 #endif // !AMBIENT_LIGHT_DISABLED

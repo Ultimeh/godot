@@ -83,4 +83,5 @@ struct SceneData {
 	uint camera_visible_layers;
 	float pass_alpha_multiplier;
 	float fog_sky_affect;
+	float radiance_normalization;
 };

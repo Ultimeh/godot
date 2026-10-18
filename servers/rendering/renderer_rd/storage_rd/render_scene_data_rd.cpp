@@ -261,6 +261,23 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		ubo.IBL_exposure_normalization = 1.0;
 	}
 
+	// The radiance octmap holds the sky times the background energy, intensity and exposure it was rendered with
+	// (sky.glsl's brightness_multiplier). Its samples are scaled by the current ones over those, so each counts once,
+	// and a change made since the octmap was rendered applies at once.
+	ubo.radiance_normalization = 1.0;
+	if (p_env.is_valid()) {
+		RID sky_rid = render_scene_render->environment_get_sky(p_env);
+		if (sky_rid.is_valid()) {
+			float brightness = render_scene_render->environment_get_bg_energy_multiplier(p_env) * render_scene_render->environment_get_bg_intensity(p_env);
+			if (p_camera_attributes.is_valid()) {
+				brightness *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
+			}
+			const RendererRD::SkyRD *sky = render_scene_render->get_sky();
+			float baked_brightness = sky->sky_get_baked_exposure(sky_rid) * sky->sky_get_baked_brightness(sky_rid);
+			ubo.radiance_normalization = baked_brightness > 0.0 ? brightness / p_luminance_multiplier / baked_brightness : 0.0;
+		}
+	}
+
 	bool roughness_limiter_enabled = p_opaque_render_buffers && render_scene_render->screen_space_roughness_limiter_is_active();
 	ubo.flags |= roughness_limiter_enabled ? SCENE_DATA_FLAGS_USE_ROUGHNESS_LIMITER : 0;
 	ubo.roughness_limiter_amount = render_scene_render->screen_space_roughness_limiter_get_amount();

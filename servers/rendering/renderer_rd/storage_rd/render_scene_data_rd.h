@@ -184,7 +184,8 @@ private:
 		float pass_alpha_multiplier;
 
 		float fog_sky_affect;
-		float _pad_std140[3];
+		float radiance_normalization; // Scales the radiance octmap to the current background brightness.
+		float _pad_std140[2];
 	};
 
 	struct UBODATA {

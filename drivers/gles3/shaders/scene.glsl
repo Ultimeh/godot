@@ -229,6 +229,11 @@ struct SceneData {
 	float luminance_multiplier;
 	uint camera_visible_layers;
 	bool pancake_shadows;
+
+	float radiance_normalization;
+	uint pad1;
+	uint pad2;
+	uint pad3;
 };
 
 // The containing data block is for historic reasons.
@@ -1214,6 +1219,11 @@ struct SceneData {
 	float luminance_multiplier;
 	uint camera_visible_layers;
 	bool pancake_shadows;
+
+	float radiance_normalization;
+	uint pad1;
+	uint pad2;
+	uint pad3;
 };
 
 layout(std140) uniform SceneDataBlock { // ubo:2
@@ -2435,7 +2445,7 @@ void main() {
 		specular_light = textureLod(radiance_map, ref_vec, sqrt(roughness) * RADIANCE_MAX_LOD).rgb;
 		specular_light = srgb_to_linear(specular_light);
 		specular_light *= horizon * horizon;
-		specular_light *= scene_data_block.data.ambient_light_color_energy.a;
+		specular_light *= scene_data_block.data.radiance_normalization;
 	}
 #endif // USE_RADIANCE_MAP
 
@@ -2479,7 +2489,7 @@ void main() {
 			vec3 ambient_dir = mat3(scene_data_block.data.radiance_inverse_xform) * indirect_normal;
 			vec3 cubemap_ambient = textureLod(radiance_map, ambient_dir, RADIANCE_MAX_LOD).rgb;
 			cubemap_ambient = srgb_to_linear(cubemap_ambient);
-			ambient_light = mix(ambient_light, cubemap_ambient * scene_data_block.data.ambient_light_color_energy.a, scene_data_block.data.ambient_color_sky_mix);
+			ambient_light = mix(ambient_light, cubemap_ambient * scene_data_block.data.radiance_normalization, scene_data_block.data.ambient_color_sky_mix);
 		}
 #endif // USE_RADIANCE_MAP
 

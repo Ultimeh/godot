@@ -1676,6 +1676,22 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 		scene_state.data.IBL_exposure_normalization = 1.0;
 	}
 
+	// The radiance cubemap holds the sky times the background energy, intensity and exposure it was rendered with
+	// (its baked exposure). Its samples are scaled by the current ones over those, so each counts once, and a change
+	// made since the cubemap was rendered applies at once.
+	scene_state.data.radiance_normalization = 1.0;
+	if (is_environment(p_render_data->environment)) {
+		RID sky_rid = environment_get_sky(p_render_data->environment);
+		if (sky_rid.is_valid()) {
+			float brightness = environment_get_bg_energy_multiplier(p_render_data->environment) * environment_get_bg_intensity(p_render_data->environment);
+			if (p_render_data->camera_attributes.is_valid()) {
+				brightness *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+			}
+			float baked_brightness = sky_get_baked_exposure(sky_rid);
+			scene_state.data.radiance_normalization = baked_brightness > 0.0 ? brightness / baked_brightness : 0.0;
+		}
+	}
+
 	_update_scene_ubo(scene_state.ubo_buffer, SCENE_DATA_UNIFORM_LOCATION, sizeof(SceneState::UBO), &scene_state.data, "Scene state UBO");
 	if (p_render_data->view_count > 1) {
 		_update_scene_ubo(scene_state.multiview_buffer, SCENE_MULTIVIEW_UNIFORM_LOCATION, sizeof(SceneState::MultiviewUBO), &scene_state.multiview_data, "Multiview UBO");

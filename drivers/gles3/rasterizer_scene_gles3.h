@@ -451,6 +451,11 @@ private:
 			float luminance_multiplier;
 			uint32_t camera_visible_layers;
 			bool pancake_shadows;
+
+			float radiance_normalization; // Scales the radiance cubemap to the current background brightness.
+			uint32_t pad1;
+			uint32_t pad2;
+			uint32_t pad3;
 		};
 		static_assert(sizeof(UBO) % 16 == 0, "Scene UBO size must be a multiple of 16 bytes");
 		static_assert(sizeof(UBO) < 16384, "Scene UBO size must be 16384 bytes or smaller");

@@ -270,6 +270,7 @@ public:
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
 		float baked_exposure = 1.0;
+		float baked_brightness = 1.0; // Background energy, intensity and exposure the radiance octmap was rendered with.
 
 		// State to track when radiance octmap needs updating.
 		SkyMaterialData *prev_material = nullptr;
@@ -320,6 +321,7 @@ public:
 	// when the radiance is stored as a 2D array), for shaders that bind it as texture2D.
 	RID sky_get_radiance_2d_texture_rd(RID p_sky) const;
 	float sky_get_baked_exposure(RID p_sky) const;
+	float sky_get_baked_brightness(RID p_sky) const;
 
 	RID allocate_sky_rid();
 	void initialize_sky_rid(RID p_rid);
