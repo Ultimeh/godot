@@ -692,6 +692,7 @@ void RenderRaytracing::prepare_frame() {
 	instance_flags.clear();
 	instance_masks.clear();
 	front_layer_instance_count = 0;
+	procedural_instance_masks = 0;
 	mm_displace_requests.clear();
 	sbt_offsets.clear();
 	geometry_data.clear();
@@ -3985,7 +3986,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(instance_mask(inst));
+				// A ray query only reports an AABB candidate: the shader must find the hit itself
+				// (rayQueryGenerateIntersectionEXT, CommitProceduralPrimitiveHit), and the intersection is this material's
+				// code, which only its hit group has. The ray query loops trace these bits with traceRay instead.
+				uint8_t proc_mask = instance_mask(inst);
+				if (proc_mask & RT_INSTANCE_MASK_SHADOW) {
+					proc_mask |= RT_INSTANCE_MASK_PROCEDURAL_SHADOW;
+				}
+				if (proc_mask & RT_INSTANCE_MASK_CAMERA) {
+					proc_mask |= RT_INSTANCE_MASK_PROCEDURAL_CAMERA;
+				}
+				procedural_instance_masks |= proc_mask & (RT_INSTANCE_MASK_PROCEDURAL_SHADOW | RT_INSTANCE_MASK_PROCEDURAL_CAMERA);
+				instance_masks.push_back(proc_mask);
 			}
 			continue;
 		}
@@ -5390,6 +5402,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRONT_LAYER_COUNT] = float(front_layer_instance_count);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PROCEDURAL_MASKS] = float(procedural_instance_masks);
 		if (p_background_is_color) {
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 0] = p_background_color.r;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 1] = p_background_color.g;

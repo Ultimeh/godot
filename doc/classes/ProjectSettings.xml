@@ -3310,6 +3310,7 @@
 		<member name="rendering/pathtracing/use_simple_shadows" type="bool" setter="" getter="" default="false">
 			If [code]true[/code], shadow rays use Ray Queries instead of fully traced rays. Ray Queries are significantly cheaper but rely on a quick alpha texture fetch, which can produce incorrect shadows on materials with generated/animated alpha textures. Fully traced shadow rays are more accurate but incur a higher GPU cost.
 			[b]Note:[/b] Only has an effect when path tracing is enabled on the active [Environment].
+			[b]Note:[/b] A Ray Query cannot run the intersection code of an [RTProceduralInstance3D]: while the scene holds any, the shadow rays that the Ray Query lets through are traced again through the pipeline against procedural geometry only.
 		</member>
 		<member name="rendering/reflections/reflection_atlas/reflection_count" type="int" setter="" getter="" default="64">
 			Number of cubemaps to store in the reflection atlas. The number of [ReflectionProbe]s in a scene will be limited by this amount. A higher number requires more VRAM.

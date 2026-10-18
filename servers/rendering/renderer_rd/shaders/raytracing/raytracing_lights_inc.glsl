@@ -185,9 +185,50 @@ float lights_get_specular_multiplier(float specular_amount, float roughness) {
 // Shadow Ray (traceRayEXT pipeline)
 // ============================================================================
 
-/// Returns true if light is visible.
-/// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
+/// Returns true if nothing p_mask selects blocks the ray.
+/// Uses SkipClosestHitShader so only intersection, any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
+bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dist, uint p_mask) {
+#if defined(USE_SER)
+	hitObjectEXT hitObject;
+	hitObjectTraceRayEXT(hitObject, tlas,
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			p_mask, 0, 0, 0,
+			origin, 0.001, direction, max_dist - 0.001, 0);
+
+	return !(hitObjectIsHitEXT(hitObject));
+#else
+	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
+	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
+	// Save full payload, set up shadow ray, then restore after trace.
+	PathPayload saved_payload = payload;
+
+	PathState shadow_ps;
+	shadow_ps.radiance = vec3(0.0);
+	shadow_ps.throughput = vec3(0.0);
+	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
+	shadow_ps.rng_state = 0u;
+	shadow_ps.hit_t = 0.0;
+	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
+	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
+	path_pack(payload, shadow_ps);
+
+	traceRayEXT(tlas,
+			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			p_mask, 0, 0, 0,
+			origin, 0.001, direction, max_dist - 0.001, 0);
+
+	// Unpack to check visibility (miss shader packs radiance = 1.0).
+	shadow_ps = path_unpack(payload);
+	bool visible = shadow_ps.radiance.x > 0.5;
+
+	payload = saved_payload;
+
+	return visible;
+#endif
+}
+
+/// Returns true if light is visible.
 bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
 	// A light within 2 mm of the surface would give the ray an empty interval (tmax below tmin), which Vulkan leaves
 	// undefined: it is visible.
@@ -214,43 +255,18 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 		}
 	}
 
-	return rayQueryGetIntersectionTypeEXT(shadow_rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
-#elif defined(USE_SER)
-	hitObjectEXT hitObject;
-	hitObjectTraceRayEXT(hitObject, tlas,
-			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			RT_MASK_SHADOW, 0, 0, 0,
-			origin, 0.001, direction, max_dist - 0.001, 0);
-
-	return !(hitObjectIsHitEXT(hitObject));
+	if (rayQueryGetIntersectionTypeEXT(shadow_rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+		return false;
+	}
+	// The query skipped the AABB candidates: the shader must find their hit itself (GL_EXT_ray_query
+	// rayQueryGenerateIntersectionEXT, DXR spec RayQuery::CommitProceduralPrimitiveHit), and it is the material's
+	// intersection code, which only its hit group has. The procedural shadow casters are traced through the pipeline, when the TLAS holds any.
+	if ((uint(get_rt_param(RT_PARAM_PROCEDURAL_MASKS)) & RT_MASK_PROCEDURAL_SHADOW) != 0u) {
+		return lights_trace_shadow_ray_pipeline(origin, direction, max_dist, RT_MASK_PROCEDURAL_SHADOW);
+	}
+	return true;
 #else
-	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
-	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
-	// Save full payload, set up shadow ray, then restore after trace.
-	PathPayload saved_payload = payload;
-
-	PathState shadow_ps;
-	shadow_ps.radiance = vec3(0.0);
-	shadow_ps.throughput = vec3(0.0);
-	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
-	shadow_ps.rng_state = 0u;
-	shadow_ps.hit_t = 0.0;
-	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
-	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
-	path_pack(payload, shadow_ps);
-
-	traceRayEXT(tlas,
-			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			RT_MASK_SHADOW, 0, 0, 0,
-			origin, 0.001, direction, max_dist - 0.001, 0);
-
-	// Unpack to check visibility (miss shader packs radiance = 1.0).
-	shadow_ps = path_unpack(payload);
-	bool visible = shadow_ps.radiance.x > 0.5;
-
-	payload = saved_payload;
-
-	return visible;
+	return lights_trace_shadow_ray_pipeline(origin, direction, max_dist, RT_MASK_SHADOW);
 #endif
 }
 

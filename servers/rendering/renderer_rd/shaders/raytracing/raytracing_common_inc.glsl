@@ -21,6 +21,9 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_MASK_CAMERA 0x01
 #define RT_MASK_SHADOW 0x02
 #define RT_MASK_FRONT_LAYER 0x04
+// Procedural geometry only, next to SHADOW and CAMERA: what a ray query loop traces apart (RT_PARAM_PROCEDURAL_MASKS).
+#define RT_MASK_PROCEDURAL_SHADOW 0x08
+#define RT_MASK_PROCEDURAL_CAMERA 0x10
 
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;

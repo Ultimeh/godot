@@ -95,7 +95,8 @@ public:
 	static constexpr int RT_PARAM_DENOISER = 3;
 	static constexpr int RT_PARAM_FRONT_LAYER_COUNT = 4;
 	static constexpr int RT_PARAM_DECAL_COUNT = 5;
-	// Indices 6-7 reserved for future use.
+	static constexpr int RT_PARAM_PROCEDURAL_MASKS = 6; // RT_INSTANCE_MASK_PROCEDURAL_* bits in the TLAS this frame.
+	// Index 7 reserved for future use.
 	static constexpr int RT_PARAM_BACKGROUND_COLOR = 8; // 8-10: linear RGB, with the background energy.
 	static constexpr int RT_PARAM_BACKGROUND_COLOR_USED = 11;
 	// Indices 12-13 reserved for future use.

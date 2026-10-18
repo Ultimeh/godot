@@ -257,6 +257,10 @@ enum : uint8_t {
 	RT_INSTANCE_MASK_CAMERA = 1u,
 	RT_INSTANCE_MASK_SHADOW = 2u,
 	RT_INSTANCE_MASK_FRONT_LAYER = 4u, // Transparent surfaces, for their reflections only (RenderForwardClustered::front_layer_reflection).
+	// Procedural geometry (RTProceduralInstance3D) also carries these next to SHADOW and CAMERA: a ray query cannot run
+	// its intersection shader, so the ray query loops trace them apart with traceRay (RT_PARAM_PROCEDURAL_MASKS).
+	RT_INSTANCE_MASK_PROCEDURAL_SHADOW = 8u,
+	RT_INSTANCE_MASK_PROCEDURAL_CAMERA = 0x10u,
 	RT_INSTANCE_MASK_DOUBLE_SIDED_SHADOW = 0x80u, // Build-time only: the shadow rays need both faces, see build_tlas().
 };
 
@@ -824,6 +828,7 @@ class RenderRaytracing {
 	LocalVector<uint32_t> decal_grid;
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 	uint32_t front_layer_instance_count = 0;
+	uint32_t procedural_instance_masks = 0; // RT_INSTANCE_MASK_PROCEDURAL_* bits of this frame's instances.
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 

@@ -602,9 +602,24 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 					}
 				}
 			}
+			float spec_t_max = 10000.0;
 			if (rayQueryGetIntersectionTypeEXT(spec_rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
 				spec_hit_dist = rayQueryGetIntersectionTEXT(spec_rq, true);
+				spec_t_max = spec_hit_dist;
 			}
+#ifdef USE_SER
+			// The query skipped procedural geometry, whose hit only its hit group's intersection shader finds (see
+			// lights_trace_shadow_ray()). A hit object runs it, and gives the distance without a closest hit shader.
+			// Without SER, procedural geometry is missing from this guide.
+			if ((uint(get_rt_param(RT_PARAM_PROCEDURAL_MASKS)) & RT_MASK_PROCEDURAL_CAMERA) != 0u) {
+				hitObjectEXT spec_hit_object;
+				hitObjectTraceRayEXT(spec_hit_object, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+						RT_MASK_PROCEDURAL_CAMERA, 0, 0, 0, spec_origin, 0.001, spec_dir, spec_t_max, 0);
+				if (hitObjectIsHitEXT(spec_hit_object)) {
+					spec_hit_dist = hitObjectGetRayTMaxEXT(spec_hit_object);
+				}
+			}
+#endif
 		}
 		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}

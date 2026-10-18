@@ -8,6 +8,7 @@
 		Each entry in [member bounds] defines one primitive AABB visible to intersection shaders via [code]gl_PrimitiveID[/code]. If [member bounds] is empty the node falls back to a single primitive using [member size] as the bounding box centered at the origin.
 		A zero-surface [ArrayMesh] is attached internally so the renderer classifies this node as a mesh instance. No vertex or index data is submitted to the raster pipeline; the node is invisible outside of ray tracing.
 		[b]Note:[/b] Requires a GPU with hardware ray tracing support and path tracing enabled in the [Environment].
+		[b]Note:[/b] Transparent surfaces, which path tracing draws with rasterization, receive no shadow from procedural geometry: their shadow rays are ray queries in the fragment shader, which cannot run the material's intersection code. Without shader execution reordering (SER), procedural geometry is also missing from the specular hit distance given to DLSS Ray Reconstruction. Shadows of opaque surfaces are complete, including with [member ProjectSettings.rendering/pathtracing/use_simple_shadows].
 	</description>
 	<tutorials>
 	</tutorials>
