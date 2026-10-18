@@ -503,7 +503,10 @@ private:
 		String base_sources_key; // Their hash, part of every hit group's cache key.
 		String ch_template; // Template GLSL with /* RT_CUSTOM_* */ markers.
 		String ah_template;
-		String is_template;
+		String is_template; // With ENABLE_INTERSECTION_SHADERS.
+		// The base any-hit for procedural hit groups without their own: their hit attributes are the intersection
+		// shader's (ENABLE_INTERSECTION_SHADERS), hit group 0's are a triangle's.
+		String ah_procedural_src;
 	};
 	HashMap<uint32_t, VariantCompileContext> variant_compile_contexts;
 

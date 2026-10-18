@@ -88,6 +88,18 @@ static uint32_t _raygen_variant_from_rt_flags(uint32_t p_rt_flags) {
 	return variant;
 }
 
+// Procedural hit groups only: their shaders share the intersection shader's hit attributes.
+static constexpr const char *INTERSECTION_SHADERS_DEFINE = "#define ENABLE_INTERSECTION_SHADERS\n";
+
+// p_source with p_define on the line after its #version directive.
+static String _insert_after_version(const String &p_source, const String &p_define) {
+	const int version_pos = p_source.find("#version");
+	ERR_FAIL_COND_V(version_pos < 0, p_source);
+	const int line_end = p_source.find("\n", version_pos);
+	ERR_FAIL_COND_V(line_end < 0, p_source);
+	return p_source.insert(line_end + 1, p_define);
+}
+
 // Returns the GLSL preamble for the variant identified by p_variant_mask.
 // Each set bit i activates RAYGEN_SHADER_OPTIONS[i].define_snippet.
 static String _raygen_variant_preamble(uint32_t p_variant_mask) {
@@ -419,6 +431,10 @@ struct SceneShaderRaytracing::PipelineBuildTask {
 	Vector<RD::ShaderStageSPIRVData> base_non_hit_stages; // RAYGEN + MISS.
 	RD::ShaderStageSPIRVData base_any_hit_stage;
 	bool base_any_hit_valid = false;
+	// The same any-hit with the intersection shaders' hit attributes, for procedural hit groups without their own.
+	String base_any_hit_procedural_src;
+	RD::ShaderStageSPIRVData base_any_hit_procedural_stage;
+	bool base_any_hit_procedural_valid = false;
 
 	struct SlotInput {
 		RID existing_per_hg_shader;
@@ -1197,8 +1213,10 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 		}
 	};
 
-	// Fixed intersection hit-attribute layout for all variants (keeps base_shader layout stable).
-	inject_define(sources, "#define ENABLE_INTERSECTION_SHADERS\n");
+	// No ENABLE_INTERSECTION_SHADERS in the base: hit group 0 and the custom triangle hit groups are triangle hit groups,
+	// whose any-hit and closest-hit shaders must use BuiltInTriangleIntersectionAttributes (DXR spec, "Intersection
+	// attributes structure"). Procedural hit groups get it (_insert_after_version()), so that all their shaders use the
+	// intersection shader's structure, as the same section requires.
 
 	if (p_rt_flags & RT_FLAG_DEBUG_VIS_ENABLED) {
 		inject_define(sources, "#define RT_DEBUG_ENABLED\n");
@@ -1224,10 +1242,11 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	VariantCompileContext ctx;
 	ctx.ch_template = base_ch_src.insert(base_ch_src.find("\n", base_ch_ver) + 1, custom_hg_define);
 	ctx.ah_template = base_ah_src.insert(base_ah_src.find("\n", base_ah_ver) + 1, custom_hg_define);
+	ctx.ah_procedural_src = _insert_after_version(base_ah_src, INTERSECTION_SHADERS_DEFINE);
 	if (!intersection_source_template.is_empty()) {
 		int base_is_ver = intersection_source_template.find("#version");
 		if (base_is_ver >= 0) {
-			ctx.is_template = intersection_source_template.insert(intersection_source_template.find("\n", base_is_ver) + 1, custom_hg_define);
+			ctx.is_template = _insert_after_version(intersection_source_template.insert(intersection_source_template.find("\n", base_is_ver) + 1, custom_hg_define), INTERSECTION_SHADERS_DEFINE);
 		}
 	}
 
@@ -1410,6 +1429,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 	task->base_sbt_capacity = p_bundle.hit_sbt_capacity;
 	task->base_sources = ctx.base_sources;
 	task->base_sources_key = ctx.base_sources_key;
+	task->base_any_hit_procedural_src = ctx.ah_procedural_src;
 	{
 		RD::PipelineSpecializationConstant sc;
 		sc.constant_id = 0;
@@ -1510,6 +1530,12 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
 			si.ah_src = _apply_varying_code(s, entry.varyings);
 		}
+		if (entry.is_procedural) {
+			si.ch_src = _insert_after_version(si.ch_src, INTERSECTION_SHADERS_DEFINE);
+			if (!si.ah_src.is_empty()) {
+				si.ah_src = _insert_after_version(si.ah_src, INTERSECTION_SHADERS_DEFINE);
+			}
+		}
 		if (entry.is_procedural && !ctx.is_template.is_empty()) {
 			String s = ctx.is_template;
 			s = s.replace("/* RT_CUSTOM_INTERSECTION_GLOBALS */", entry.intersection_globals);
@@ -1560,6 +1586,12 @@ void SceneShaderRaytracing::_compile_hit_group(uint32_t p_index, PipelineBuildTa
 			return;
 		}
 		custom_stages.push_back(sd);
+	} else if (si.is_procedural) {
+		// The hit group takes its any-hit from this binary: without it, the slot fails.
+		if (!p_task->base_any_hit_procedural_valid) {
+			return;
+		}
+		custom_stages.push_back(p_task->base_any_hit_procedural_stage);
 	} else if (p_task->base_any_hit_valid) {
 		custom_stages.push_back(p_task->base_any_hit_stage);
 	}
@@ -1666,6 +1698,19 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 				p_task->base_any_hit_valid = true;
 			}
 		}
+		for (uint32_t i : p_task->compile_indices) {
+			const PipelineBuildTask::SlotInput &si = p_task->slots[i];
+			if (si.is_procedural && !si.uses_alpha_clip) {
+				String error;
+				p_task->base_any_hit_procedural_stage.shader_stage = RD::SHADER_STAGE_ANY_HIT;
+				p_task->base_any_hit_procedural_stage.spirv = RD::get_singleton()->shader_compile_spirv_from_source(RD::SHADER_STAGE_ANY_HIT, p_task->base_any_hit_procedural_src, RD::SHADER_LANGUAGE_GLSL, &error);
+				p_task->base_any_hit_procedural_valid = !p_task->base_any_hit_procedural_stage.spirv.is_empty();
+				if (!p_task->base_any_hit_procedural_valid) {
+					_dump_failed_shader(p_task->base_any_hit_procedural_src, vformat("v%x_any_hit_procedural", p_task->rt_flags));
+				}
+				break;
+			}
+		}
 		if (!base_stages.is_empty()) {
 			const uint64_t hit_groups_begin = OS::get_singleton()->get_ticks_usec();
 			WorkerThreadPool::GroupID group = WorkerThreadPool::get_singleton()->add_template_group_task(this, &SceneShaderRaytracing::_compile_hit_group, p_task, p_task->compile_indices.size(), -1, true, SNAME("RT hit group compile"));
@@ -1730,7 +1775,8 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 			RD::PipelineShader base_any_hit_ps = { p_task->base_shader, p_task->spec_constants };
 			RD::HitGroup hg;
 			hg.closest_hit_shader = custom_ps;
-			hg.any_hit_shader = si.uses_alpha_clip ? custom_ps : base_any_hit_ps;
+			// A procedural hit group's any-hit is in its own binary, with the intersection shader's hit attributes.
+			hg.any_hit_shader = (si.uses_alpha_clip || si.is_procedural) ? custom_ps : base_any_hit_ps;
 			if (si.is_procedural) {
 				hg.intersection_shader = custom_ps;
 			}
@@ -1781,7 +1827,7 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 		RD::PipelineShader custom_ps = { p_task->new_per_hg_shaders[i], p_task->spec_constants };
 		RD::HitGroup hg;
 		hg.closest_hit_shader = custom_ps;
-		hg.any_hit_shader = p_task->slots[i].uses_alpha_clip ? custom_ps : base_ps;
+		hg.any_hit_shader = (p_task->slots[i].uses_alpha_clip || p_task->slots[i].is_procedural) ? custom_ps : base_ps;
 		if (p_task->slots[i].is_procedural) {
 			hg.intersection_shader = custom_ps;
 		}

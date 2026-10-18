@@ -68,8 +68,9 @@ layout(set = 0, binding = 15, r32f) uniform image2D rt_depth_image;
 
 #endif // !RT_STAGE_ANY_HIT
 
-// Shared hitAttributeEXT layout for all hit-group stages.
-// Vulkan requires every shader in a hit group to agree on this layout.
+// Hit attributes: a triangle's barycentrics (BuiltInTriangleIntersectionAttributes, required in triangle hit groups by
+// the DXR spec, "Intersection attributes structure"), or with ENABLE_INTERSECTION_SHADERS, which only procedural hit
+// groups' shaders get, the structure their intersection shader reports. Every shader of a hit group uses the same one.
 #if defined(RT_STAGE_CLOSEST_HIT) || defined(RT_STAGE_ANY_HIT) || defined(RT_STAGE_INTERSECTION)
 struct HitAttribs {
 	vec2 bary_or_uv;
