@@ -130,9 +130,11 @@ void FSRFrameGenerationEffect::prepare(const Parameters &p_params) {
 LocalVector<FSRFrameGenerationEffect::CallbackPayload *> FSRFrameGenerationEffect::pending_payloads;
 
 void FSRFrameGenerationEffect::_capture_hudless(CallbackPayload *p_payload) {
+#ifdef D3D12_ENABLED
 	const RID hudless = DLSSEffect::get_frame_generation_hudless();
 	p_payload->hudless_resource = hudless.is_valid() ? RD::get_singleton()->get_driver_resource(RD::DriverResource::DRIVER_RESOURCE_TEXTURE, hudless) : 0;
 	p_payload->hudless_final = true;
+#endif
 }
 
 void FSRFrameGenerationEffect::finalize_frame_callbacks() {
