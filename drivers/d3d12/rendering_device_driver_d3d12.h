@@ -117,6 +117,8 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 		bool shader_execution_reordering_supported = false;
 		// Ray tracing tier 1.2 and Shader Model 6.9, whose ray queries (AllocateRayQuery2) may meet opacity micromaps.
 		bool opacity_micromap_supported = false;
+		// Ray tracing tier 1.1 and ID3D12Device7: hit groups added to a pipeline (AddToStateObject).
+		bool state_object_additions_supported = false;
 	};
 
 	RenderingContextDriverD3D12 *context_driver = nullptr;
@@ -463,7 +465,6 @@ private:
 	static const char *_device_removed_reason_name(HRESULT p_reason);
 
 public:
-
 private:
 	/********************/
 	/**** SEMAPHORES ****/
@@ -974,13 +975,29 @@ private:
 		Microsoft::WRL::ComPtr<ID3D12StateObject> pso;
 		const ShaderInfo *layout_defining_shader_info = nullptr;
 		TightLocalVector<const void *> shader_identifiers;
+
+		// Made with D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS: hit groups can be added (AddToStateObject). An
+		// identifier points into the state object it was queried from: a grown one queries all of them again, by name.
+		bool allows_additions = false;
+		uint32_t generation = 0; // Additions in its chain, which make the exports' names unique.
+		uint32_t max_payload_size = 0;
+		uint32_t max_attribute_size = 0;
+		uint32_t max_recursion_depth = 0;
+		TightLocalVector<String> group_names; // Each group's export, in group order.
 	};
+
+	// The ray tracing pipeline's config, shader config and global root signature subobjects, the same in a pipeline and in
+	// what is added to it (DXR spec, AddToStateObject).
+	void _raytracing_state_object_add_configs(CD3DX12_STATE_OBJECT_DESC &r_desc, const RaytracingPipelineInfo &p_pipeline);
 
 public:
 	virtual RaytracingPipelineID raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) override final;
 	virtual void raytracing_pipeline_free(RaytracingPipelineID p_pipeline) override final;
 
 	virtual bool raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) override final;
+
+	virtual bool raytracing_pipeline_can_add_hit_groups(RaytracingPipelineID p_pipeline) override final;
+	virtual RaytracingPipelineID raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) override final;
 
 private:
 	D3D12_GPU_VIRTUAL_ADDRESS_RANGE _sbt_to_gpu_virtual_address_range(const ShaderBindingTable &p_sbt);

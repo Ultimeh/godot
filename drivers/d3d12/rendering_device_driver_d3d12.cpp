@@ -6499,6 +6499,32 @@ RDD::AccelerationStructureID RenderingDeviceDriverD3D12::opacity_micromap_create
 
 // ----- PIPELINE -----
 
+void RenderingDeviceDriverD3D12::_raytracing_state_object_add_configs(CD3DX12_STATE_OBJECT_DESC &r_desc, const RaytracingPipelineInfo &p_pipeline) {
+	// Owned by the desc, which keeps a pointer to each helper's data: a helper local to this function would be gone before
+	// CreateStateObject / AddToStateObject reads it (d3dx12_state_object.h, CreateSubobject).
+	CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT *shader_config_subobject = r_desc.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
+	shader_config_subobject->Config(p_pipeline.max_payload_size, p_pipeline.max_attribute_size);
+
+	if (raytracing_capabilities.opacity_micromap_supported) {
+		// Without it, the pipeline's rays must not meet a geometry that references an opacity micromap array.
+		CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT *pipeline_config_subobject = r_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
+		pipeline_config_subobject->Config(p_pipeline.max_recursion_depth, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS);
+	} else {
+		CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT *pipeline_config_subobject = r_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
+		pipeline_config_subobject->Config(p_pipeline.max_recursion_depth);
+	}
+
+	CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT *root_signature_subobject = r_desc.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
+	root_signature_subobject->SetRootSignature(p_pipeline.layout_defining_shader_info->root_signature.Get());
+
+	if (p_pipeline.allows_additions) {
+		// What is added later is not compiled with the rest again (DXR spec, "Incremental additions to existing state
+		// objects"); every version keeps the flag so it can grow again.
+		CD3DX12_STATE_OBJECT_CONFIG_SUBOBJECT *state_object_config_subobject = r_desc.CreateSubobject<CD3DX12_STATE_OBJECT_CONFIG_SUBOBJECT>();
+		state_object_config_subobject->SetFlags(D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS);
+	}
+}
+
 RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) {
 	// This RAII helper is to free patched shader bytecodes when the function returns.
 	thread_local LocalVector<Vector<uint8_t>> shader_bytecodes;
@@ -6510,6 +6536,7 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 
 	thread_local LocalVector<LPCWSTR> export_names;
 	export_names.clear();
+	TightLocalVector<String> group_names;
 
 	CD3DX12_STATE_OBJECT_DESC state_object_desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
 	uint32_t max_payload_size_in_bytes = 0;
@@ -6551,10 +6578,12 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 
 	for (uint32_t i = 0; i < p_raygen_shader_indices.size(); i++) {
 		shader_identifier_names.push_back(export_names[p_raygen_shader_indices[i]]);
+		group_names.push_back(vformat("dxil_library_subobject_%d", p_raygen_shader_indices[i]));
 	}
 
 	for (uint32_t i = 0; i < p_miss_shader_indices.size(); i++) {
 		shader_identifier_names.push_back(export_names[p_miss_shader_indices[i]]);
+		group_names.push_back(vformat("dxil_library_subobject_%d", p_miss_shader_indices[i]));
 	}
 
 	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
@@ -6579,25 +6608,17 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 		}
 
 		shader_identifier_names.push_back(((const D3D12_HIT_GROUP_DESC &)*hit_group_subobject).HitGroupExport);
-	}
-
-	CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT shader_config_subobject(state_object_desc);
-	shader_config_subobject.Config(max_payload_size_in_bytes, max_attribute_size_in_bytes);
-
-	if (raytracing_capabilities.opacity_micromap_supported) {
-		// Without it, the pipeline's rays must not meet a geometry that references an opacity micromap array.
-		// Owned by the desc, which keeps a pointer to the helper's data: a helper local to this block would be gone
-		// before CreateStateObject reads it (d3dx12_state_object.h, CreateSubobject).
-		CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT *pipeline_config_subobject = state_object_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
-		pipeline_config_subobject->Config(p_max_trace_recursion_depth, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS);
-	} else {
-		CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT *pipeline_config_subobject = state_object_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-		pipeline_config_subobject->Config(p_max_trace_recursion_depth);
+		group_names.push_back(hit_group_export_name);
 	}
 
 	const ShaderInfo *layout_defining_shader_info = (const ShaderInfo *)p_layout_defining_shader.id;
-	CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT root_signature_subobject(state_object_desc);
-	root_signature_subobject.SetRootSignature(layout_defining_shader_info->root_signature.Get());
+	RaytracingPipelineInfo config;
+	config.layout_defining_shader_info = layout_defining_shader_info;
+	config.max_payload_size = max_payload_size_in_bytes;
+	config.max_attribute_size = max_attribute_size_in_bytes;
+	config.max_recursion_depth = p_max_trace_recursion_depth;
+	config.allows_additions = raytracing_capabilities.state_object_additions_supported;
+	_raytracing_state_object_add_configs(state_object_desc, config);
 
 	ComPtr<ID3D12Device5> device_5;
 	device->QueryInterface(device_5.GetAddressOf());
@@ -6624,7 +6645,121 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 	raytracing_pipeline_info->pso = std::move(state_object);
 	raytracing_pipeline_info->layout_defining_shader_info = layout_defining_shader_info;
 	raytracing_pipeline_info->shader_identifiers = std::move(shader_identifiers);
+	raytracing_pipeline_info->allows_additions = config.allows_additions;
+	raytracing_pipeline_info->max_payload_size = config.max_payload_size;
+	raytracing_pipeline_info->max_attribute_size = config.max_attribute_size;
+	raytracing_pipeline_info->max_recursion_depth = config.max_recursion_depth;
+	raytracing_pipeline_info->group_names = std::move(group_names);
 
+	return RaytracingPipelineID(raytracing_pipeline_info);
+}
+
+bool RenderingDeviceDriverD3D12::raytracing_pipeline_can_add_hit_groups(RaytracingPipelineID p_pipeline) {
+	return p_pipeline && ((const RaytracingPipelineInfo *)p_pipeline.id)->allows_additions;
+}
+
+RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) {
+	const RaytracingPipelineInfo *base = (const RaytracingPipelineInfo *)p_pipeline.id;
+	ERR_FAIL_COND_V(!base || !base->allows_additions, RaytracingPipelineID());
+
+	thread_local LocalVector<Vector<uint8_t>> shader_bytecodes;
+	struct ClearShaderBytecodes {
+		~ClearShaderBytecodes() {
+			shader_bytecodes.clear();
+		}
+	} clear_shader_bytecodes;
+
+	// The addition's exports are named after its generation: a name must be unique in the whole grown state object.
+	const uint32_t generation = base->generation + 1;
+	CD3DX12_STATE_OBJECT_DESC addition_desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+	LocalVector<String> library_names;
+	uint32_t max_payload_size_in_bytes = 0;
+	uint32_t max_attribute_size_in_bytes = 0;
+
+	for (uint32_t i = 0; i < p_shaders.size(); i++) {
+		const PipelineShader &shader = p_shaders[i];
+		const ShaderInfo *shader_info_in = (const ShaderInfo *)shader.shader.id;
+
+		const Vector<uint8_t> *shader_bytecode_ptr = shader_info_in->stages_bytecode.getptr(shader.shader_stage);
+		ERR_FAIL_NULL_V(shader_bytecode_ptr, RaytracingPipelineID());
+		Vector<uint8_t> shader_bytecode = *shader_bytecode_ptr;
+		bool ok = _shader_apply_specialization_constants(shader_info_in, shader.specialization_constants, shader.shader_stage, shader_bytecode);
+		ERR_FAIL_COND_V(!ok, RaytracingPipelineID());
+
+		CD3DX12_DXIL_LIBRARY_SUBOBJECT *dxil_library_subobject = addition_desc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+		D3D12_SHADER_BYTECODE d3d12_shader_bytecode = { shader_bytecode.ptr(), (SIZE_T)shader_bytecode.size() };
+		dxil_library_subobject->SetDXILLibrary(&d3d12_shader_bytecode);
+		shader_bytecodes.push_back(std::move(shader_bytecode)); // Store the shader bytecode to prevent stale pointers.
+
+		const String export_name = vformat("dxil_library_subobject_g%d_%d", generation, i);
+		dxil_library_subobject->DefineExport((LPCWSTR)export_name.utf16().ptr(), L"main");
+		library_names.push_back(export_name);
+
+		const ShaderInfo::ShaderConfig *shader_config = shader_info_in->stages_shader_config.getptr(shader.shader_stage);
+		if (shader_config) {
+			max_payload_size_in_bytes = MAX(max_payload_size_in_bytes, shader_config->payload_size_in_bytes);
+			max_attribute_size_in_bytes = MAX(max_attribute_size_in_bytes, shader_config->attribute_size_in_bytes);
+		}
+	}
+	if (max_payload_size_in_bytes > base->max_payload_size || max_attribute_size_in_bytes > base->max_attribute_size) {
+		// An addition declares the pipeline's shader config: the caller makes the whole pipeline again.
+		print_verbose(vformat("D3D12: hit groups not added to a raytracing pipeline: payload %d / attribute %d bytes, the pipeline's are %d / %d.", max_payload_size_in_bytes, max_attribute_size_in_bytes, base->max_payload_size, base->max_attribute_size));
+		return RaytracingPipelineID();
+	}
+
+	TightLocalVector<String> group_names;
+	group_names = base->group_names;
+	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+		const HitGroup &hit_group = p_hit_groups[i];
+		CD3DX12_HIT_GROUP_SUBOBJECT *hit_group_subobject = addition_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+		const String hit_group_export_name = vformat("hit_group_subobject_g%d_%d", generation, i);
+		hit_group_subobject->SetHitGroupExport((LPCWSTR)hit_group_export_name.utf16().ptr());
+		hit_group_subobject->SetHitGroupType(hit_group.intersection_shader_index != UINT32_MAX ? D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE : D3D12_HIT_GROUP_TYPE_TRIANGLES);
+		if (hit_group.closest_hit_shader_index != UINT32_MAX) {
+			hit_group_subobject->SetClosestHitShaderImport((LPCWSTR)library_names[hit_group.closest_hit_shader_index].utf16().ptr());
+		}
+		if (hit_group.any_hit_shader_index != UINT32_MAX) {
+			hit_group_subobject->SetAnyHitShaderImport((LPCWSTR)library_names[hit_group.any_hit_shader_index].utf16().ptr());
+		}
+		if (hit_group.intersection_shader_index != UINT32_MAX) {
+			hit_group_subobject->SetIntersectionShaderImport((LPCWSTR)library_names[hit_group.intersection_shader_index].utf16().ptr());
+		}
+		group_names.push_back(hit_group_export_name);
+	}
+
+	// The same configs and global root signature as the pipeline it grows (DXR spec, AddToStateObject).
+	_raytracing_state_object_add_configs(addition_desc, *base);
+
+	ComPtr<ID3D12Device7> device_7;
+	device->QueryInterface(device_7.GetAddressOf());
+	ERR_FAIL_NULL_V(device_7, RaytracingPipelineID());
+	ComPtr<ID3D12StateObject> state_object;
+	HRESULT hr = device_7->AddToStateObject(addition_desc, base->pso.Get(), IID_PPV_ARGS(state_object.GetAddressOf()));
+	if (FAILED(hr)) {
+		_report_device_removed("AddToStateObject");
+		ERR_FAIL_V_MSG(RaytracingPipelineID(), "AddToStateObject failed with error " + vformat("0x%08ux", (uint64_t)hr) + ".");
+	}
+
+	// Every identifier queried from the grown state object: the base's point into the base, which may be freed first.
+	ComPtr<ID3D12StateObjectProperties> state_object_properties;
+	state_object->QueryInterface(state_object_properties.GetAddressOf());
+	TightLocalVector<const void *> shader_identifiers;
+	shader_identifiers.resize(group_names.size());
+	for (uint32_t i = 0; i < group_names.size(); i++) {
+		shader_identifiers[i] = state_object_properties->GetShaderIdentifier((LPCWSTR)group_names[i].utf16().ptr());
+		ERR_FAIL_NULL_V_MSG(shader_identifiers[i], RaytracingPipelineID(), "AddToStateObject: no identifier for " + group_names[i] + ".");
+	}
+
+	RaytracingPipelineInfo *raytracing_pipeline_info = VersatileResource::allocate<RaytracingPipelineInfo>(resources_allocator);
+	raytracing_pipeline_info->pso = std::move(state_object);
+	raytracing_pipeline_info->layout_defining_shader_info = base->layout_defining_shader_info;
+	raytracing_pipeline_info->shader_identifiers = std::move(shader_identifiers);
+	raytracing_pipeline_info->allows_additions = true;
+	raytracing_pipeline_info->generation = generation;
+	raytracing_pipeline_info->max_payload_size = base->max_payload_size;
+	raytracing_pipeline_info->max_attribute_size = base->max_attribute_size;
+	raytracing_pipeline_info->max_recursion_depth = base->max_recursion_depth;
+	raytracing_pipeline_info->group_names = std::move(group_names);
 	return RaytracingPipelineID(raytracing_pipeline_info);
 }
 
@@ -7516,6 +7651,11 @@ Error RenderingDeviceDriverD3D12::_check_capabilities() {
 		raytracing_capabilities.shader_execution_reordering_supported = raytracing_capabilities.raytracing_pipeline_supported && shader_capabilities.shader_model >= D3D_SHADER_MODEL_6_9;
 		// Opacity micromap arrays need tier 1.2; Shader Model 6.9 for the ray queries that may meet them (AllocateRayQuery2).
 		raytracing_capabilities.opacity_micromap_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_2 && shader_capabilities.shader_model >= D3D_SHADER_MODEL_6_9;
+		// GODOT_RT_STATE_OBJECT_ADDITIONS=0 makes every ray tracing pipeline in one piece, for comparisons.
+		ComPtr<ID3D12Device7> device_7;
+		raytracing_capabilities.state_object_additions_supported = options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 &&
+				SUCCEEDED(device->QueryInterface(device_7.GetAddressOf())) &&
+				OS::get_singleton()->get_environment("GODOT_RT_STATE_OBJECT_ADDITIONS") != "0";
 		print_verbose(vformat("D3D12: ray tracing tier %d.%d, opacity micromaps %s.", options5.RaytracingTier / 10, options5.RaytracingTier % 10, raytracing_capabilities.opacity_micromap_supported ? "supported" : "unsupported"));
 	}
 
