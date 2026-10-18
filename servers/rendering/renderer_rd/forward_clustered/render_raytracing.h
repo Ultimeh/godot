@@ -941,7 +941,9 @@ public:
 	// The decals around the camera, in world space, and a hashed grid of them for the hit shaders; uploads them to
 	// p_state's buffers. Returns their number.
 	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);
-	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
+	// `p_background_color` (linear) is what the camera rays that miss see when the background is a color; with
+	// `p_background_is_color` false they see the sky, as the light of any other ray.
+	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_background_is_color, const Color &p_background_color);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
 	void apply_volumetric_fog(const RenderDataRD *p_render_data, bool p_legacy_blending);

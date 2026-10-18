@@ -223,6 +223,7 @@
 		<member name="pathtracing_enabled" type="bool" setter="set_pathtracing_enabled" getter="is_pathtracing_enabled" default="false">
 			If [code]true[/code], enables hardware-accelerated path tracing for this environment. Path tracing produces physically accurate global illumination, reflections, and shadows by simulating light rays bouncing through the scene. Requires a GPU with ray tracing support.
 			[b]Note:[/b] Path tracing is mutually exclusive with rasterization-based rendering. When enabled, features such as SDFGI, screen-space reflections, and shadow maps are bypassed.
+			[b]Note:[/b] Camera rays that leave the scene show the background, as in rasterization. Other rays that leave the scene receive the environment's light as rasterization applies it: the [member sky] when [member ambient_light_source] or [member reflected_light_source] use it, otherwise the ambient light (the background color for [constant AMBIENT_SOURCE_BG], [member ambient_light_color] for [constant AMBIENT_SOURCE_COLOR]), and none with [constant AMBIENT_SOURCE_DISABLED].
 		</member>
 		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="3">
 			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.

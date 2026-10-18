@@ -21,7 +21,10 @@
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
 #define RT_PARAM_FRONT_LAYER_COUNT 4 // rt_params[1].x - Transparent surfaces in the TLAS (front layer reflections)
 #define RT_PARAM_DECAL_COUNT 5 // rt_params[1].y - Decals in the decal buffer (raytracing_decals_inc.glsl)
-// Indices 6-13 reserved for future use
+// Indices 6-7 reserved for future use
+#define RT_PARAM_BACKGROUND_COLOR 8 // rt_params[2].xyz - Background color seen by camera rays (linear, with its energy)
+#define RT_PARAM_BACKGROUND_COLOR_USED 11 // rt_params[2].w - 1 when the background is a color (BG_COLOR, BG_CLEAR_COLOR)
+// Indices 12-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 

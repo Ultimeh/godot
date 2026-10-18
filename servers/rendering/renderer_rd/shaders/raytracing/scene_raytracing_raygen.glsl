@@ -316,8 +316,18 @@ void main() {
 			1.0 - scene_data_block.data.radiance_border_size * 2.0);
 	vec2 sky_uv = vec3_to_oct_with_border(sky_dir, border);
 
-	vec3 sky_color = radiance_octmap_sample(sky_uv, 0.0);
-	sky_color *= scene_data_block.data.IBL_exposure_normalization;
+	// A camera ray sees the background; any other ray the light the Environment gives the scene, as the raster's ambient
+	// and reflections (scene_forward_clustered.glsl): the sky when it lights or reflects the scene, else the ambient light
+	// (the background color for AMBIENT_SOURCE_BG), nothing when the ambient light is disabled.
+	vec3 sky_color = vec3(0.0);
+	if (get_total_bounces(ps.packed_bounces_flags) == 0u && get_rt_param(RT_PARAM_BACKGROUND_COLOR_USED) != 0.0) {
+		sky_color = vec3(get_rt_param(RT_PARAM_BACKGROUND_COLOR), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 1), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 2));
+	} else if (bool(scene_data_block.data.flags & (SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP | SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP))) {
+		sky_color = radiance_octmap_sample(sky_uv, 0.0);
+		sky_color *= scene_data_block.data.IBL_exposure_normalization;
+	} else if (bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT)) {
+		sky_color = scene_data_block.data.ambient_light_color_energy.rgb;
+	}
 
 	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) != 0u) {
 		vec3 fog_color = scene_data_block.data.fog_light_color;

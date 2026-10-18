@@ -248,6 +248,8 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	float sky_brightness_multiplier = 1.0;
 
 	Color clear_color;
+	// Where raster clears to clear_color, the camera rays that miss show it.
+	bool background_is_color = true;
 
 	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW) {
 		clear_color = Color(0, 0, 0, 1); //in overdraw mode, BG should always be black
@@ -256,6 +258,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		float bg_energy_multiplier = environment_get_bg_energy_multiplier(p_render_data->environment);
 		bg_energy_multiplier *= environment_get_bg_intensity(p_render_data->environment);
 		RSE::EnvironmentReflectionSource reflection_source = environment_get_reflection_source(p_render_data->environment);
+		background_is_color = bg_mode == RSE::ENV_BG_CLEAR_COLOR || bg_mode == RSE::ENV_BG_COLOR;
 
 		if (p_render_data->camera_attributes.is_valid()) {
 			bg_energy_multiplier *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
@@ -353,7 +356,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// and freeing the previous one freed a set made with it ("uniform_set is null" on the first frames).
 	if (rt_state) {
 		raytracing->rt_ensure_textures(rb.ptr());
-		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
+		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, background_is_color, clear_color);
 	}
 
 	// Execute raytracing (replaces the opaque + motion vector pass). Without a uniform set this frame (the pipeline was
