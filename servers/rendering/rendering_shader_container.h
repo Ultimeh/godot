@@ -68,6 +68,7 @@ protected:
 		uint32_t push_constant_stages_mask = 0;
 		uint32_t stage_count = 0;
 		uint32_t shader_name_len = 0;
+		uint32_t padding = 0; // Fills the alignment hole left by vertex_input_mask, which would be serialized uninitialized.
 	};
 
 	struct ReflectionBindingData {
@@ -98,6 +99,14 @@ protected:
 		uint32_t code_compression_flags = 0;
 		uint32_t code_decompressed_size = 0;
 	};
+
+	// These structs are copied raw into the container bytes: any implicit padding would carry uninitialized memory into
+	// them and make the containers (and the shader cache files) differ between identical compilations.
+	static_assert(std::has_unique_object_representations_v<ContainerHeader>);
+	static_assert(std::has_unique_object_representations_v<ReflectionData>);
+	static_assert(std::has_unique_object_representations_v<ReflectionBindingData>);
+	static_assert(std::has_unique_object_representations_v<ReflectionSpecializationData>);
+	static_assert(std::has_unique_object_representations_v<ShaderHeader>);
 
 	ReflectionData reflection_data;
 	Vector<uint32_t> reflection_binding_set_uniforms_count;

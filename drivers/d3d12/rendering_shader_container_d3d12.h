@@ -144,6 +144,14 @@ protected:
 		uint32_t root_signature_crc = 0;
 	};
 
+	// Copied raw into the container bytes, like the base class structs: no implicit padding allowed.
+	static_assert(std::has_unique_object_representations_v<ReflectionBindingSetDataD3D12>);
+	static_assert(std::has_unique_object_representations_v<ReflectionBindingDataD3D12>);
+	static_assert(std::has_unique_object_representations_v<ReflectionSpecializationDataD3D12>);
+	static_assert(std::has_unique_object_representations_v<ShaderConfigDataD3D12>);
+	static_assert(std::has_unique_object_representations_v<ReflectionDataD3D12>);
+	static_assert(std::has_unique_object_representations_v<ContainerFooterD3D12>);
+
 	void *lib_d3d12 = nullptr;
 	ReflectionDataD3D12 reflection_data_d3d12;
 	Vector<ReflectionBindingSetDataD3D12> reflection_binding_set_data_d3d12;
