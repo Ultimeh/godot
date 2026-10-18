@@ -65,10 +65,12 @@ public:
 		Transform3D prev_cam_transform;
 		bool dlss_g = false;
 		int dlss_g_frames = 1; // Generated frames between two rendered ones: 1 = 2x, 2 = 3x, 3 = 4x.
+		// Upscale the color's alpha too (transparent viewports). DLSS and DLSS-RR otherwise output RGB only,
+		// with an alpha of their own; NVIDIA advises it only when the alpha is needed, as it costs GPU time.
+		bool alpha_upscaling = false;
 
 		// DLSS Ray Reconstruction buffers
 		bool dlss_rr = false; // Enable DLSS-RR mode instead of regular DLSS
-		bool dlss_rr_alpha_upscaling = false; // Upscale alpha channel (needed for depth reconstruction)
 		RID dlss_rr_diffuse_albedo; // Diffuse albedo buffer (RGB)
 		RID dlss_rr_specular_albedo; // Specular albedo buffer (RGB)
 		RID dlss_rr_normal_roughness; // World-space normal (XYZ) + roughness (W)
@@ -78,6 +80,9 @@ public:
 	DLSSEffect *last_effect = nullptr;
 	bool is_d3d12 = false;
 	int delay = 4; // Warmup frames before DLSS evaluates (Vulkan stability workaround).
+	// Parameters::alpha_upscaling this context was made for. Streamline reads alphaUpscalingEnabled only when it creates
+	// the NGX feature, which a change of that option alone does not do: a change needs a new context.
+	bool alpha_upscaling = false;
 
 	virtual ~DLSSContext() {}
 };

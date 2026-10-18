@@ -97,9 +97,15 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_fsr2(Rende
 	}
 }
 
-void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_dlss(RendererRD::DLSSEffect *effect) {
+void RenderForwardClustered::RenderBufferDataForwardClustered::ensure_dlss(RendererRD::DLSSEffect *effect, bool p_alpha_upscaling) {
+	if (dlss_context != nullptr && dlss_context->alpha_upscaling != p_alpha_upscaling) {
+		// The viewport's transparency changed: the NGX feature must be created again (see DLSSContext::alpha_upscaling).
+		memdelete(dlss_context);
+		dlss_context = nullptr;
+	}
 	if (dlss_context == nullptr) {
 		dlss_context = effect->create_context(render_buffers->get_internal_size(), render_buffers->get_target_size());
+		dlss_context->alpha_upscaling = p_alpha_upscaling;
 	}
 }
 
@@ -2701,7 +2707,9 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 		RD::get_singleton()->draw_command_end_label();
 	} else if (p_scale_type == SCALE_3D_DLSS) {
 		RENDER_TIMESTAMP("DLSS");
-		rb_data->ensure_dlss(dlss_effect);
+		// A transparent viewport needs the alpha upscaled with the color: 0 where the background was cleared,
+		// 1 on opaque geometry, as without DLSS.
+		rb_data->ensure_dlss(dlss_effect, p_render_data->transparent_bg);
 
 		RID exposure;
 		if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
@@ -2733,11 +2741,11 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 			params.jitter = jitter;
 			params.delta_time = float(p_time_step);
 			params.reset_accumulation = false; // FIXME: The engine does not provide a way to reset the accumulation.
+			params.alpha_upscaling = params.context->alpha_upscaling;
 
 			// DLSS Ray Reconstruction guide buffers are supplied by the raytraced path.
 			if (p_dlss_rr.active) {
 				params.dlss_rr = true;
-				params.dlss_rr_alpha_upscaling = false;
 				params.dlss_rr_diffuse_albedo = p_dlss_rr.diffuse_albedo;
 				params.dlss_rr_specular_albedo = p_dlss_rr.specular_albedo;
 				params.dlss_rr_normal_roughness = p_dlss_rr.normal_roughness;
@@ -3332,7 +3340,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// Shadow pass can change the base uniform set samplers.
 	_update_render_base_uniform_set();
 
-	uint32_t opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, using_motion_pass);
+	// With the motion pass, opaque surfaces write an alpha of 0: the color's alpha is then FSR2's reactive mask
+	// (get_internal_texture_reactive()). DLSS reads no reactive mask, and in a transparent viewport it upscales
+	// that alpha as the coverage, so opaque surfaces keep theirs.
+	const bool apply_alpha_multiplier = using_motion_pass && !(scale_type == SCALE_3D_DLSS && p_render_data->transparent_bg);
+	uint32_t opaque_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, true, apply_alpha_multiplier);
 
 	RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, opaque_pass_uniform_buffer_index, true);
 

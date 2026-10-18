@@ -609,7 +609,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 		context->currentDlssDOptions.outputWidth = context->currentDlssOptions.outputWidth;
 		context->currentDlssDOptions.outputHeight = context->currentDlssOptions.outputHeight;
 		context->currentDlssDOptions.colorBuffersHDR = sl::Boolean::eTrue;
-		context->currentDlssDOptions.alphaUpscalingEnabled = p_params.dlss_rr_alpha_upscaling ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		context->currentDlssDOptions.alphaUpscalingEnabled = p_params.alpha_upscaling ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		context->currentDlssDOptions.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked; // Normal XYZ + Roughness W
 
 		// Set world-to-camera and camera-to-world matrices for DLSS-RR
@@ -652,6 +652,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 		}
 
 		context->currentDlssOptions.colorBuffersHDR = sl::Boolean::eTrue;
+		context->currentDlssOptions.alphaUpscalingEnabled = p_params.alpha_upscaling ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		char dlssPreset = p_params.preset;
 		if (dlssPreset == '?') {
 			dlssPreset = StreamlineContext::get().dlss_default_preset;

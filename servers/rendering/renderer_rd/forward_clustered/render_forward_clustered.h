@@ -153,7 +153,7 @@ public:
 		void ensure_fsr2(RendererRD::FSR2Effect *effect);
 		RendererRD::FSR2Context *get_fsr2_context() const { return fsr2_context; }
 
-		void ensure_dlss(RendererRD::DLSSEffect *effect);
+		void ensure_dlss(RendererRD::DLSSEffect *effect, bool p_alpha_upscaling);
 		RendererRD::DLSSContext *get_dlss_context() const { return dlss_context; }
 
 #ifdef METAL_MFXTEMPORAL_ENABLED
