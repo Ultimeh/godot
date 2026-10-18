@@ -5280,7 +5280,7 @@ uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderD
 // Uniform set update
 // ---------------------------------------------------------------------------
 
-RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_background_is_color, const Color &p_background_color) {
+RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_background_is_color, const Color &p_background_color, bool p_reflection_shows_background) {
 	ERR_FAIL_NULL_V(p_state, RID());
 
 	Ref<RenderForwardClustered::RenderBufferDataForwardClustered> rb_data;
@@ -5408,6 +5408,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 1] = p_background_color.g;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 2] = p_background_color.b;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR_USED] = 1.0;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_REFLECTION_BACKGROUND] = p_reflection_shows_background ? 1.0 : 0.0;
 		}
 
 		// Unjittered VP for motion vectors (matches raster convention).

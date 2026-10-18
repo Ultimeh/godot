@@ -250,6 +250,8 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	Color clear_color;
 	// As raster's load_color: BG_CANVAS and BG_KEEP keep the color buffer's pixels where the camera rays missed.
 	bool keep_background = false;
+	// REFLECTION_SOURCE_BG: where the background is a color, the rays that miss along a specular lobe show it.
+	bool reflection_from_background = false;
 
 	if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW) {
 		clear_color = Color(0, 0, 0, 1); //in overdraw mode, BG should always be black
@@ -258,6 +260,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		float bg_energy_multiplier = environment_get_bg_energy_multiplier(p_render_data->environment);
 		bg_energy_multiplier *= environment_get_bg_intensity(p_render_data->environment);
 		RSE::EnvironmentReflectionSource reflection_source = environment_get_reflection_source(p_render_data->environment);
+		reflection_from_background = reflection_source == RSE::ENV_REFLECTION_SOURCE_BG;
 
 		if (p_render_data->camera_attributes.is_valid()) {
 			bg_energy_multiplier *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
@@ -360,7 +363,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		// Where raster doesn't draw the sky it clears to clear_color: the camera rays that miss show it (black for
 		// BG_SKY in a transparent viewport and for BG_CAMERA_FEED; unused where the background is kept).
 		const bool background_is_color = !draw_sky;
-		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, background_is_color, clear_color);
+		rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, background_is_color, clear_color, background_is_color && reflection_from_background);
 	}
 
 	// Execute raytracing (replaces the opaque + motion vector pass). Without a uniform set this frame (the pipeline was

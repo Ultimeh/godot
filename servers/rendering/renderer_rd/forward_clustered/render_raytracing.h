@@ -961,8 +961,9 @@ public:
 	// p_state's buffers. Returns their number.
 	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);
 	// `p_background_color` (linear) is what the camera rays that miss see where the raster clears to it (no sky drawn);
-	// with `p_background_is_color` false they see the sky, as the light of any other ray.
-	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_background_is_color, const Color &p_background_color);
+	// with `p_background_is_color` false they see the sky, as the light of any other ray. With
+	// `p_reflection_shows_background` (REFLECTION_SOURCE_BG), the rays that miss along a specular lobe see it too.
+	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_background_is_color, const Color &p_background_color, bool p_reflection_shows_background);
 
 	// Where the camera rays missed, `p_keep_background` keeps the color buffer's pixels (BG_CANVAS, BG_KEEP), else the
 	// miss color goes there with an alpha of 0, as the raster's clear color.

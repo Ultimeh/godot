@@ -99,7 +99,7 @@ public:
 	// Index 7 reserved for future use.
 	static constexpr int RT_PARAM_BACKGROUND_COLOR = 8; // 8-10: linear RGB, with the background energy.
 	static constexpr int RT_PARAM_BACKGROUND_COLOR_USED = 11;
-	// Indices 12-13 reserved for future use.
+	static constexpr int RT_PARAM_REFLECTION_BACKGROUND = 12; // 1: REFLECTION_SOURCE_BG with a color background. 13 reserved.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 

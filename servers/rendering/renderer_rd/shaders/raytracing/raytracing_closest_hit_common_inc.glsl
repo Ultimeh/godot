@@ -698,6 +698,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	} else {
 		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
 	}
+	// If the next ray leaves the scene, it takes the Environment's light by this lobe: as raster's ambient_light for the
+	// diffuse lobe and indirect_specular_light for the specular one (scene_forward_clustered.glsl).
+	ps.packed_bounces_flags = set_specular_lobe(ps.packed_bounces_flags, brdfType == SPECULAR_TYPE);
 
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.

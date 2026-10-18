@@ -25,7 +25,8 @@
 // Index 7 reserved for future use
 #define RT_PARAM_BACKGROUND_COLOR 8 // rt_params[2].xyz - Background color seen by camera rays (linear, with its energy)
 #define RT_PARAM_BACKGROUND_COLOR_USED 11 // rt_params[2].w - 1 where the raster clears to the background color (no sky drawn)
-// Indices 12-13 reserved for future use
+#define RT_PARAM_REFLECTION_BACKGROUND 12 // rt_params[3].x - 1 when reflections show the background color (REFLECTION_SOURCE_BG)
+// Index 13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
@@ -132,6 +133,16 @@ uint set_front_layer_ray(uint packed) {
 }
 bool is_front_layer_ray(uint packed) {
 	return (packed & FRONT_LAYER_RAY_FLAG) != 0u;
+}
+
+// Specular lobe flag (bit 28): the ray left its last surface along the specular lobe, not the diffuse one. A miss then
+// takes the Environment's reflected light, else its ambient light, as raster splits them (scene_raytracing_raygen.glsl).
+const uint SPECULAR_LOBE_FLAG = (1u << 28);
+uint set_specular_lobe(uint packed, bool specular) {
+	return specular ? (packed | SPECULAR_LOBE_FLAG) : (packed & ~SPECULAR_LOBE_FLAG);
+}
+bool is_specular_lobe(uint packed) {
+	return (packed & SPECULAR_LOBE_FLAG) != 0u;
 }
 
 const uint PATH_TERMINATED_FLAG = (1u << 26);

@@ -143,7 +143,9 @@ void main() {
 			PathState rs;
 			rs.radiance = vec3(0.0);
 			rs.throughput = vec3(1.0);
-			rs.packed_bounces_flags = pack_bounces(0u, 0u); // As deep as a camera path; not sample zero: no primary writes.
+			// As deep as a camera path; not sample zero: no primary writes. Along the transparent surface's specular lobe:
+			// a miss takes the reflected light, as the raster transparent pass reflects.
+			rs.packed_bounces_flags = set_specular_lobe(pack_bounces(0u, 0u), true);
 			rs.rng_state = fs.rng_state;
 			vec3 ray_origin = offset_ray_origin(origin.xyz + direction.xyz * fs.hit_t, fs.offset_normal);
 			vec3 ray_dir = fs.next_ray_dir;
@@ -316,17 +318,38 @@ void main() {
 			1.0 - scene_data_block.data.radiance_border_size * 2.0);
 	vec2 sky_uv = vec3_to_oct_with_border(sky_dir, border);
 
-	// A camera ray sees the background; any other ray the light the Environment gives the scene, as the raster's ambient
-	// and reflections (scene_forward_clustered.glsl): the sky when it lights or reflects the scene, else the ambient light
-	// (the background color for AMBIENT_SOURCE_BG), nothing when the ambient light is disabled.
+	// A camera ray sees the background. Any other ray takes the light the Environment gives the scene by the lobe it left
+	// its last surface along (SPECULAR_LOBE_FLAG), as the raster's indirect_specular_light and ambient_light
+	// (scene_forward_clustered.glsl).
+	const vec3 background_color = vec3(get_rt_param(RT_PARAM_BACKGROUND_COLOR), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 1), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 2));
+	const bool use_ambient_cubemap = bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP);
+	const bool use_reflection_cubemap = bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP);
 	vec3 sky_color = vec3(0.0);
-	if (get_total_bounces(ps.packed_bounces_flags) == 0u && get_rt_param(RT_PARAM_BACKGROUND_COLOR_USED) != 0.0) {
-		sky_color = vec3(get_rt_param(RT_PARAM_BACKGROUND_COLOR), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 1), get_rt_param(RT_PARAM_BACKGROUND_COLOR + 2));
-	} else if (bool(scene_data_block.data.flags & (SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP | SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP))) {
-		sky_color = radiance_octmap_sample(sky_uv, 0.0);
-		sky_color *= scene_data_block.data.radiance_normalization;
+	if (get_total_bounces(ps.packed_bounces_flags) == 0u && !is_specular_lobe(ps.packed_bounces_flags)) {
+		// Camera ray: the clear color where the raster clears to it, else the sky (the raster sky pass draws over it).
+		if (get_rt_param(RT_PARAM_BACKGROUND_COLOR_USED) != 0.0) {
+			sky_color = background_color;
+		} else if (use_ambient_cubemap || use_reflection_cubemap) {
+			sky_color = radiance_octmap_sample(sky_uv, 0.0) * scene_data_block.data.radiance_normalization;
+		} else if (bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT)) {
+			sky_color = scene_data_block.data.ambient_light_color_energy.rgb;
+		}
+	} else if (is_specular_lobe(ps.packed_bounces_flags)) {
+		// The reflected light (reflected_light_source): the sky; the background color for REFLECTION_SOURCE_BG with a color
+		// background; nothing with REFLECTION_SOURCE_DISABLED.
+		if (use_reflection_cubemap) {
+			sky_color = radiance_octmap_sample(sky_uv, 0.0) * scene_data_block.data.radiance_normalization;
+		} else if (get_rt_param(RT_PARAM_REFLECTION_BACKGROUND) != 0.0) {
+			sky_color = background_color;
+		}
 	} else if (bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT)) {
+		// The ambient light (ambient_light_source): the ambient color, or the background color for AMBIENT_SOURCE_BG, mixed
+		// with the sky by ambient_light_sky_contribution when the sky lights the scene; nothing with AMBIENT_SOURCE_DISABLED.
 		sky_color = scene_data_block.data.ambient_light_color_energy.rgb;
+		if (use_ambient_cubemap) {
+			vec3 sky_radiance = radiance_octmap_sample(sky_uv, 0.0) * scene_data_block.data.radiance_normalization;
+			sky_color = mix(sky_color, sky_radiance, scene_data_block.data.ambient_color_sky_mix);
+		}
 	}
 
 	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) != 0u) {
