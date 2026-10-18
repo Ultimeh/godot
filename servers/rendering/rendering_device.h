@@ -169,7 +169,6 @@ public:
 	void frame_stats_draw_begin();
 
 private:
-
 protected:
 	static void _bind_methods();
 
@@ -1355,6 +1354,7 @@ private:
 		uint32_t raygen_shader_count = 0;
 		uint32_t miss_shader_count = 0;
 		uint32_t hit_group_count = 0;
+		Vector<RID> shaders; // Its dependencies, also those of the pipelines made from it (raytracing_pipeline_add_hit_groups()).
 	};
 
 	Error _raytracing_pipeline_create_sbt_buffer(RDD::RaytracingPipelineID p_raytracing_pipeline, uint32_t p_raygen_shader_count, uint32_t p_miss_shader_count, Buffer &r_sbt_buffer);
@@ -1385,6 +1385,12 @@ public:
 
 	RID raytracing_pipeline_create(Span<PipelineShader> p_raygen_shaders, Span<PipelineShader> p_miss_shaders, Span<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth);
 	bool raytracing_pipeline_is_valid(RID p_pipeline);
+	// A new pipeline holding p_pipeline's groups, then p_hit_groups (hit group indices continuing after p_pipeline's), made
+	// without compiling p_pipeline's shaders again (D3D12 state object additions, Vulkan pipeline libraries): what a pipeline
+	// whose hit groups arrive over time is rebuilt with. p_pipeline stays valid. Invalid when
+	// raytracing_pipeline_can_add_hit_groups() is false, or when the driver refuses these shaders: make the whole pipeline.
+	bool raytracing_pipeline_can_add_hit_groups(RID p_pipeline);
+	RID raytracing_pipeline_add_hit_groups(RID p_pipeline, Span<HitGroup> p_hit_groups);
 
 	void update_pipeline_cache(bool p_closing = false);
 

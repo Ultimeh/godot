@@ -445,6 +445,18 @@ struct SceneShaderRaytracing::PipelineBuildTask {
 	bool failed = false;
 	String error;
 
+	// The bundle's pipeline when the task was made, to which the hit groups compiled now are added when the driver allows
+	// (incremental): new_pipeline is then base_pipeline plus them (or base_pipeline itself when none was compiled), and
+	// new_slot_groups the bundle's next PipelineBundle::slot_groups.
+	RID base_pipeline;
+	LocalVector<uint32_t> base_slot_groups;
+	uint32_t base_group_count = 0;
+	uint32_t base_empty_group = 0;
+	uint32_t base_sbt_capacity = 0;
+	bool incremental = false;
+	LocalVector<uint32_t> new_slot_groups;
+	uint32_t new_group_count = 0;
+
 	SafeFlag abort_requested;
 	SafeFlag done;
 	WorkerThreadPool::TaskID worker_id = WorkerThreadPool::INVALID_TASK_ID;
@@ -1366,9 +1378,15 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 
 	r_bundle.pipeline = new_pipeline;
 	r_bundle.hit_sbt = new_sbt;
+	r_bundle.hit_sbt_range = sbt_range;
+	r_bundle.hit_sbt_capacity = sbt_size;
 	r_bundle.live_hg_count = 1;
 	r_bundle.live_ready_mask.clear();
 	r_bundle.live_ready_mask.push_back(true);
+	r_bundle.slot_groups.clear();
+	r_bundle.slot_groups.push_back(0);
+	r_bundle.pipeline_group_count = hit_groups.size();
+	r_bundle.empty_group = 1;
 	return true;
 }
 
@@ -1385,6 +1403,11 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 	PipelineBuildTask *task = memnew(PipelineBuildTask);
 	task->rt_flags = p_rt_flags;
 	task->base_shader = p_bundle.base_shader;
+	task->base_pipeline = p_bundle.pipeline;
+	task->base_slot_groups = p_bundle.slot_groups;
+	task->base_group_count = p_bundle.pipeline_group_count;
+	task->base_empty_group = p_bundle.empty_group;
+	task->base_sbt_capacity = p_bundle.hit_sbt_capacity;
 	task->base_sources = ctx.base_sources;
 	task->base_sources_key = ctx.base_sources_key;
 	{
@@ -1680,6 +1703,63 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 		return;
 	}
 
+	// The hit groups compiled now added to the bundle's pipeline when the driver allows it: the driver compiles them
+	// alone instead of the whole pipeline again (seconds that grew with every material). Each new slot's SBT record then
+	// points to the group appended for it; a slot still pending to the empty group.
+	if (p_task->base_pipeline.is_valid() && RD::get_singleton()->raytracing_pipeline_can_add_hit_groups(p_task->base_pipeline)) {
+		// Within the SBT range the bundle has: beyond it, a full build makes a larger one.
+		bool mapped = p_task->base_slot_groups.size() <= n && n <= p_task->base_sbt_capacity;
+		p_task->new_slot_groups = p_task->base_slot_groups;
+		p_task->new_slot_groups.resize(n);
+		for (uint32_t i = p_task->base_slot_groups.size(); i < n; i++) {
+			p_task->new_slot_groups[i] = p_task->base_empty_group;
+		}
+		LocalVector<RD::HitGroup> added;
+		LocalVector<uint32_t> added_slots;
+		for (uint32_t i = 1; i < n && mapped; i++) {
+			const PipelineBuildTask::SlotInput &si = p_task->slots[i];
+			if (si.existing_per_hg_shader.is_valid()) {
+				// Compiled by an earlier build: it must be in the base pipeline already.
+				mapped = i < p_task->base_slot_groups.size() && p_task->base_slot_groups[i] != p_task->base_empty_group;
+				continue;
+			}
+			if (!p_task->new_ready_mask[i] || p_task->new_per_hg_shaders[i].is_null()) {
+				continue;
+			}
+			RD::PipelineShader custom_ps = { p_task->new_per_hg_shaders[i], p_task->spec_constants };
+			RD::PipelineShader base_any_hit_ps = { p_task->base_shader, p_task->spec_constants };
+			RD::HitGroup hg;
+			hg.closest_hit_shader = custom_ps;
+			hg.any_hit_shader = si.uses_alpha_clip ? custom_ps : base_any_hit_ps;
+			if (si.is_procedural) {
+				hg.intersection_shader = custom_ps;
+			}
+			added.push_back(hg);
+			added_slots.push_back(i);
+		}
+		if (mapped) {
+			const uint64_t pipeline_begin = OS::get_singleton()->get_ticks_usec();
+			RID new_pipeline = p_task->base_pipeline;
+			if (!added.is_empty()) {
+				new_pipeline = RD::get_singleton()->raytracing_pipeline_add_hit_groups(p_task->base_pipeline, { added.ptr(), (uint64_t)added.size() });
+			}
+			if (new_pipeline.is_valid()) {
+				for (uint32_t j = 0; j < added_slots.size(); j++) {
+					p_task->new_slot_groups[added_slots[j]] = p_task->base_group_count + j;
+				}
+				p_task->new_group_count = p_task->base_group_count + added.size();
+				p_task->new_pipeline = new_pipeline;
+				p_task->incremental = true;
+				const uint64_t batch_end = OS::get_singleton()->get_ticks_usec();
+				print_verbose(vformat("RT: variant 0x%x: %d hit groups compiled (base stages %d ms, hit groups in parallel %d ms), %d added to the pipeline (now %d hit groups) in %d ms, %d ms in all.",
+						p_task->rt_flags, p_task->compile_indices.size(), int(base_usec / 1000), int(hit_groups_usec / 1000), added.size(), p_task->new_group_count,
+						int((batch_end - pipeline_begin) / 1000), int((batch_end - batch_begin) / 1000)));
+				finish();
+				return;
+			}
+		}
+	}
+
 	// raytracing_pipeline_create may run off render thread (RD uses internal sync).
 	RD::PipelineShader base_ps = { p_task->base_shader, p_task->spec_constants };
 	RD::HitGroup hg0_default;
@@ -1771,6 +1851,31 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 		}
 	}
 
+	if (p_task->incremental) {
+		if (bundle.pipeline != p_task->base_pipeline || !bundle.hit_sbt.is_valid()) {
+			// Swapped since the task was made: its pipeline extends one no longer in use; built again from the bundle.
+			if (p_task->new_pipeline != p_task->base_pipeline && p_task->new_pipeline.is_valid()) {
+				RD::get_singleton()->free_rid(p_task->new_pipeline);
+			}
+			bundle.dirty = true;
+			return;
+		}
+		if (p_task->new_pipeline != bundle.pipeline) {
+			// The same SBT, its records written again from the new pipeline (its groups are a superset of the old one's).
+			RD::get_singleton()->hit_sbt_set_pipeline(bundle.hit_sbt, p_task->new_pipeline);
+			RD::get_singleton()->set_resource_name(p_task->new_pipeline, String("RT Pipeline [flags=") + itos(p_task->rt_flags) + "]");
+			RD::get_singleton()->free_rid(bundle.pipeline);
+			bundle.pipeline = p_task->new_pipeline;
+			bundle.pipeline_group_count = p_task->new_group_count;
+			pipeline_swap_count++;
+		}
+		RD::get_singleton()->hit_sbt_range_update(bundle.hit_sbt, bundle.hit_sbt_range, 0, { p_task->new_slot_groups.ptr(), (uint64_t)p_task->new_slot_groups.size() });
+		bundle.slot_groups = p_task->new_slot_groups;
+		bundle.live_hg_count = n;
+		bundle.live_ready_mask = p_task->new_ready_mask;
+		return;
+	}
+
 	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
 	uint32_t sbt_size = MAX(n, HIT_SBT_CAPACITY);
 
@@ -1807,8 +1912,17 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 	RD::get_singleton()->set_resource_name(p_task->new_pipeline, String("RT Pipeline [flags=") + itos(p_task->rt_flags) + "]");
 	bundle.pipeline = p_task->new_pipeline;
 	bundle.hit_sbt = new_sbt;
+	bundle.hit_sbt_range = sbt_range;
+	bundle.hit_sbt_capacity = sbt_size;
 	bundle.live_hg_count = n;
 	bundle.live_ready_mask = p_task->new_ready_mask;
+	// A full build: slot i is hit group i, the trailing sentinel n has no shader.
+	bundle.slot_groups.resize(n);
+	for (uint32_t i = 0; i < n; i++) {
+		bundle.slot_groups[i] = i;
+	}
+	bundle.pipeline_group_count = n + 1;
+	bundle.empty_group = n;
 	pipeline_swap_count++;
 }
 

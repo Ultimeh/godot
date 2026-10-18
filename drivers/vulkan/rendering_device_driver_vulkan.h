@@ -107,7 +107,10 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		uint32_t shader_group_handle_alignment = 0;
 		uint32_t shader_group_handle_size_aligned = 0;
 		uint32_t shader_group_base_alignment = 0;
+		uint32_t max_hit_attribute_size = 0;
 		bool validation = false;
+		// VK_KHR_pipeline_library: ray tracing pipelines linked from libraries, to which hit groups can be added.
+		bool pipeline_library_support = false;
 	};
 
 	struct DescriptorIndexingCapabilities {
@@ -527,6 +530,9 @@ private:
 		TightLocalVector<Vector<uint8_t>> spirv_stage_bytes;
 		TightLocalVector<uint64_t> original_stage_size;
 		VkPipelineLayout vk_pipeline_layout = VK_NULL_HANDLE;
+		// The largest ray payload and hit attribute its stages declare, in bytes (_spirv_ray_interface_sizes()).
+		uint32_t ray_payload_size = 0;
+		uint32_t ray_hit_attribute_size = 0;
 	};
 
 public:
@@ -786,11 +792,47 @@ public:
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;
 
+private:
+	// A ray tracing pipeline library (VK_KHR_pipeline_library), shared by the pipelines linked from it.
+	struct RaytracingLibraryInfo {
+		VkPipeline vk_pipeline = VK_NULL_HANDLE;
+		SafeRefCount references;
+	};
+
+	struct RaytracingPipelineInfo {
+		VkPipeline vk_pipeline = VK_NULL_HANDLE;
+		// Linked from these (the first holds the ray generation and miss groups) when hit groups can be added; empty for a
+		// pipeline made in one piece. What another link of the same pipeline needs is kept with them.
+		LocalVector<RaytracingLibraryInfo *> libraries;
+		VkPipelineLayout vk_layout = VK_NULL_HANDLE;
+		VkPipelineCreateFlags vk_flags = 0;
+		uint32_t max_recursion_depth = 0;
+		uint32_t max_payload_size = 0;
+		uint32_t max_hit_attribute_size = 0;
+	};
+
+	// The stages of p_shaders as VkPipelineShaderStageCreateInfo, with their specialization constants; r_storage keeps the
+	// data they point to. Also the largest ray payload and hit attribute their shaders declare.
+	struct RaytracingStagesStorage {
+		LocalVector<VkPipelineShaderStageCreateInfo> stages;
+		LocalVector<VkSpecializationInfo> specialization_infos;
+		LocalVector<VkSpecializationMapEntry> map_entries;
+	};
+	bool _raytracing_stages_fill(VectorView<PipelineShader> p_shaders, RaytracingStagesStorage &r_storage, uint32_t &r_max_payload_size, uint32_t &r_max_hit_attribute_size);
+	// A library of these stages and groups, or VK_NULL_HANDLE.
+	VkPipeline _raytracing_library_create(const RaytracingStagesStorage &p_stages, const LocalVector<VkRayTracingShaderGroupCreateInfoKHR> &p_groups, const RaytracingPipelineInfo &p_pipeline);
+	// p_pipeline.libraries linked into p_pipeline.vk_pipeline.
+	bool _raytracing_libraries_link(RaytracingPipelineInfo &p_pipeline);
+	void _raytracing_library_unreference(RaytracingLibraryInfo *p_library);
+
 public:
 	virtual RaytracingPipelineID raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) override final;
 	virtual void raytracing_pipeline_free(RaytracingPipelineID p_pipeline) override final;
 
 	virtual bool raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) override final;
+
+	virtual bool raytracing_pipeline_can_add_hit_groups(RaytracingPipelineID p_pipeline) override final;
+	virtual RaytracingPipelineID raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) override final;
 
 	/*****************/
 	/**** QUERIES ****/

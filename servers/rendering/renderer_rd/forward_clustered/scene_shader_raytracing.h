@@ -418,6 +418,15 @@ public:
 		LocalVector<bool> live_ready_mask;
 		uint32_t live_hg_count = 0;
 
+		// The pipeline's hit group behind each slot's SBT record: the slot's own index after a full build; for hit groups
+		// added since (RD::raytracing_pipeline_add_hit_groups()), the index they were appended at. Slots not in the
+		// pipeline use empty_group, a hit group with no shader.
+		LocalVector<uint32_t> slot_groups;
+		uint32_t pipeline_group_count = 0;
+		uint32_t empty_group = 0;
+		RD::HitShaderBindingTableRange hit_sbt_range = 0;
+		uint32_t hit_sbt_capacity = 0; // Records in hit_sbt_range.
+
 		bool dirty = false;
 		bool initial_pipeline_built = false;
 		// The frame a view last traced with it (-1: never, as init()'s probe); only bundles in use are rebuilt.

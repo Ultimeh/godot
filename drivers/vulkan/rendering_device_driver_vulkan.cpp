@@ -591,6 +591,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	_register_requested_device_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME, false);
@@ -1138,6 +1139,10 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		if (enabled_device_extension_names.has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {
 			raytracing_capabilities.raytracing_pipeline_support = raytracing_pipeline_features.rayTracingPipeline;
 			raytracing_capabilities.validation = raytracing_validation_features.rayTracingValidation;
+			// GODOT_RT_PIPELINE_LIBRARIES=0 makes every ray tracing pipeline in one piece, for comparisons.
+			raytracing_capabilities.pipeline_library_support = raytracing_capabilities.raytracing_pipeline_support &&
+					enabled_device_extension_names.has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+					OS::get_singleton()->get_environment("GODOT_RT_PIPELINE_LIBRARIES") != "0";
 		}
 
 		if (enabled_device_extension_names.has(VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
@@ -1327,8 +1332,10 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			raytracing_capabilities.shader_group_handle_alignment = raytracing_properties.shaderGroupHandleAlignment;
 			raytracing_capabilities.shader_group_handle_size_aligned = _align_up(raytracing_capabilities.shader_group_handle_size, raytracing_capabilities.shader_group_handle_alignment);
 			raytracing_capabilities.shader_group_base_alignment = raytracing_properties.shaderGroupBaseAlignment;
+			raytracing_capabilities.max_hit_attribute_size = raytracing_properties.maxRayHitAttributeSize;
 
 			print_verbose("- Vulkan Raytracing supported");
+			print_verbose("  pipeline libraries: " + String(raytracing_capabilities.pipeline_library_support ? "yes" : "no"));
 			print_verbose("  shader group handle size: " + itos(raytracing_capabilities.shader_group_handle_size));
 			print_verbose("  shader group handle alignment: " + itos(raytracing_capabilities.shader_group_handle_alignment));
 			print_verbose("  shader group handle size aligned: " + itos(raytracing_capabilities.shader_group_handle_size_aligned));
@@ -4506,6 +4513,164 @@ static VkShaderStageFlagBits RD_STAGE_TO_VK_SHADER_STAGE_BITS[RDD::SHADER_STAGE_
 	VK_SHADER_STAGE_INTERSECTION_BIT_KHR,
 };
 
+// The largest ray payload (RayPayloadKHR, IncomingRayPayloadKHR) and hit attribute (HitAttributeKHR) a SPIR-V module
+// declares, in bytes: what VkRayTracingPipelineInterfaceCreateInfoKHR declares for the pipelines and libraries its stages
+// go in. Sized with std430's alignments, never below the tightly packed size.
+static void _spirv_ray_interface_sizes(const uint32_t *p_words, uint32_t p_word_count, uint32_t &r_payload_size, uint32_t &r_hit_attribute_size) {
+	static constexpr uint32_t SPV_OP_TYPE_BOOL = 20;
+	static constexpr uint32_t SPV_OP_TYPE_INT = 21;
+	static constexpr uint32_t SPV_OP_TYPE_FLOAT = 22;
+	static constexpr uint32_t SPV_OP_TYPE_VECTOR = 23;
+	static constexpr uint32_t SPV_OP_TYPE_MATRIX = 24;
+	static constexpr uint32_t SPV_OP_TYPE_ARRAY = 28;
+	static constexpr uint32_t SPV_OP_TYPE_STRUCT = 30;
+	static constexpr uint32_t SPV_OP_TYPE_POINTER = 32;
+	static constexpr uint32_t SPV_OP_TYPE_FORWARD_POINTER = 39;
+	static constexpr uint32_t SPV_OP_CONSTANT = 43;
+	static constexpr uint32_t SPV_OP_VARIABLE = 59;
+	static constexpr uint32_t SPV_STORAGE_RAY_PAYLOAD = 5338;
+	static constexpr uint32_t SPV_STORAGE_HIT_ATTRIBUTE = 5339;
+	static constexpr uint32_t SPV_STORAGE_INCOMING_RAY_PAYLOAD = 5342;
+
+	r_payload_size = 0;
+	r_hit_attribute_size = 0;
+	if (p_word_count < 5) {
+		return;
+	}
+
+	// Each type's instruction and word count, each constant's value; std430 size and alignment of a type, by recursion over
+	// its members (depth bounded against malformed modules).
+	struct Types {
+		HashMap<uint32_t, const uint32_t *> instructions;
+		HashMap<uint32_t, uint32_t> word_counts;
+		HashMap<uint32_t, uint32_t> constants;
+
+		bool size_of(uint32_t p_type, uint32_t p_depth, uint32_t &r_size, uint32_t &r_align) const {
+			const uint32_t *const *type = instructions.getptr(p_type);
+			if (!type || p_depth > 32) {
+				return false;
+			}
+			const uint32_t *t = *type;
+			const uint32_t word_count = word_counts[p_type];
+			switch (t[0] & 0xFFFF) {
+				case SPV_OP_TYPE_BOOL:
+					r_size = r_align = 4;
+					return true;
+				case SPV_OP_TYPE_INT:
+				case SPV_OP_TYPE_FLOAT:
+					r_size = r_align = MAX(1u, t[2] / 8);
+					return true;
+				case SPV_OP_TYPE_POINTER:
+				case SPV_OP_TYPE_FORWARD_POINTER:
+					r_size = r_align = 8; // A physical storage buffer pointer.
+					return true;
+				case SPV_OP_TYPE_VECTOR: {
+					uint32_t component_size = 0;
+					uint32_t component_align = 0;
+					if (!size_of(t[2], p_depth + 1, component_size, component_align)) {
+						return false;
+					}
+					r_size = component_size * t[3];
+					r_align = component_size * (t[3] == 2 ? 2 : 4);
+					return true;
+				}
+				case SPV_OP_TYPE_MATRIX:
+				case SPV_OP_TYPE_ARRAY: {
+					uint32_t element_size = 0;
+					uint32_t element_align = 0;
+					if (!size_of(t[2], p_depth + 1, element_size, element_align)) {
+						return false;
+					}
+					uint32_t count = t[3];
+					if ((t[0] & 0xFFFF) == SPV_OP_TYPE_ARRAY) {
+						const uint32_t *length = constants.getptr(t[3]);
+						if (!length) {
+							return false;
+						}
+						count = *length;
+					}
+					r_align = element_align;
+					r_size = STEPIFY(element_size, element_align) * count;
+					return true;
+				}
+				case SPV_OP_TYPE_STRUCT: {
+					uint32_t offset = 0;
+					r_align = 1;
+					for (uint32_t m = 2; m < word_count; m++) {
+						uint32_t member_size = 0;
+						uint32_t member_align = 0;
+						if (!size_of(t[m], p_depth + 1, member_size, member_align)) {
+							return false;
+						}
+						offset = STEPIFY(offset, member_align) + member_size;
+						r_align = MAX(r_align, member_align);
+					}
+					r_size = STEPIFY(offset, r_align);
+					return true;
+				}
+			}
+			return false;
+		}
+	} types;
+	LocalVector<Pair<uint32_t, uint32_t>> variables; // Pointer type, storage class.
+	for (uint32_t w = 5; w < p_word_count;) {
+		const uint32_t word_count = p_words[w] >> 16;
+		const uint32_t opcode = p_words[w] & 0xFFFF;
+		if (word_count == 0 || w + word_count > p_word_count) {
+			return;
+		}
+		switch (opcode) {
+			case SPV_OP_TYPE_BOOL:
+			case SPV_OP_TYPE_INT:
+			case SPV_OP_TYPE_FLOAT:
+			case SPV_OP_TYPE_VECTOR:
+			case SPV_OP_TYPE_MATRIX:
+			case SPV_OP_TYPE_ARRAY:
+			case SPV_OP_TYPE_STRUCT:
+			case SPV_OP_TYPE_POINTER:
+			case SPV_OP_TYPE_FORWARD_POINTER:
+				if (word_count >= 2) {
+					types.instructions[p_words[w + 1]] = &p_words[w];
+					types.word_counts[p_words[w + 1]] = word_count;
+				}
+				break;
+			case SPV_OP_CONSTANT:
+				if (word_count >= 4) {
+					types.constants[p_words[w + 2]] = p_words[w + 3];
+				}
+				break;
+			case SPV_OP_VARIABLE:
+				if (word_count >= 4) {
+					variables.push_back(Pair<uint32_t, uint32_t>(p_words[w + 1], p_words[w + 3]));
+				}
+				break;
+			default:
+				break;
+		}
+		w += word_count;
+	}
+
+	for (const Pair<uint32_t, uint32_t> &variable : variables) {
+		uint32_t *target = nullptr;
+		if (variable.second == SPV_STORAGE_RAY_PAYLOAD || variable.second == SPV_STORAGE_INCOMING_RAY_PAYLOAD) {
+			target = &r_payload_size;
+		} else if (variable.second == SPV_STORAGE_HIT_ATTRIBUTE) {
+			target = &r_hit_attribute_size;
+		} else {
+			continue;
+		}
+		const uint32_t *const *pointer = types.instructions.getptr(variable.first);
+		if (!pointer || ((*pointer)[0] & 0xFFFF) != SPV_OP_TYPE_POINTER) {
+			continue;
+		}
+		uint32_t size = 0;
+		uint32_t align = 0;
+		if (types.size_of((*pointer)[3], 0, size, align)) {
+			*target = MAX(*target, size);
+		}
+	}
+}
+
 RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Ref<RenderingShaderContainer> &p_shader_container, const Vector<ImmutableSampler> &p_immutable_samplers) {
 	ShaderReflection shader_refl = p_shader_container->get_shader_reflection();
 	ShaderInfo shader_info;
@@ -4698,6 +4863,15 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 #endif
 
 		Aftermath::get_singleton()->register_shader(AFTERMATH_SHADER_SPIRV, decoded_spirv.ptr(), decoded_spirv.size());
+
+		if (raytracing_capabilities.pipeline_library_support) {
+			// The libraries a ray tracing pipeline is linked from declare its largest payload and hit attribute.
+			uint32_t payload_size = 0;
+			uint32_t hit_attribute_size = 0;
+			_spirv_ray_interface_sizes((const uint32_t *)decoded_spirv.ptr(), decoded_spirv.size() / sizeof(uint32_t), payload_size, hit_attribute_size);
+			shader_info.ray_payload_size = MAX(shader_info.ray_payload_size, payload_size);
+			shader_info.ray_hit_attribute_size = MAX(shader_info.ray_hit_attribute_size, hit_attribute_size);
+		}
 
 		VkShaderModuleCreateInfo shader_module_create_info = {};
 		shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -7034,7 +7208,7 @@ void RenderingDeviceDriverVulkan::command_build_tlas(CommandBufferID p_cmd_buffe
 
 void RenderingDeviceDriverVulkan::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
-	vkCmdBindPipeline(command_buffer->vk_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, (VkPipeline)p_pipeline.id);
+	vkCmdBindPipeline(command_buffer->vk_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, ((const RaytracingPipelineInfo *)p_pipeline.id)->vk_pipeline);
 }
 
 void RenderingDeviceDriverVulkan::command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) {
@@ -7057,10 +7231,17 @@ void RenderingDeviceDriverVulkan::command_trace_rays(CommandBufferID p_cmd_buffe
 
 // --- PIPELINE ---
 
-RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) {
-#if VULKAN_RAYTRACING_ENABLED
-	VkPipelineShaderStageCreateInfo *stages = ALLOCA_ARRAY(VkPipelineShaderStageCreateInfo, p_shaders.size());
+bool RenderingDeviceDriverVulkan::_raytracing_stages_fill(VectorView<PipelineShader> p_shaders, RaytracingStagesStorage &r_storage, uint32_t &r_max_payload_size, uint32_t &r_max_hit_attribute_size) {
+	// Sized first: the stages point into the other two.
+	uint32_t map_entry_count = 0;
+	for (uint32_t i = 0; i < p_shaders.size(); i++) {
+		map_entry_count += p_shaders[i].specialization_constants.size();
+	}
+	r_storage.stages.resize(p_shaders.size());
+	r_storage.specialization_infos.resize(p_shaders.size());
+	r_storage.map_entries.resize(map_entry_count);
 
+	uint32_t map_entry_index = 0;
 	for (uint32_t i = 0; i < p_shaders.size(); i++) {
 		const PipelineShader &shader = p_shaders[i];
 		const ShaderInfo *shader_info = (const ShaderInfo *)shader.shader.id;
@@ -7069,24 +7250,26 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 		for (uint32_t j = 0; j < shader_info->vk_stages_create_info.size(); j++) {
 			const VkPipelineShaderStageCreateInfo &create_info = shader_info->vk_stages_create_info[j];
 			if (create_info.stage & RD_STAGE_TO_VK_SHADER_STAGE_BITS[shader.shader_stage]) {
-				stages[i] = create_info;
+				r_storage.stages[i] = create_info;
 
 				if (shader.specialization_constants.size()) {
-					VkSpecializationMapEntry *specialization_map_entries = ALLOCA_ARRAY(VkSpecializationMapEntry, shader.specialization_constants.size());
+					VkSpecializationMapEntry *specialization_map_entries = &r_storage.map_entries[map_entry_index];
 					for (uint32_t k = 0; k < shader.specialization_constants.size(); k++) {
 						specialization_map_entries[k] = {};
 						specialization_map_entries[k].constantID = shader.specialization_constants[k].constant_id;
 						specialization_map_entries[k].offset = (const char *)&shader.specialization_constants[k].int_value - (const char *)shader.specialization_constants.ptr();
 						specialization_map_entries[k].size = sizeof(uint32_t);
 					}
+					map_entry_index += shader.specialization_constants.size();
 
-					VkSpecializationInfo *specialization_info = ALLOCA_SINGLE(VkSpecializationInfo);
-					specialization_info->dataSize = shader.specialization_constants.size() * sizeof(PipelineSpecializationConstant);
-					specialization_info->pData = shader.specialization_constants.ptr();
-					specialization_info->mapEntryCount = shader.specialization_constants.size();
-					specialization_info->pMapEntries = specialization_map_entries;
+					VkSpecializationInfo &specialization_info = r_storage.specialization_infos[i];
+					specialization_info = {};
+					specialization_info.dataSize = shader.specialization_constants.size() * sizeof(PipelineSpecializationConstant);
+					specialization_info.pData = shader.specialization_constants.ptr();
+					specialization_info.mapEntryCount = shader.specialization_constants.size();
+					specialization_info.pMapEntries = specialization_map_entries;
 
-					stages[i].pSpecializationInfo = specialization_info;
+					r_storage.stages[i].pSpecializationInfo = &specialization_info;
 				}
 
 				found_shader_stage = true;
@@ -7094,11 +7277,95 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 			}
 		}
 
-		ERR_FAIL_COND_V_MSG(!found_shader_stage, RaytracingPipelineID(), vformat("Shader \"%s\" doesn't have a stage compatible with the specified raytracing PipelineShaderStage.", shader_info->name));
+		ERR_FAIL_COND_V_MSG(!found_shader_stage, false, vformat("Shader \"%s\" doesn't have a stage compatible with the specified raytracing PipelineShaderStage.", shader_info->name));
+		r_max_payload_size = MAX(r_max_payload_size, shader_info->ray_payload_size);
+		r_max_hit_attribute_size = MAX(r_max_hit_attribute_size, shader_info->ray_hit_attribute_size);
+	}
+	return true;
+}
+
+static VkRayTracingShaderGroupCreateInfoKHR _raytracing_hit_group_create_info(const RDD::HitGroup &p_hit_group) {
+	VkRayTracingShaderGroupCreateInfoKHR vk_shader_group = {};
+	vk_shader_group.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+	vk_shader_group.type = p_hit_group.intersection_shader_index != UINT32_MAX ? VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR : VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+	vk_shader_group.generalShader = VK_SHADER_UNUSED_KHR;
+	vk_shader_group.closestHitShader = p_hit_group.closest_hit_shader_index;
+	vk_shader_group.anyHitShader = p_hit_group.any_hit_shader_index;
+	vk_shader_group.intersectionShader = p_hit_group.intersection_shader_index;
+	return vk_shader_group;
+}
+
+VkPipeline RenderingDeviceDriverVulkan::_raytracing_library_create(const RaytracingStagesStorage &p_stages, const LocalVector<VkRayTracingShaderGroupCreateInfoKHR> &p_groups, const RaytracingPipelineInfo &p_pipeline) {
+	VkRayTracingPipelineInterfaceCreateInfoKHR interface_info = {};
+	interface_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR;
+	interface_info.maxPipelineRayPayloadSize = p_pipeline.max_payload_size;
+	interface_info.maxPipelineRayHitAttributeSize = p_pipeline.max_hit_attribute_size;
+
+	VkRayTracingPipelineCreateInfoKHR create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+	create_info.flags = p_pipeline.vk_flags | VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+	create_info.stageCount = p_stages.stages.size();
+	create_info.pStages = p_stages.stages.ptr();
+	create_info.groupCount = p_groups.size();
+	create_info.pGroups = p_groups.ptr();
+	create_info.maxPipelineRayRecursionDepth = p_pipeline.max_recursion_depth;
+	create_info.pLibraryInterface = &interface_info;
+	create_info.layout = p_pipeline.vk_layout;
+
+	VkPipeline vk_library = VK_NULL_HANDLE;
+	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &create_info, nullptr, &vk_library);
+	ERR_FAIL_COND_V_MSG(err, VK_NULL_HANDLE, vformat("Couldn't create a Vulkan raytracing pipeline library (VkResult error %d).", err));
+	return vk_library;
+}
+
+bool RenderingDeviceDriverVulkan::_raytracing_libraries_link(RaytracingPipelineInfo &p_pipeline) {
+	LocalVector<VkPipeline> vk_libraries;
+	for (const RaytracingLibraryInfo *library : p_pipeline.libraries) {
+		vk_libraries.push_back(library->vk_pipeline);
+	}
+	VkPipelineLibraryCreateInfoKHR library_info = {};
+	library_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR;
+	library_info.libraryCount = vk_libraries.size();
+	library_info.pLibraries = vk_libraries.ptr();
+
+	VkRayTracingPipelineInterfaceCreateInfoKHR interface_info = {};
+	interface_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR;
+	interface_info.maxPipelineRayPayloadSize = p_pipeline.max_payload_size;
+	interface_info.maxPipelineRayHitAttributeSize = p_pipeline.max_hit_attribute_size;
+
+	// No stage or group of its own: the libraries' groups, in their order (the ray generation and miss groups first).
+	VkRayTracingPipelineCreateInfoKHR create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+	create_info.flags = p_pipeline.vk_flags;
+	create_info.maxPipelineRayRecursionDepth = p_pipeline.max_recursion_depth;
+	create_info.pLibraryInfo = &library_info;
+	create_info.pLibraryInterface = &interface_info;
+	create_info.layout = p_pipeline.vk_layout;
+
+	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &create_info, nullptr, &p_pipeline.vk_pipeline);
+	ERR_FAIL_COND_V_MSG(err, false, vformat("Couldn't link Vulkan raytracing pipeline libraries (VkResult error %d).", err));
+	return true;
+}
+
+void RenderingDeviceDriverVulkan::_raytracing_library_unreference(RaytracingLibraryInfo *p_library) {
+	if (p_library->references.unref()) {
+		vkDestroyPipeline(vk_device, p_library->vk_pipeline, nullptr);
+		memdelete(p_library);
+	}
+}
+
+RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) {
+#if VULKAN_RAYTRACING_ENABLED
+	RaytracingStagesStorage stages;
+	uint32_t max_payload_size = 0;
+	uint32_t max_hit_attribute_size = 0;
+	if (!_raytracing_stages_fill(p_shaders, stages, max_payload_size, max_hit_attribute_size)) {
+		return RaytracingPipelineID();
 	}
 
 	uint32_t shader_group_count = p_raygen_shader_indices.size() + p_miss_shader_indices.size() + p_hit_groups.size();
-	VkRayTracingShaderGroupCreateInfoKHR *shader_groups = ALLOCA_ARRAY(VkRayTracingShaderGroupCreateInfoKHR, shader_group_count);
+	LocalVector<VkRayTracingShaderGroupCreateInfoKHR> shader_groups;
+	shader_groups.resize(shader_group_count);
 
 	for (uint32_t i = 0; i < p_raygen_shader_indices.size(); i++) {
 		VkRayTracingShaderGroupCreateInfoKHR &vk_shader_group = shader_groups[i];
@@ -7123,38 +7390,57 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 	}
 
 	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
-		const HitGroup &hit_group = p_hit_groups[i];
-
-		VkRayTracingShaderGroupCreateInfoKHR &vk_shader_group = shader_groups[p_raygen_shader_indices.size() + p_miss_shader_indices.size() + i];
-		vk_shader_group = {};
-		vk_shader_group.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-		vk_shader_group.type = hit_group.intersection_shader_index != UINT32_MAX ? VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR : VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
-		vk_shader_group.generalShader = VK_SHADER_UNUSED_KHR;
-		vk_shader_group.closestHitShader = hit_group.closest_hit_shader_index;
-		vk_shader_group.anyHitShader = hit_group.any_hit_shader_index;
-		vk_shader_group.intersectionShader = hit_group.intersection_shader_index;
+		shader_groups[p_raygen_shader_indices.size() + p_miss_shader_indices.size() + i] = _raytracing_hit_group_create_info(p_hit_groups[i]);
 	}
 
 	const ShaderInfo *layout_defining_shader_info = (const ShaderInfo *)p_layout_defining_shader.id;
 
-	VkRayTracingPipelineCreateInfoKHR pipeline_create_info = {};
-	pipeline_create_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-	pipeline_create_info.layout = layout_defining_shader_info->vk_pipeline_layout;
-	pipeline_create_info.stageCount = p_shaders.size();
-	pipeline_create_info.pStages = stages;
-	pipeline_create_info.groupCount = shader_group_count;
-	pipeline_create_info.pGroups = shader_groups;
-	pipeline_create_info.maxPipelineRayRecursionDepth = p_max_trace_recursion_depth;
+	RaytracingPipelineInfo *pipeline = memnew(RaytracingPipelineInfo);
+	pipeline->vk_layout = layout_defining_shader_info->vk_pipeline_layout;
+	pipeline->max_recursion_depth = p_max_trace_recursion_depth;
 	if (opacity_micromap_support) {
 		// Without it, the pipeline's rays must not meet a geometry that references an opacity micromap.
-		pipeline_create_info.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+		pipeline->vk_flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
 	}
 
-	VkPipeline vk_pipeline = VK_NULL_HANDLE;
-	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &pipeline_create_info, nullptr, &vk_pipeline);
-	ERR_FAIL_COND_V_MSG(err, RaytracingPipelineID(), vformat("Couldn't create Vulkan raytracing pipelines (VkResult error %d).", err));
+	// One library holding every stage and group given, linked alone: hit groups can be added later
+	// (raytracing_pipeline_add_hit_groups()) without compiling these again. Its payload and hit attribute sizes bound the
+	// shaders added; a triangle hit group's attribute (the barycentrics) is at least 8 bytes.
+	if (raytracing_capabilities.pipeline_library_support && max_payload_size > 0) {
+		pipeline->max_payload_size = max_payload_size;
+		pipeline->max_hit_attribute_size = MIN(MAX(max_hit_attribute_size, 8u), raytracing_capabilities.max_hit_attribute_size);
+		const VkPipeline vk_library = _raytracing_library_create(stages, shader_groups, *pipeline);
+		if (vk_library != VK_NULL_HANDLE) {
+			RaytracingLibraryInfo *library = memnew(RaytracingLibraryInfo);
+			library->vk_pipeline = vk_library;
+			library->references.init();
+			pipeline->libraries.push_back(library);
+			if (_raytracing_libraries_link(*pipeline)) {
+				return RaytracingPipelineID(pipeline);
+			}
+			_raytracing_library_unreference(library);
+			pipeline->libraries.clear();
+		}
+		WARN_PRINT_ONCE("Vulkan: a raytracing pipeline could not be made from a pipeline library; its hit groups will be compiled again whenever one is added.");
+	}
 
-	return RaytracingPipelineID(vk_pipeline);
+	VkRayTracingPipelineCreateInfoKHR pipeline_create_info = {};
+	pipeline_create_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+	pipeline_create_info.flags = pipeline->vk_flags;
+	pipeline_create_info.layout = pipeline->vk_layout;
+	pipeline_create_info.stageCount = stages.stages.size();
+	pipeline_create_info.pStages = stages.stages.ptr();
+	pipeline_create_info.groupCount = shader_group_count;
+	pipeline_create_info.pGroups = shader_groups.ptr();
+	pipeline_create_info.maxPipelineRayRecursionDepth = p_max_trace_recursion_depth;
+
+	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &pipeline_create_info, nullptr, &pipeline->vk_pipeline);
+	if (err) {
+		memdelete(pipeline);
+		ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Couldn't create Vulkan raytracing pipelines (VkResult error %d).", err));
+	}
+
+	return RaytracingPipelineID(pipeline);
 #else
 	return RaytracingPipelineID();
 #endif
@@ -7162,7 +7448,78 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 
 void RenderingDeviceDriverVulkan::raytracing_pipeline_free(RaytracingPipelineID p_pipeline) {
 #if VULKAN_RAYTRACING_ENABLED
-	vkDestroyPipeline(vk_device, (VkPipeline)p_pipeline.id, nullptr);
+	RaytracingPipelineInfo *pipeline = (RaytracingPipelineInfo *)p_pipeline.id;
+	vkDestroyPipeline(vk_device, pipeline->vk_pipeline, nullptr);
+	for (RaytracingLibraryInfo *library : pipeline->libraries) {
+		_raytracing_library_unreference(library);
+	}
+	memdelete(pipeline);
+#endif
+}
+
+bool RenderingDeviceDriverVulkan::raytracing_pipeline_can_add_hit_groups(RaytracingPipelineID p_pipeline) {
+#if VULKAN_RAYTRACING_ENABLED
+	return p_pipeline && !((const RaytracingPipelineInfo *)p_pipeline.id)->libraries.is_empty();
+#else
+	return false;
+#endif
+}
+
+RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) {
+#if VULKAN_RAYTRACING_ENABLED
+	const RaytracingPipelineInfo *base = (const RaytracingPipelineInfo *)p_pipeline.id;
+	ERR_FAIL_COND_V(!base || base->libraries.is_empty(), RaytracingPipelineID());
+
+	RaytracingStagesStorage stages;
+	uint32_t max_payload_size = 0;
+	uint32_t max_hit_attribute_size = 0;
+	if (!_raytracing_stages_fill(p_shaders, stages, max_payload_size, max_hit_attribute_size)) {
+		return RaytracingPipelineID();
+	}
+	if (max_payload_size > base->max_payload_size || max_hit_attribute_size > base->max_hit_attribute_size) {
+		// Every library of a pipeline declares the same interface: the caller makes the whole pipeline again.
+		print_verbose(vformat("Vulkan: hit groups not added to a raytracing pipeline: payload %d / hit attribute %d bytes, the pipeline's are %d / %d.", max_payload_size, max_hit_attribute_size, base->max_payload_size, base->max_hit_attribute_size));
+		return RaytracingPipelineID();
+	}
+
+	LocalVector<VkRayTracingShaderGroupCreateInfoKHR> shader_groups;
+	shader_groups.resize(p_hit_groups.size());
+	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+		shader_groups[i] = _raytracing_hit_group_create_info(p_hit_groups[i]);
+	}
+
+	RaytracingPipelineInfo *pipeline = memnew(RaytracingPipelineInfo);
+	pipeline->vk_layout = base->vk_layout;
+	pipeline->vk_flags = base->vk_flags;
+	pipeline->max_recursion_depth = base->max_recursion_depth;
+	pipeline->max_payload_size = base->max_payload_size;
+	pipeline->max_hit_attribute_size = base->max_hit_attribute_size;
+
+	const VkPipeline vk_library = _raytracing_library_create(stages, shader_groups, *pipeline);
+	if (vk_library == VK_NULL_HANDLE) {
+		memdelete(pipeline);
+		return RaytracingPipelineID();
+	}
+	// The base's libraries, shared, then the new one: the base's groups keep their indices, the new ones follow.
+	for (RaytracingLibraryInfo *library : base->libraries) {
+		library->references.ref();
+		pipeline->libraries.push_back(library);
+	}
+	RaytracingLibraryInfo *library = memnew(RaytracingLibraryInfo);
+	library->vk_pipeline = vk_library;
+	library->references.init();
+	pipeline->libraries.push_back(library);
+
+	if (!_raytracing_libraries_link(*pipeline)) {
+		for (RaytracingLibraryInfo *linked : pipeline->libraries) {
+			_raytracing_library_unreference(linked);
+		}
+		memdelete(pipeline);
+		return RaytracingPipelineID();
+	}
+	return RaytracingPipelineID(pipeline);
+#else
+	return RaytracingPipelineID();
 #endif
 }
 
@@ -7174,7 +7531,7 @@ bool RenderingDeviceDriverVulkan::raytracing_pipeline_get_shader_group_handles(R
 			vformat("Data stride (%d) must be greater than or equal to the size of the shader group handles (%d).", p_data_stride_bytes, raytracing_capabilities.shader_group_handle_size));
 
 	for (uint32_t i = 0; i < p_group_indices.size(); i++) {
-		VkResult err = device_functions.GetRayTracingShaderGroupHandlesKHR(vk_device, (VkPipeline)p_pipeline.id, p_group_index_offset + p_group_indices[i], 1, raytracing_capabilities.shader_group_handle_size, r_data);
+		VkResult err = device_functions.GetRayTracingShaderGroupHandlesKHR(vk_device, ((const RaytracingPipelineInfo *)p_pipeline.id)->vk_pipeline, p_group_index_offset + p_group_indices[i], 1, raytracing_capabilities.shader_group_handle_size, r_data);
 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, false, vformat("Couldn't get Vulkan raytracing shader group handles (VkResult error %d).", err));
 		r_data += p_data_stride_bytes;
 	}
@@ -7739,7 +8096,7 @@ void RenderingDeviceDriverVulkan::set_object_name(ObjectType p_type, ID p_driver
 			}
 		} break;
 		case OBJECT_TYPE_RAYTRACING_PIPELINE: {
-			_set_object_name(VK_OBJECT_TYPE_PIPELINE, (uint64_t)p_driver_id.id, p_name);
+			_set_object_name(VK_OBJECT_TYPE_PIPELINE, (uint64_t)((const RaytracingPipelineInfo *)p_driver_id.id)->vk_pipeline, p_name);
 		} break;
 		default: {
 			DEV_ASSERT(false);

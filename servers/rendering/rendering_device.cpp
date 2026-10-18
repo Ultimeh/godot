@@ -5778,31 +5778,31 @@ RID RenderingDevice::raytracing_pipeline_create(Span<PipelineShader> p_raygen_sh
 			update_pipeline_cache();
 		}
 
+		auto add_shader = [&](RID p_shader) {
+			if (p_shader.is_valid() && !pipeline.shaders.has(p_shader)) {
+				pipeline.shaders.push_back(p_shader);
+			}
+		};
+		for (uint32_t i = 0; i < p_raygen_shaders.size(); i++) {
+			add_shader(p_raygen_shaders[i].shader);
+		}
+		for (uint32_t i = 0; i < p_miss_shaders.size(); i++) {
+			add_shader(p_miss_shaders[i].shader);
+		}
+		for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+			const HitGroup &hit_group = p_hit_groups[i];
+			add_shader(hit_group.closest_hit_shader.shader);
+			add_shader(hit_group.any_hit_shader.shader);
+			add_shader(hit_group.intersection_shader.shader);
+		}
+
 		id = raytracing_pipeline_owner.make_rid(pipeline);
 #ifdef DEV_ENABLED
 		set_resource_name(id, "RID:" + itos(id.get_id()));
 #endif
 
-		for (uint32_t i = 0; i < p_raygen_shaders.size(); i++) {
-			_add_dependency(id, p_raygen_shaders[i].shader);
-		}
-		for (uint32_t i = 0; i < p_miss_shaders.size(); i++) {
-			_add_dependency(id, p_miss_shaders[i].shader);
-		}
-		for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
-			const HitGroup &hit_group = p_hit_groups[i];
-
-			if (hit_group.closest_hit_shader.is_valid()) {
-				_add_dependency(id, hit_group.closest_hit_shader.shader);
-			}
-
-			if (hit_group.any_hit_shader.is_valid()) {
-				_add_dependency(id, hit_group.any_hit_shader.shader);
-			}
-
-			if (hit_group.intersection_shader.is_valid()) {
-				_add_dependency(id, hit_group.intersection_shader.shader);
-			}
+		for (const RID &shader : pipeline.shaders) {
+			_add_dependency(id, shader);
 		}
 	}
 
@@ -5811,6 +5811,118 @@ RID RenderingDevice::raytracing_pipeline_create(Span<PipelineShader> p_raygen_sh
 
 bool RenderingDevice::raytracing_pipeline_is_valid(RID p_pipeline) {
 	return raytracing_pipeline_owner.owns(p_pipeline);
+}
+
+bool RenderingDevice::raytracing_pipeline_can_add_hit_groups(RID p_pipeline) {
+	_THREAD_SAFE_METHOD_
+	const RaytracingPipeline *pipeline = raytracing_pipeline_owner.get_or_null(p_pipeline);
+	return pipeline && driver->raytracing_pipeline_can_add_hit_groups(pipeline->driver_id);
+}
+
+RID RenderingDevice::raytracing_pipeline_add_hit_groups(RID p_pipeline, Span<HitGroup> p_hit_groups) {
+	ERR_FAIL_COND_V(p_hit_groups.is_empty(), RID());
+
+	thread_local LocalVector<RDD::PipelineShader> shaders;
+	thread_local LocalVector<RDD::HitGroup> hit_groups;
+	thread_local LocalVector<PipelineShader> shader_keys;
+	shaders.clear();
+	hit_groups.clear();
+	shader_keys.clear();
+
+	RaytracingPipeline pipeline;
+	RDD::RaytracingPipelineID base_driver_id;
+
+	// ===== Region 1: locked validation, as raytracing_pipeline_create() =====
+	{
+		_THREAD_SAFE_METHOD_
+
+		const RaytracingPipeline *base = raytracing_pipeline_owner.get_or_null(p_pipeline);
+		ERR_FAIL_NULL_V(base, RID());
+		pipeline = *base;
+		pipeline.sbt_buffer = Buffer();
+		base_driver_id = base->driver_id;
+
+		// The new stages, once each, in the base's layout (the layout of a pipeline cannot change).
+		auto get_shader_index = [&](const PipelineShader &p_shader, ShaderStage p_shader_stage) -> uint32_t {
+			for (uint32_t i = 0; i < shader_keys.size(); i++) {
+				if (shader_keys[i].shader == p_shader.shader && shaders[i].shader_stage == p_shader_stage && shader_keys[i].specialization_constants == p_shader.specialization_constants) {
+					return i;
+				}
+			}
+			Shader *shader = shader_owner.get_or_null(p_shader.shader);
+			ERR_FAIL_NULL_V(shader, UINT32_MAX);
+			ERR_FAIL_COND_V_MSG(shader->pipeline_type != PIPELINE_TYPE_RAYTRACING, UINT32_MAX, "Only raytracing shaders can be used in raytracing pipelines.");
+			ERR_FAIL_COND_V_MSG(!(shader->stages_bits & (1 << p_shader_stage)), UINT32_MAX, "Shader does not contain the required stage.");
+			bool compatible_layout = shader->set_formats.size() <= pipeline.set_formats.size() && shader->push_constant_size == pipeline.push_constant_size;
+			for (uint32_t i = 0; i < shader->set_formats.size() && compatible_layout; i++) {
+				compatible_layout = shader->set_formats[i] == pipeline.set_formats[i];
+			}
+			ERR_FAIL_COND_V_MSG(!compatible_layout, UINT32_MAX, "The added shaders must fit the pipeline's layout.");
+
+			RDD::PipelineShader rdd_shader;
+			rdd_shader.shader = shader->driver_id;
+			rdd_shader.shader_stage = p_shader_stage;
+			rdd_shader.specialization_constants = p_shader.specialization_constants;
+			shaders.push_back(rdd_shader);
+			shader_keys.push_back(p_shader);
+			if (!pipeline.shaders.has(p_shader.shader)) {
+				pipeline.shaders.push_back(p_shader.shader);
+			}
+			return shaders.size() - 1;
+		};
+
+		for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+			const HitGroup &hit_group = p_hit_groups[i];
+			RDD::HitGroup rdd_hit_group;
+			if (hit_group.closest_hit_shader.is_valid()) {
+				rdd_hit_group.closest_hit_shader_index = get_shader_index(hit_group.closest_hit_shader, SHADER_STAGE_CLOSEST_HIT);
+				ERR_FAIL_COND_V(rdd_hit_group.closest_hit_shader_index == UINT32_MAX, RID());
+			}
+			if (hit_group.any_hit_shader.is_valid()) {
+				rdd_hit_group.any_hit_shader_index = get_shader_index(hit_group.any_hit_shader, SHADER_STAGE_ANY_HIT);
+				ERR_FAIL_COND_V(rdd_hit_group.any_hit_shader_index == UINT32_MAX, RID());
+			}
+			if (hit_group.intersection_shader.is_valid()) {
+				rdd_hit_group.intersection_shader_index = get_shader_index(hit_group.intersection_shader, SHADER_STAGE_INTERSECTION);
+				ERR_FAIL_COND_V(rdd_hit_group.intersection_shader_index == UINT32_MAX, RID());
+			}
+			hit_groups.push_back(rdd_hit_group);
+		}
+	}
+
+	// ===== Region 2: unlocked driver addition =====
+	pipeline.driver_id = driver->raytracing_pipeline_add_hit_groups(base_driver_id, shaders, hit_groups);
+	if (!pipeline.driver_id) {
+		return RID(); // Not an error: the caller makes the whole pipeline instead.
+	}
+	pipeline.hit_group_count += p_hit_groups.size();
+
+	// Its own ray generation and miss records: a linked pipeline's group handles may differ from its base's.
+	Error err = _raytracing_pipeline_create_sbt_buffer(pipeline.driver_id, pipeline.raygen_shader_count, pipeline.miss_shader_count, pipeline.sbt_buffer);
+	if (unlikely(err != OK)) {
+		driver->raytracing_pipeline_free(pipeline.driver_id);
+		ERR_FAIL_V(RID());
+	}
+
+	// ===== Region 3: locked RID registration =====
+	RID id;
+	{
+		_THREAD_SAFE_METHOD_
+
+		if (pipeline_cache_enabled) {
+			update_pipeline_cache();
+		}
+
+		id = raytracing_pipeline_owner.make_rid(pipeline);
+#ifdef DEV_ENABLED
+		set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+		for (const RID &shader : pipeline.shaders) {
+			_add_dependency(id, shader);
+		}
+	}
+
+	return id;
 }
 
 /****************/
@@ -9288,7 +9400,6 @@ void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 	}
 
 	if (fence_signaled) {
-
 		// Flush any pending requests for asynchronous buffer downloads.
 		if (!frames[p_frame].download_buffer_get_data_requests.is_empty()) {
 			GodotProfileZoneGrouped(_profile_zone, "flush asynchronous buffer downloads");

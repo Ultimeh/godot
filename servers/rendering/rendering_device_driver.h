@@ -851,6 +851,13 @@ public:
 
 	virtual bool raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_group_index_offset, VectorView<uint32_t> p_group_indices, uint8_t *r_data, uint32_t p_data_stride_bytes) = 0;
 
+	// Hit groups added to an existing pipeline without compiling its shaders again (D3D12 AddToStateObject, Vulkan
+	// pipeline libraries): a new pipeline holding p_pipeline's groups, then p_hit_groups (indices into p_shaders). p_pipeline
+	// stays valid. Invalid when the driver or the pipeline does not allow it (raytracing_pipeline_can_add_hit_groups()), or
+	// when the new shaders do not fit the pipeline's ray payload and hit attribute sizes.
+	virtual bool raytracing_pipeline_can_add_hit_groups(RaytracingPipelineID p_pipeline) { return false; }
+	virtual RaytracingPipelineID raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) { return RaytracingPipelineID(); }
+
 	// ----- COMMANDS -----
 
 	virtual void command_build_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, uint64_t p_scratch_offset) = 0;
