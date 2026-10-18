@@ -6586,11 +6586,13 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 
 	if (raytracing_capabilities.opacity_micromap_supported) {
 		// Without it, the pipeline's rays must not meet a geometry that references an opacity micromap array.
-		CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT pipeline_config_subobject(state_object_desc);
-		pipeline_config_subobject.Config(p_max_trace_recursion_depth, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS);
+		// Owned by the desc, which keeps a pointer to the helper's data: a helper local to this block would be gone
+		// before CreateStateObject reads it (d3dx12_state_object.h, CreateSubobject).
+		CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT *pipeline_config_subobject = state_object_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
+		pipeline_config_subobject->Config(p_max_trace_recursion_depth, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_OPACITY_MICROMAPS);
 	} else {
-		CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT pipeline_config_subobject(state_object_desc);
-		pipeline_config_subobject.Config(p_max_trace_recursion_depth);
+		CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT *pipeline_config_subobject = state_object_desc.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
+		pipeline_config_subobject->Config(p_max_trace_recursion_depth);
 	}
 
 	const ShaderInfo *layout_defining_shader_info = (const ShaderInfo *)p_layout_defining_shader.id;
@@ -6602,6 +6604,9 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 
 	ComPtr<ID3D12StateObject> state_object;
 	HRESULT hr = device_5->CreateStateObject(state_object_desc, IID_PPV_ARGS(state_object.GetAddressOf()));
+	if (FAILED(hr)) {
+		_report_device_removed("CreateStateObject");
+	}
 	ERR_FAIL_COND_V_MSG(FAILED(hr), RaytracingPipelineID(), "CreateStateObject failed with error " + vformat("0x%08ux", (uint64_t)hr) + ".");
 
 	ComPtr<ID3D12StateObjectProperties> state_object_properties;
