@@ -838,14 +838,14 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 					const RID projector_texture = texture_storage->texture_get_rd_texture(light->projector, true);
 					if (projector_texture.is_valid()) {
 						const Transform3D view_to_light = (inverse_transform * light_transform.orthonormalized()).affine_inverse();
-						const Vector2 size = light->directional_projector_size;
-						const Vector2 offset = light->directional_projector_offset;
+						const Vector2 projector_size = light->directional_projector_size;
+						const Vector2 projector_offset = light->directional_projector_offset;
 						for (int k = 0; k < 3; k++) {
-							light_data.projector_uv_x[k] = view_to_light.basis.rows[0][k] / size.x;
-							light_data.projector_uv_y[k] = -view_to_light.basis.rows[1][k] / size.y;
+							light_data.projector_uv_x[k] = view_to_light.basis.rows[0][k] / projector_size.x;
+							light_data.projector_uv_y[k] = -view_to_light.basis.rows[1][k] / projector_size.y;
 						}
-						light_data.projector_uv_x[3] = (view_to_light.origin.x - offset.x) / size.x + 0.5;
-						light_data.projector_uv_y[3] = 0.5 - (view_to_light.origin.y - offset.y) / size.y;
+						light_data.projector_uv_x[3] = (view_to_light.origin.x - projector_offset.x) / projector_size.x + 0.5;
+						light_data.projector_uv_y[3] = 0.5 - (view_to_light.origin.y - projector_offset.y) / projector_size.y;
 						light_data.projector_enabled = 1;
 						directional_projector_light = light_instance->light;
 					}

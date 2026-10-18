@@ -5088,7 +5088,7 @@ uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderD
 		}
 	}
 
-	const uint32_t bucket_count = CLAMP(Math::next_power_of_2(uint32_t(MAX<uint64_t>(entry_bound * 2, 64))), 64u, uint32_t(RT_DECAL_GRID_MAX_BUCKETS));
+	const uint32_t bucket_count = CLAMP(Math::next_power_of_2(uint32_t(MAX<uint64_t>(entry_bound * 2, uint64_t(64)))), 64u, uint32_t(RT_DECAL_GRID_MAX_BUCKETS));
 	const uint32_t bucket_mask = bucket_count - 1;
 	const uint32_t offsets_base = RT_DECAL_GRID_HEADER + global_decals.size();
 	const uint32_t entries_base = offsets_base + bucket_count + 1;
