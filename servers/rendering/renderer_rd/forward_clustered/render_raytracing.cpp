@@ -649,13 +649,13 @@ void RenderRaytracing::_free_merged_mm_entry(RID p_handle) {
 		return;
 	}
 	RD *rd = RD::get_singleton();
-	if (e->blas.is_valid()) {
-		rd->free_rid(e->blas);
+	if (e->blas.is_valid() && rd->acceleration_structure_is_valid(e->blas)) {
+		rd->free_rid(e->blas); // Not when freed with its micromap.
 	}
 	if (e->merge_uniform_set.is_valid() && rd->uniform_set_is_valid(e->merge_uniform_set)) {
 		rd->free_rid(e->merge_uniform_set);
 	}
-	const RID buffers[] = { e->merged_vtx_buffer, e->merged_attr_buffer, e->replicated_idx_buffer, e->merged_prev_buffer };
+	const RID buffers[] = { e->merged_vtx_buffer, e->merged_attr_buffer, e->replicated_idx_buffer, e->merged_prev_buffer, e->omm_index_buffer };
 	for (const RID &buffer : buffers) {
 		if (buffer.is_valid()) {
 			rd->free_rid(buffer);
@@ -1626,7 +1626,7 @@ LocalVector<RD::Uniform> RenderRaytracing::_displace_frame_uniforms(RID p_job_bu
 // Opacity micromaps
 // ---------------------------------------------------------------------------
 
-RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh) {
+RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh, uint32_t p_lod) {
 	RD *rd = RD::get_singleton();
 	// GODOT_RT_OPACITY_MICROMAPS=0 turns them off without touching the project, for comparisons.
 	static const bool omm_enabled = GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && rd->has_feature(RD::SUPPORTS_OPACITY_MICROMAP) &&
@@ -1654,6 +1654,7 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	key.surface_counter = p_surface_counter;
 	key.material = p_material;
 	key.material_counter = p_material_counter;
+	key.lod = p_lod;
 	// A surface baked once it lasts RT_OMM_STABLE_FRAMES: a sprite's mesh replaced every frame would be baked and its BLAS
 	// built again every frame.
 	static constexpr uint32_t RT_OMM_STABLE_FRAMES = 10;
@@ -1686,6 +1687,17 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, false, &rest, &vertex_buffer, &attribute_buffer, &index_buffer);
 	RT_GeometryData &geometry = rest.geometry;
+	if (p_lod > 0) {
+		// A LOD's triangles: its own indices into the same vertices, in the order the merged BLASes replicate them
+		// (_get_lod_view() keeps it), with the format of LOD 0's.
+		RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+		index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, p_lod);
+		const uint32_t lod_index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, p_lod);
+		if (!index_buffer.is_valid() || lod_index_count == 0 || geometry.index_format == RT_INDEX_FORMAT_NONE) {
+			return nullptr;
+		}
+		geometry.primitive_count = lod_index_count / 3;
+	}
 	if (vertex_buffer.is_valid()) {
 		geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
 	}
@@ -3197,7 +3209,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		bool p_displace,
 		bool p_reevaluate,
 		RTMaterialData *p_mat_data,
+		RID p_material,
 		uint16_t p_material_counter,
+		bool p_allow_omm,
 		const Transform3D &p_transform,
 		const Transform3D &p_prev_transform,
 		uint32_t p_instance_uniforms_ofs,
@@ -3345,10 +3359,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			cap_vertices -= cap_vertices % 3; // Non-indexed: the vertices are the triangles.
 		}
 
-		if (entry.blas.is_valid()) {
-			rd->free_rid(entry.blas);
-			entry.blas = RID();
+		if (entry.blas.is_valid() && rd->acceleration_structure_is_valid(entry.blas)) {
+			rd->free_rid(entry.blas); // Not when freed with its micromap.
 		}
+		entry.blas = RID();
 		if (entry.merge_uniform_set.is_valid() && rd->uniform_set_is_valid(entry.merge_uniform_set)) {
 			rd->free_rid(entry.merge_uniform_set);
 		}
@@ -3385,6 +3399,62 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			ERR_FAIL_COND_V(!entry.replicated_idx_buffer.is_valid(), false);
 			rd->set_resource_name(entry.replicated_idx_buffer, "RT MM replicated idx [" + itos(cache_key) + "]");
 		}
+	}
+
+	// --- The instances' cut-out: the surface's micromap (its LOD's) shared by every instance through an index buffer
+	// (merged triangle i references entry i mod the instance's triangle count), so no bake per merged BLAS. ---
+	const uint32_t cap_triangles = indexed ? entry.cap_indices / 3 : entry.cap_vertices / 3;
+	RID omm_micromap;
+	uint32_t omm_level = 0;
+	if (p_allow_omm) {
+		const RTOmmEntry *omm = _omm_entry(p_mesh_surface, mesh_storage->multimesh_get_mesh(p_mm_rid), p_surface_index, p_surface_counter, p_material, p_material_counter, p_mat_data, true, lod);
+		if (omm && omm->micromap.is_valid() && rd->acceleration_structure_is_valid(omm->micromap)) {
+			omm_micromap = omm->micromap;
+			omm_level = omm->level;
+		}
+	}
+	if (entry.blas.is_valid() && !rd->acceleration_structure_is_valid(entry.blas)) {
+		// Freed with the micromap it depended on (its entry evicted).
+		entry.blas = RID();
+		entry.blas_built_once = false;
+	}
+	const bool omm_index_stale = omm_micromap.is_valid() &&
+			(!entry.omm_index_buffer.is_valid() || entry.omm_index_triangles != cap_triangles || entry.omm_index_period != prim_count);
+	if (entry.blas.is_valid() && (entry.built_omm_micromap != omm_micromap || omm_index_stale)) {
+		// The geometry description holds the micromap and its indices: a full build of a new BLAS (a refit keeps them).
+		// Freed first: the BLAS depends on the index buffer replaced below.
+		rd->free_rid(entry.blas);
+		entry.blas = RID();
+		entry.blas_built_once = false;
+	}
+	if (omm_index_stale) {
+		const bool use_16bit = prim_count <= 65536;
+		Vector<uint8_t> omm_indices;
+		omm_indices.resize(STEPIFY(cap_triangles * (use_16bit ? 2u : 4u), 4u));
+		uint32_t entry_index = 0;
+		for (uint32_t t = 0; t < cap_triangles; t++) {
+			if (use_16bit) {
+				reinterpret_cast<uint16_t *>(omm_indices.ptrw())[t] = uint16_t(entry_index);
+			} else {
+				reinterpret_cast<uint32_t *>(omm_indices.ptrw())[t] = entry_index;
+			}
+			entry_index = entry_index + 1 == prim_count ? 0 : entry_index + 1;
+		}
+		if (entry.omm_index_buffer.is_valid()) {
+			rd->free_rid(entry.omm_index_buffer);
+		}
+		entry.omm_index_buffer = rd->storage_buffer_create(omm_indices.size(), Span<uint8_t>(omm_indices.ptr(), omm_indices.size()), 0,
+				RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		ERR_FAIL_COND_V(!entry.omm_index_buffer.is_valid(), false);
+		rd->set_resource_name(entry.omm_index_buffer, "RT MM merged OMM indices [" + itos(cache_key) + "]");
+		entry.omm_index_triangles = cap_triangles;
+		entry.omm_index_period = prim_count;
+		entry.omm_index_16bit = use_16bit;
+	} else if (!omm_micromap.is_valid() && entry.omm_index_buffer.is_valid() && !entry.blas.is_valid()) {
+		rd->free_rid(entry.omm_index_buffer);
+		entry.omm_index_buffer = RID();
+		entry.omm_index_triangles = 0;
+		entry.omm_index_period = 0;
 	}
 
 	RID src_attr_buf;
@@ -3585,12 +3655,25 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			as_geom.geometry.triangles.index_count = entry.cap_indices;
 		}
 
+		if (omm_micromap.is_valid()) {
+			as_geom.geometry.triangles.opacity_micromap = omm_micromap;
+			as_geom.geometry.triangles.opacity_micromap_index_buffer = entry.omm_index_buffer;
+			as_geom.geometry.triangles.opacity_micromap_index_format = entry.omm_index_16bit ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32;
+			RD::OpacityMicromapUsage usage;
+			usage.count = cap_triangles;
+			usage.subdivision_level = omm_level;
+			usage.format = RD::OPACITY_MICROMAP_FORMAT_4_STATE;
+			as_geom.geometry.triangles.opacity_micromap_usages.push_back(usage);
+		}
+		entry.built_omm_micromap = omm_micromap;
+		entry.built_omm_level = omm_level;
+
 		BitField<RD::AccelerationStructureFlagBits> as_flags =
 				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
 				RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT;
 		entry.blas = rd->blas_create({ &as_geom, 1 }, as_flags);
 		ERR_FAIL_COND_V(!entry.blas.is_valid(), false);
-		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + "]");
+		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + (omm_micromap.is_valid() ? "] OMM" : "]"));
 	}
 
 	if (needs_rebake || displace_now) {
@@ -4353,7 +4436,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool use_merged = !pending.per_instance && pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter, pending.lod,
-						pending.displace, pending.reevaluate, pending.mat_data, pending.material_counter, pending.instance_transform, pending.prev_instance_transform,
+						pending.displace, pending.reevaluate, pending.mat_data, pending.material_rid, pending.material_counter,
+						pending.material_ready && !(pending.inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT),
+						pending.instance_transform, pending.prev_instance_transform,
 						uint32_t(pending.mm_surf->owner->shader_uniforms_offset),
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
@@ -4627,11 +4712,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		}
 		// The merged buffers by when they were last traced: the unused budget holds those older than 60 frames.
 		uint64_t merged_mb[3] = {};
+		uint32_t merged_traced = 0;
+		uint32_t merged_traced_omm = 0;
 		for (const RID &rid : merged_mm_pool.get_owned_list()) {
 			const RTMergedMMEntry *e = merged_mm_pool.get_or_null(rid);
 			const uint32_t age = RSG::rasterizer->get_frame_number() - e->last_used_frame;
 			merged_mb[age <= 2 ? 0 : (age <= 60 ? 1 : 2)] += e->buffer_bytes;
+			if (age <= 2) {
+				merged_traced++;
+				merged_traced_omm += e->built_omm_micromap.is_valid() ? 1 : 0;
+			}
 		}
+		print_line(vformat("RTCACHES merged MultiMeshes traced in the last 2 frames: %d, %d with opacity micromaps", merged_traced, merged_traced_omm));
 		print_line(vformat("RTCACHES merged MultiMesh buffers: %d MB traced in the last 2 frames, %d MB in the last 60, %d MB older | RD buffers %d MB, textures %d MB",
 				int(merged_mb[0] >> 20), int(merged_mb[1] >> 20), int(merged_mb[2] >> 20),
 				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_BUFFERS) >> 20), int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TEXTURES) >> 20)));
