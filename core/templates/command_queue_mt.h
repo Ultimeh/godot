@@ -33,8 +33,7 @@
 #include "core/object/worker_thread_pool.h"
 #include "core/os/condition_variable.h"
 #include "core/os/mutex.h"
-
-#include <cstdlib>
+#include "core/os/os.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/simple_type.h"
 #include "core/templates/tuple.h"
@@ -136,10 +135,7 @@ class CommandQueueMT {
 	}
 
 	// GODOT_QUEUE_NOTIFY_ALWAYS=1 wakes the pump for every command.
-	static inline const bool notify_every_command = []() {
-		const char *v = std::getenv("GODOT_QUEUE_NOTIFY_ALWAYS");
-		return v != nullptr && v[0] == '1';
-	}();
+	bool notify_every_command = false;
 
 	template <typename T, bool NeedsSync, typename... Args>
 	_FORCE_INLINE_ void _push_internal(Args &&...args) {
@@ -292,5 +288,6 @@ public:
 
 	CommandQueueMT() {
 		command_mem.reserve(DEFAULT_COMMAND_MEM_SIZE_KB * 1024);
+		notify_every_command = OS::get_singleton() && OS::get_singleton()->get_environment("GODOT_QUEUE_NOTIFY_ALWAYS") == "1";
 	}
 };
