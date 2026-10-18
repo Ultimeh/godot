@@ -795,20 +795,36 @@ void main() {
 #ifdef RT_CUSTOM_HIT_GROUP
 	// Compute hit data inline (cannot include closest_hit_common_inc here).
 	uint rt_geometry_idx = geometry_idx;
-	vec2 rt_uv = fetch_uv(geom, i0, i1, i2, bary);
-	TBNResult ah_tbn = fetch_tbn(geom, i0, i1, i2, bary);
-
 	mat3 model_rotation = mat3(gl_ObjectToWorldEXT);
 	mat3 normal_matrix = mat3(
 			normalize(model_rotation[0]),
 			normalize(model_rotation[1]),
 			normalize(model_rotation[2]));
 
-	vec3 rt_normal = normalize(normal_matrix * ah_tbn.normal);
-	vec3 rt_tangent = normalize(normal_matrix * ah_tbn.tangent);
-	vec3 rt_bitangent = cross(rt_normal, rt_tangent) * ah_tbn.bitangent_sign;
-
-	bool rt_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
+	vec2 rt_uv;
+	vec3 rt_normal;
+	vec3 rt_tangent;
+	vec3 rt_bitangent;
+	bool rt_front_face;
+#ifdef ENABLE_INTERSECTION_SHADERS
+	if ((geom.flags & FLAG_PROCEDURAL) != 0u) {
+		// As compute_hit_data(): the HIT_UV, HIT_NORMAL and HIT_TANGENT the intersection shader reported, which the
+		// cut-out reads, not a triangle's (an AABB has no vertices).
+		rt_uv = hit_attribs.bary_or_uv;
+		rt_normal = normalize(normal_matrix * normalize(unpackSnorm4x8(hit_attribs.packed_normal).xyz));
+		rt_tangent = normalize(normal_matrix * normalize(unpackSnorm4x8(hit_attribs.packed_tangent).xyz));
+		rt_bitangent = cross(rt_normal, rt_tangent);
+		rt_front_face = (dot(rt_normal, -gl_WorldRayDirectionEXT) > 0.0);
+	} else
+#endif
+	{
+		rt_uv = fetch_uv(geom, i0, i1, i2, bary);
+		TBNResult ah_tbn = fetch_tbn(geom, i0, i1, i2, bary);
+		rt_normal = normalize(normal_matrix * ah_tbn.normal);
+		rt_tangent = normalize(normal_matrix * ah_tbn.tangent);
+		rt_bitangent = cross(rt_normal, rt_tangent) * ah_tbn.bitangent_sign;
+		rt_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
+	}
 	if (!rt_front_face) {
 		rt_normal = -rt_normal;
 	}

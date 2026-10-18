@@ -3968,9 +3968,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				material_data.push_back(proc_mat_data->data);
 				material_data[material_data.size() - 1].instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 
-				// Procedural instances disable triangle culling and are opaque.
-				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
-						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				// Procedural instances disable triangle culling. They are opaque unless the material cuts out: an opaque
+				// hit runs no any-hit shader (Vulkan spec "Ray Opacity Culling", DXR spec "Any hit shaders"), so a
+				// forced opaque instance ignored ALPHA_SCISSOR_THRESHOLD and discard.
+				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+				const SceneShaderRaytracing::CustomShaderEntry *proc_entry = rt_shader->get_custom_shader_entry(hg_index);
+				if (!proc_entry || !proc_entry->uses_alpha_clip) {
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				}
 				instance_flags.push_back(inst_flags);
 				instance_masks.push_back(instance_mask(inst));
 			}
