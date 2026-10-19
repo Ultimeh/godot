@@ -2433,14 +2433,25 @@ static void _rd_stages_to_d3d12(BitField<RDD::PipelineStageBits> p_stages, D3D12
 	}
 }
 
+// The synchronization scopes reserved to their own accesses (Enhanced Barriers spec, "Access Bits Barrier Sync
+// Compatibility": UAV clears with D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, acceleration structure operations with their own
+// accesses). The runtime refuses them with any other access, D3D12_BARRIER_ACCESS_COMMON and _NO_ACCESS included: the
+// command list then fails to close and the device is removed (DXGI_ERROR_INVALID_CALL).
+static constexpr D3D12_BARRIER_SYNC RESERVED_SYNC_SCOPES = D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE |
+		D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO;
+
 // A global barrier from the common access must go to it (D3D12 removes the device otherwise): a source access without a
 // compatible stage falls back to it (_rd_stages_and_access_to_d3d12()). Toward no access, nothing after it waits: skipped.
+// A reserved scope after it (a UAV clear) cannot take the common access: the whole queue waits instead.
 static void _push_global_barrier(LocalVector<D3D12_GLOBAL_BARRIER> &r_barriers, D3D12_GLOBAL_BARRIER p_barrier) {
 	if (p_barrier.AccessBefore == D3D12_BARRIER_ACCESS_COMMON && p_barrier.AccessAfter != D3D12_BARRIER_ACCESS_COMMON) {
 		if (p_barrier.AccessAfter == D3D12_BARRIER_ACCESS_NO_ACCESS) {
 			return;
 		}
 		p_barrier.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+		if (p_barrier.SyncAfter & RESERVED_SYNC_SCOPES) {
+			p_barrier.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+		}
 	}
 	r_barriers.push_back(p_barrier);
 }
@@ -2523,9 +2534,7 @@ static void _push_split_global_barrier(LocalVector<D3D12_GLOBAL_BARRIER> &r_barr
 static D3D12_BARRIER_SYNC _rd_stages_to_d3d12_without_access(BitField<RDD::PipelineStageBits> p_stages) {
 	D3D12_BARRIER_SYNC sync = D3D12_BARRIER_SYNC_NONE;
 	_rd_stages_to_d3d12(p_stages, sync);
-	const D3D12_BARRIER_SYNC reserved = D3D12_BARRIER_SYNC_CLEAR_UNORDERED_ACCESS_VIEW | D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE |
-			D3D12_BARRIER_SYNC_COPY_RAYTRACING_ACCELERATION_STRUCTURE | D3D12_BARRIER_SYNC_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO;
-	if (sync & reserved) {
+	if (sync & RESERVED_SYNC_SCOPES) {
 		sync = D3D12_BARRIER_SYNC_ALL;
 	}
 	return sync;
