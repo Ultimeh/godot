@@ -345,6 +345,10 @@ uint64_t RenderingServerDefault::get_rendering_info(RSE::RenderingInfo p_info) {
 	return RSG::utilities->get_rendering_info(p_info);
 }
 
+uint32_t RenderingServerDefault::pathtracing_get_pending_hit_group_count() const {
+	return RSG::scene->pathtracing_get_pending_hit_group_count();
+}
+
 RenderingDeviceEnums::DeviceType RenderingServerDefault::get_video_adapter_type() const {
 	return RSG::utilities->get_video_adapter_type();
 }

@@ -1625,6 +1625,10 @@ uint32_t RendererSceneCull::get_pipeline_compilations(RSE::PipelineSource p_sour
 	return scene_render->get_pipeline_compilations(p_source);
 }
 
+uint32_t RendererSceneCull::pathtracing_get_pending_hit_group_count() const {
+	return scene_render->pathtracing_get_pending_hit_group_count();
+}
+
 void RendererSceneCull::instance_geometry_get_shader_parameter_list(RID p_instance, List<PropertyInfo> *p_parameters) const {
 	ERR_FAIL_NULL(p_parameters);
 	const Instance *instance = instance_owner.get_or_null(p_instance);

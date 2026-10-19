@@ -915,6 +915,8 @@ class RenderRaytracing {
 	// Frees the entries no frame used for a while (all of them with p_all).
 	void _omm_evict(bool p_all);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
+	// A BaseMaterial3D's generated shader, traced by hit group 0 from its parameters (p_albedo: its "albedo").
+	static bool _is_base_material(RID p_material, const Variant &p_albedo);
 	// The material a surface is traced with while its custom shader's hit group compiles, or null to leave it out.
 	RTMaterialData *_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out);
 	// Whether a MultiMesh surface goes into a merged BLAS (_build_merged_mm_blas()), or one TLAS instance per instance.
@@ -954,6 +956,9 @@ public:
 	void free_caches_if_unused();
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
+	// Queues the hit groups of these materials' shaders (duplicates and freed materials allowed), whether or not their
+	// instances are in a TLAS yet: compiled by the next pipeline build.
+	void precache_hit_groups(const LocalVector<RID> &p_materials);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
 	// The RD texture of the directional light projector gather_lights() found (binding 38), or invalid.
 	RID rt_directional_projector;

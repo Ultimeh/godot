@@ -81,6 +81,13 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		return;
 	}
 
+	if (!rt_precache_materials_enabled && _rt_precaches_hit_groups()) {
+		// From the first traced frame on, every surface built queues its material's hit group (_geometry_instance_update());
+		// those built before, once.
+		rt_precache_materials_enabled = true;
+		_rt_precache_all_surface_materials();
+	}
+
 	scene_state.used_uniform_buffer_count = 0;
 
 	static const int texture_multisamples[RSE::VIEWPORT_MSAA_MAX] = { 1, 2, 4, 8 };
@@ -215,7 +222,10 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			raytracing->dlss_rr_free_buffers(rb.ptr());
 		}
 
+		// The surfaces built by the render list fill above, out of the TLAS ones included.
+		_rt_precache_hit_groups();
 		rt_state = raytracing->build_tlas(p_render_data, rt_flags);
+		_rt_publish_pending_hit_groups();
 	} else if (rb_data.is_valid() && raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
 		// No RT shader available: free DLSS RR buffers so DLSS falls back to SR.
 		raytracing->dlss_rr_free_buffers(rb.ptr());
@@ -645,6 +655,45 @@ bool RenderForwardClusteredPT::_setup_rt() {
 	}
 
 	return raytracing->get_shader()->is_usable();
+}
+
+bool RenderForwardClusteredPT::_rt_precaches_hit_groups() {
+	// GODOT_RT_HG_PRECACHE=0: a hit group is queued when the TLAS first meets its material, as before (comparisons).
+	static const bool off = OS::get_singleton()->get_environment("GODOT_RT_HG_PRECACHE") == "0";
+	return !off;
+}
+
+void RenderForwardClusteredPT::_rt_precache_hit_groups() {
+	if (rt_precache_materials.is_empty() || !raytracing) {
+		return;
+	}
+	raytracing->precache_hit_groups(rt_precache_materials);
+	rt_precache_materials.clear();
+}
+
+void RenderForwardClusteredPT::_rt_publish_pending_hit_groups() {
+	// Surfaces built since the last drain may add some: counted as one until then.
+	const uint32_t pending = raytracing->get_shader()->get_pending_hit_group_count() + (rt_precache_materials.is_empty() ? 0 : 1);
+	rt_pending_hit_groups.set(pending);
+}
+
+void RenderForwardClusteredPT::update() {
+	RenderForwardClustered::update();
+
+	if (!rt_precache_materials_enabled) {
+		return;
+	}
+	// Frames that trace nothing (a loading screen over a hidden 3D view) still compile what the instances created meanwhile
+	// need, for the variant traced last.
+	SceneShaderRaytracing *rt_shader = raytracing->get_shader();
+	_rt_precache_hit_groups();
+	rt_shader->drain_completed_compiles();
+	rt_shader->finalize_custom_shaders();
+	_rt_publish_pending_hit_groups();
+}
+
+uint32_t RenderForwardClusteredPT::pathtracing_get_pending_hit_group_count() const {
+	return rt_pending_hit_groups.get();
 }
 
 void RenderForwardClusteredPT::_age_out_motion_vectors(const RenderDataRD *p_render_data) {

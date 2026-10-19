@@ -2011,14 +2011,17 @@ void SceneShaderRaytracing::_kick_rebuild_if_idle() {
 		return;
 	}
 	// The variant a view traced with last first; one unused for RT_UNUSED_BUNDLE_FRAMES (init()'s probe, a setting
-	// changed since) stays dirty, rebuilt if a view traces with it again.
+	// changed since) stays dirty, rebuilt if a view traces with it again. The one traced last is rebuilt at any age: hit
+	// groups precached under a loading screen that hides the 3D view are compiled for it (precache_hit_groups()).
 	static constexpr int64_t RT_UNUSED_BUNDLE_FRAMES = 120;
 	const int64_t frame = int64_t(RSG::rasterizer->get_frame_number());
+	const PipelineBundle *last_traced = _get_last_traced_bundle();
 	uint32_t next_flags = 0;
 	PipelineBundle *next = nullptr;
 	for (KeyValue<uint32_t, PipelineBundle> &kv : pipeline_bundles) {
 		PipelineBundle &bundle = kv.value;
-		if (!bundle.dirty || !bundle.initial_pipeline_built || bundle.last_used_frame < 0 || frame - bundle.last_used_frame > RT_UNUSED_BUNDLE_FRAMES) {
+		if (!bundle.dirty || !bundle.initial_pipeline_built || bundle.last_used_frame < 0 ||
+				(frame - bundle.last_used_frame > RT_UNUSED_BUNDLE_FRAMES && &bundle != last_traced)) {
 			continue;
 		}
 		if (!next || bundle.last_used_frame > next->last_used_frame) {
@@ -2033,6 +2036,38 @@ void SceneShaderRaytracing::_kick_rebuild_if_idle() {
 			_enqueue_build(task);
 		}
 	}
+}
+
+const SceneShaderRaytracing::PipelineBundle *SceneShaderRaytracing::_get_last_traced_bundle() const {
+	const PipelineBundle *last = nullptr;
+	for (const KeyValue<uint32_t, PipelineBundle> &kv : pipeline_bundles) {
+		const PipelineBundle &bundle = kv.value;
+		if (bundle.initial_pipeline_built && bundle.last_used_frame >= 0 && (!last || bundle.last_used_frame > last->last_used_frame)) {
+			last = &bundle;
+		}
+	}
+	return last;
+}
+
+uint32_t SceneShaderRaytracing::get_pending_hit_group_count() const {
+	const PipelineBundle *bundle = _get_last_traced_bundle();
+	if (!bundle) {
+		return 0;
+	}
+	uint32_t pending = 0;
+	for (uint32_t i = 1; i < hit_group_slots.size(); i++) {
+		if (hit_group_slots[i].state != HGState::Ready) {
+			continue;
+		}
+		if (i < bundle->per_hg_states.size() && bundle->per_hg_states[i] == HGState::Failed) {
+			continue;
+		}
+		if (i < bundle->live_hg_count && i < bundle->live_ready_mask.size() && bundle->live_ready_mask[i]) {
+			continue;
+		}
+		pending++;
+	}
+	return pending;
 }
 
 void SceneShaderRaytracing::drain_completed_compiles() {

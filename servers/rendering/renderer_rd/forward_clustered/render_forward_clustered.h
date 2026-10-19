@@ -1077,6 +1077,14 @@ protected:
 	void _update_dirty_geometry_instances();
 	void _update_dirty_geometry_pipelines();
 
+	// Path tracing: the materials of the surfaces built since the path tracer last took them, so that their hit groups
+	// compile when the instances are created (a loading screen), not when they first enter the TLAS. Filled only once a
+	// view has path-traced (RenderForwardClusteredPT), duplicates included.
+	bool rt_precache_materials_enabled = false;
+	LocalVector<RID> rt_precache_materials;
+	void _rt_precache_surface_material(const GeometryInstanceSurfaceDataCache *p_surface);
+	void _rt_precache_all_surface_materials();
+
 	// Global data about the scene that can be used to pre-allocate resources without relying on culling.
 	struct GlobalSurfaceData {
 		bool screen_texture_used = false;

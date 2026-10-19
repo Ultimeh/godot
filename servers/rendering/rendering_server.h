@@ -995,6 +995,7 @@ public:
 	virtual String get_video_adapter_vendor() const = 0;
 	virtual RenderingDeviceEnums::DeviceType get_video_adapter_type() const = 0;
 	virtual String get_video_adapter_api_version() const = 0;
+	virtual uint32_t pathtracing_get_pending_hit_group_count() const = 0;
 
 	virtual void set_frame_profiling_enabled(bool p_enable) = 0;
 	virtual Vector<RenderingServerTypes::FrameProfileArea> get_frame_profile() = 0;

@@ -6489,6 +6489,12 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 		}
 	}
 
+	if (rt_precache_materials_enabled) {
+		for (const GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches; surf; surf = surf->next) {
+			_rt_precache_surface_material(surf);
+		}
+	}
+
 	//Fill push constant
 
 	ginstance->base_flags = 0;
@@ -6898,6 +6904,42 @@ void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(Geom
 	surface.uses_depth = (p_surface_cache->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW)) != 0;
 	surface.can_use_lightmap = p_surface_cache->owner->lightmap_instance.is_valid() || p_surface_cache->owner->lightmap_sh;
 	_mesh_compile_pipelines_for_surface(surface, p_global, RSE::PIPELINE_SOURCE_SURFACE);
+}
+
+void RenderForwardClustered::_rt_precache_surface_material(const GeometryInstanceSurfaceDataCache *p_surface) {
+	// The surfaces and the material RenderRaytracing::build_tlas() traces them with (override > surface > mesh).
+	const GeometryInstanceForwardClustered *ginstance = p_surface->owner;
+	const RSE::InstanceType base_type = ginstance->data->base_type;
+	if ((base_type != RSE::INSTANCE_MESH && base_type != RSE::INSTANCE_MULTIMESH) || ginstance->rt_procedural) {
+		return;
+	}
+	if (p_surface->rt_pass_flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+		// Rasterized by the transparent pass; a mesh's is traced for the front layer's reflections, unless unshaded.
+		if (base_type == RSE::INSTANCE_MULTIMESH || !p_surface->shader || p_surface->shader->unshaded) {
+			return;
+		}
+	}
+	RID material;
+	if (ginstance->data->material_override.is_valid()) {
+		material = ginstance->data->material_override;
+	} else if (p_surface->surface_index < ginstance->data->surface_materials.size() && ginstance->data->surface_materials[p_surface->surface_index].is_valid()) {
+		material = ginstance->data->surface_materials[p_surface->surface_index];
+	} else {
+		RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+		const RID mesh = base_type == RSE::INSTANCE_MULTIMESH ? mesh_storage->multimesh_get_mesh(ginstance->data->base) : ginstance->data->base;
+		if (mesh.is_valid() && mesh_storage->owns_mesh(mesh)) {
+			material = mesh_storage->mesh_surface_get_material(mesh, p_surface->surface_index);
+		}
+	}
+	if (material.is_valid()) {
+		rt_precache_materials.push_back(material);
+	}
+}
+
+void RenderForwardClustered::_rt_precache_all_surface_materials() {
+	for (SelfList<GeometryInstanceSurfaceDataCache> *list = geometry_surface_compilation_all_list.first(); list; list = list->next()) {
+		_rt_precache_surface_material(list->self());
+	}
 }
 
 void RenderForwardClustered::_update_dirty_geometry_instances() {

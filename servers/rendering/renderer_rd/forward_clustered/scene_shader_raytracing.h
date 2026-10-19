@@ -455,6 +455,9 @@ public:
 	uint32_t get_pipeline_swap_count() const { return pipeline_swap_count; }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+	// Hit groups registered but not yet in the pipeline of the variant a view traced with last (0 before any trace):
+	// their surfaces trace with the compiling fallback, or not at all for cut-outs.
+	uint32_t get_pending_hit_group_count() const;
 
 	// Compute pipeline running the slot's vertex() on every vertex (raytracing_displace.glsl); invalid if the slot
 	// does not displace or failed to compile. Compiled on first use.
@@ -486,6 +489,7 @@ private:
 	void _bundle_resize_for_slots(PipelineBundle &r_bundle);
 	bool _build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle);
 	void _kick_rebuild_if_idle();
+	const PipelineBundle *_get_last_traced_bundle() const;
 
 	// Compile lane / worker.
 	void _enqueue_build(PipelineBuildTask *p_task);

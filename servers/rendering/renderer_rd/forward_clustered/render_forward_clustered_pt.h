@@ -46,6 +46,13 @@ class RenderForwardClusteredPT : public RenderForwardClustered {
 
 	bool _setup_rt();
 	void _age_out_motion_vectors(const RenderDataRD *p_render_data);
+
+	// Hit groups compiled when their instances are created rather than first traced (rt_precache_materials).
+	static bool _rt_precaches_hit_groups();
+	void _rt_precache_hit_groups();
+	void _rt_publish_pending_hit_groups();
+	// SceneShaderRaytracing::get_pending_hit_group_count(), read by any thread (RenderingServer).
+	SafeNumeric<uint32_t> rt_pending_hit_groups;
 	// The transparent pass traces its lights' shadows through the TLAS (USE_RT_SHADOWS) on this device.
 	static bool _transparent_pass_traces_shadows();
 
@@ -56,6 +63,8 @@ protected:
 
 public:
 	virtual bool environment_pathtracing_replaces_shadow_maps(RID p_env) const override;
+	virtual void update() override;
+	virtual uint32_t pathtracing_get_pending_hit_group_count() const override;
 
 	RenderForwardClusteredPT();
 	~RenderForwardClusteredPT();

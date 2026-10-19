@@ -64,6 +64,9 @@ public:
 
 	virtual void mesh_generate_pipelines(RID p_mesh, bool p_background_compilation) = 0;
 	virtual uint32_t get_pipeline_compilations(RSE::PipelineSource p_source) = 0;
+	// The path tracer's hit groups still compiling (RenderingServer::pathtracing_get_pending_hit_group_count()), read from
+	// any thread.
+	virtual uint32_t pathtracing_get_pending_hit_group_count() const { return 0; }
 
 	/* SDFGI UPDATE */
 
