@@ -3925,6 +3925,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			view_planes.clear();
 		}
 	}
+	// An instance of the TLAS waits for its material's hit group: those nearest the camera are compiled first.
+	const Vector3 request_origin = p_render_data->scene_data->cam_transform.origin;
+	auto request_hit_group = [&](uint32_t p_slot_index, const AABB &p_aabb) {
+		const float distance = Vector3().max(p_aabb.position - request_origin).max(request_origin - (p_aabb.position + p_aabb.size)).length();
+		SceneShaderRaytracing::get_singleton()->request_hit_group(p_slot_index, distance);
+	};
 	// False when the instance's BLAS update waits for its next turn this frame.
 	auto update_turn = [&](const AABB &p_aabb, uint64_t p_key) -> bool {
 		if (view_planes.is_empty() || p_aabb.intersects_convex_shape(view_planes.ptr(), view_planes.size(), view_points, 8)) {
@@ -4022,6 +4028,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 			if (!rt_shader->is_hg_ready_in_bundle(hg_index, p_rt_flags)) {
+				request_hit_group(hg_index, inst->transformed_aabb);
 				continue;
 			}
 
@@ -4151,6 +4158,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 					mm_material_ready = false;
+					request_hit_group(mat_data->rt_sbt_offset, inst->transformed_aabb);
 					const SceneShaderForwardClustered::ShaderData *cut_shader = mm_surf->shader;
 					mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
 					if (!mat_data) {
@@ -4399,6 +4407,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 				material_ready = false;
+				request_hit_group(mat_data->rt_sbt_offset, inst->transformed_aabb);
 				const SceneShaderForwardClustered::ShaderData *cut_shader = surf->shader;
 				mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
 				if (!mat_data) {

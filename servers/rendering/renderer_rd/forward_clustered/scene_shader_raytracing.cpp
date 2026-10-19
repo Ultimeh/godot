@@ -460,6 +460,7 @@ struct SceneShaderRaytracing::PipelineBuildTask {
 	};
 	LocalVector<SlotInput> slots;
 	LocalVector<uint32_t> compile_indices; // The slots to compile, then those missing from the cache.
+	uint32_t slots_left_for_later = 0; // Pending slots this build leaves to the next one (_make_pipeline_build_task()).
 
 	LocalVector<RID> new_per_hg_shaders;
 	LocalVector<bool> new_ready_mask;
@@ -1154,6 +1155,19 @@ bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_
 	return b.live_ready_mask[p_slot_index];
 }
 
+void SceneShaderRaytracing::request_hit_group(uint32_t p_slot_index, float p_distance) {
+	if (p_slot_index == 0 || p_slot_index >= hit_group_slots.size()) {
+		return;
+	}
+	HitGroupSlot &slot = hit_group_slots[p_slot_index];
+	const uint64_t frame = RSG::rasterizer->get_frame_number();
+	if (!slot.requested || slot.requested_frame != frame || p_distance < slot.requested_distance) {
+		slot.requested_distance = p_distance;
+	}
+	slot.requested = true;
+	slot.requested_frame = frame;
+}
+
 uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_enabled) {
 	uint32_t flags = RT_FLAG_NONE;
 
@@ -1715,6 +1729,51 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 	task->slots[0].existing_per_hg_shader = RID();
 	task->slots[0].needs_compile = false;
 
+	// One build compiles its hit groups in parallel and adds them to the pipeline together: none is usable before the last
+	// is done. Those the TLAS waits for (in or near the view) go in a build of their own, the nearest first; the ones only
+	// precached follow, at most one per thread per build, so that one coming into view waits for one hit group's compile,
+	// not for the whole zone's.
+	LocalVector<uint32_t> pending;
+	for (uint32_t i = 1; i < slot_count; i++) {
+		const bool built = i < p_bundle.per_hg_states.size() && (p_bundle.per_hg_states[i] == HGState::Failed || (p_bundle.per_hg_states[i] == HGState::Ready && i < p_bundle.per_hg_shaders.size() && p_bundle.per_hg_shaders[i].is_valid()));
+		if (hit_group_slots[i].state == HGState::Ready && !built) {
+			pending.push_back(i);
+		}
+	}
+	struct PendingOrder {
+		const LocalVector<HitGroupSlot> *slots = nullptr;
+		bool operator()(uint32_t p_a, uint32_t p_b) const {
+			const HitGroupSlot &a = (*slots)[p_a];
+			const HitGroupSlot &b = (*slots)[p_b];
+			if (a.requested != b.requested) {
+				return a.requested;
+			}
+			if (a.requested && a.requested_distance != b.requested_distance) {
+				return a.requested_distance < b.requested_distance;
+			}
+			return p_a < p_b;
+		}
+	};
+	SortArray<uint32_t, PendingOrder> sorter;
+	sorter.compare.slots = &hit_group_slots;
+	sorter.sort(pending.ptr(), pending.size());
+	uint32_t batch_size = pending.size();
+	if (!async_compilation_enabled) {
+		// Compiled before the frame traces: all of them.
+	} else if (batch_size > 0 && hit_group_slots[pending[0]].requested) {
+		batch_size = 0;
+		while (batch_size < pending.size() && hit_group_slots[pending[batch_size]].requested) {
+			batch_size++;
+		}
+	} else {
+		batch_size = MIN(batch_size, (uint32_t)MAX(4, WorkerThreadPool::get_singleton()->get_thread_count()));
+	}
+	HashSet<uint32_t> batch;
+	for (uint32_t i = 0; i < batch_size; i++) {
+		batch.insert(pending[i]);
+	}
+	task->slots_left_for_later = pending.size() - batch_size;
+
 	for (uint32_t i = 1; i < slot_count; i++) {
 		const HitGroupSlot &slot = hit_group_slots[i];
 		PipelineBuildTask::SlotInput &si = task->slots[i];
@@ -1736,6 +1795,11 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			continue;
 		}
 		if (i < p_bundle.per_hg_states.size() && p_bundle.per_hg_states[i] == HGState::Failed) {
+			si.needs_compile = false;
+			continue;
+		}
+		if (!batch.has(i)) {
+			// A later build's: an empty group until then, as a slot registered after this task.
 			si.needs_compile = false;
 			continue;
 		}
@@ -2269,8 +2333,10 @@ void SceneShaderRaytracing::_dispatch_next_locked() {
 	PipelineBuildTask *t = compile_lane.queue[0];
 	compile_lane.queue.remove_at(0);
 	compile_lane.current = t;
+	// High priority: as a low priority task it waited behind the precached displacement and bake programs and the raster
+	// shaders' compiles (0.75 s in a zone of 42 new materials). It mostly waits for its own high priority group tasks.
 	t->worker_id = WorkerThreadPool::get_singleton()->add_native_task(
-			&SceneShaderRaytracing::_build_pipeline_worker_static, t, /*high_priority=*/false,
+			&SceneShaderRaytracing::_build_pipeline_worker_static, t, /*high_priority=*/true,
 			"RT Pipeline Build");
 }
 
@@ -2305,7 +2371,7 @@ void SceneShaderRaytracing::_kick_rebuild_if_idle() {
 	if (next) {
 		PipelineBuildTask *task = _make_pipeline_build_task(next_flags, *next);
 		if (task) {
-			next->dirty = false;
+			next->dirty = task->slots_left_for_later > 0;
 			_enqueue_build(task);
 		}
 	}

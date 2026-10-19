@@ -32,7 +32,9 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
+#include "core/os/thread.h"
 #include "core/templates/fixed_vector.h"
 #include "drivers/vulkan/vulkan_hooks.h"
 
@@ -1663,6 +1665,15 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 			device_functions.CreateRaytracingPipelinesKHR = PFN_vkCreateRayTracingPipelinesKHR(functions.GetDeviceProcAddr(vk_device, "vkCreateRayTracingPipelinesKHR"));
 			device_functions.GetRayTracingShaderGroupHandlesKHR = PFN_vkGetRayTracingShaderGroupHandlesKHR(functions.GetDeviceProcAddr(vk_device, "vkGetRayTracingShaderGroupHandlesKHR"));
 			device_functions.CmdTraceRaysKHR = PFN_vkCmdTraceRaysKHR(functions.GetDeviceProcAddr(vk_device, "vkCmdTraceRaysKHR"));
+		}
+
+		// GODOT_VK_DEFERRED_PIPELINES=0: ray tracing pipelines compiled by one synchronous call, as before (comparisons).
+		if (enabled_device_extension_names.has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) && OS::get_singleton()->get_environment("GODOT_VK_DEFERRED_PIPELINES") != "0") {
+			device_functions.CreateDeferredOperationKHR = PFN_vkCreateDeferredOperationKHR(functions.GetDeviceProcAddr(vk_device, "vkCreateDeferredOperationKHR"));
+			device_functions.DestroyDeferredOperationKHR = PFN_vkDestroyDeferredOperationKHR(functions.GetDeviceProcAddr(vk_device, "vkDestroyDeferredOperationKHR"));
+			device_functions.GetDeferredOperationMaxConcurrencyKHR = PFN_vkGetDeferredOperationMaxConcurrencyKHR(functions.GetDeviceProcAddr(vk_device, "vkGetDeferredOperationMaxConcurrencyKHR"));
+			device_functions.GetDeferredOperationResultKHR = PFN_vkGetDeferredOperationResultKHR(functions.GetDeviceProcAddr(vk_device, "vkGetDeferredOperationResultKHR"));
+			device_functions.DeferredOperationJoinKHR = PFN_vkDeferredOperationJoinKHR(functions.GetDeviceProcAddr(vk_device, "vkDeferredOperationJoinKHR"));
 		}
 
 		if (opacity_micromap_support) {
@@ -7295,7 +7306,58 @@ static VkRayTracingShaderGroupCreateInfoKHR _raytracing_hit_group_create_info(co
 	return vk_shader_group;
 }
 
-VkPipeline RenderingDeviceDriverVulkan::_raytracing_library_create(const RaytracingStagesStorage &p_stages, const LocalVector<VkRayTracingShaderGroupCreateInfoKHR> &p_groups, const RaytracingPipelineInfo &p_pipeline) {
+void RenderingDeviceDriverVulkan::_deferred_operation_join(uint32_t p_index, VkDeferredOperationKHR p_operation) {
+	// VK_THREAD_IDLE_KHR: no work for this thread yet, more may come. VK_THREAD_DONE_KHR: none left for it, the others
+	// finish the operation. VK_SUCCESS: complete.
+	VkResult result = device_functions.DeferredOperationJoinKHR(vk_device, p_operation);
+	while (result == VK_THREAD_IDLE_KHR) {
+		Thread::yield();
+		result = device_functions.DeferredOperationJoinKHR(vk_device, p_operation);
+	}
+}
+
+VkResult RenderingDeviceDriverVulkan::_raytracing_pipeline_create_deferred(const VkRayTracingPipelineCreateInfoKHR &p_create_info, VkPipeline *r_pipeline) {
+	// The driver compiles every stage and group of a pipeline in this one call: deferred, the calling thread and as many
+	// WorkerThreadPool threads as the operation can use join it (Vulkan spec, "Deferred Host Operations"; NVIDIA's ray
+	// tracing best practices). Everything it reads stays alive here until it is complete.
+	VkDeferredOperationKHR operation = VK_NULL_HANDLE;
+	WorkerThreadPool *pool = WorkerThreadPool::get_singleton();
+	if (device_functions.CreateDeferredOperationKHR && pool && pool->get_thread_count() > 1) {
+		if (device_functions.CreateDeferredOperationKHR(vk_device, nullptr, &operation) != VK_SUCCESS) {
+			operation = VK_NULL_HANDLE;
+		}
+	}
+	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, operation, pipelines_cache.vk_cache, 1, &p_create_info, nullptr, r_pipeline);
+	if (operation == VK_NULL_HANDLE) {
+		return err;
+	}
+	if (err == VK_OPERATION_DEFERRED_KHR) {
+		// UINT32_MAX: unknown. The calling thread is one of them.
+		const uint32_t max_concurrency = device_functions.GetDeferredOperationMaxConcurrencyKHR(vk_device, operation);
+		const uint32_t concurrency = MIN(max_concurrency, (uint32_t)pool->get_thread_count());
+		print_verbose(vformat("Vulkan: deferred raytracing pipeline compile, %d groups, on %d threads (the driver's maximum %d).", p_create_info.groupCount, concurrency, max_concurrency));
+		WorkerThreadPool::GroupID group = WorkerThreadPool::INVALID_TASK_ID;
+		if (concurrency > 1) {
+			group = pool->add_template_group_task(this, &RenderingDeviceDriverVulkan::_deferred_operation_join, operation, concurrency - 1, concurrency - 1, true, SNAME("Vulkan raytracing pipeline compile"));
+		}
+		_deferred_operation_join(0, operation);
+		if (group != WorkerThreadPool::INVALID_TASK_ID) {
+			pool->wait_for_group_task_completion(group);
+		}
+		// Every joining thread returned: the last ones may still be finishing their part.
+		err = device_functions.GetDeferredOperationResultKHR(vk_device, operation);
+		while (err == VK_NOT_READY) {
+			Thread::yield();
+			err = device_functions.GetDeferredOperationResultKHR(vk_device, operation);
+		}
+	} else if (err == VK_OPERATION_NOT_DEFERRED_KHR) {
+		err = VK_SUCCESS;
+	}
+	device_functions.DestroyDeferredOperationKHR(vk_device, operation, nullptr);
+	return err;
+}
+
+VkPipeline RenderingDeviceDriverVulkan::_raytracing_library_create(VectorView<VkPipelineShaderStageCreateInfo> p_stages, VectorView<VkRayTracingShaderGroupCreateInfoKHR> p_groups, const RaytracingPipelineInfo &p_pipeline, bool p_deferred) {
 	VkRayTracingPipelineInterfaceCreateInfoKHR interface_info = {};
 	interface_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_INTERFACE_CREATE_INFO_KHR;
 	interface_info.maxPipelineRayPayloadSize = p_pipeline.max_payload_size;
@@ -7304,8 +7366,8 @@ VkPipeline RenderingDeviceDriverVulkan::_raytracing_library_create(const Raytrac
 	VkRayTracingPipelineCreateInfoKHR create_info = {};
 	create_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
 	create_info.flags = p_pipeline.vk_flags | VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
-	create_info.stageCount = p_stages.stages.size();
-	create_info.pStages = p_stages.stages.ptr();
+	create_info.stageCount = p_stages.size();
+	create_info.pStages = p_stages.ptr();
 	create_info.groupCount = p_groups.size();
 	create_info.pGroups = p_groups.ptr();
 	create_info.maxPipelineRayRecursionDepth = p_pipeline.max_recursion_depth;
@@ -7313,7 +7375,7 @@ VkPipeline RenderingDeviceDriverVulkan::_raytracing_library_create(const Raytrac
 	create_info.layout = p_pipeline.vk_layout;
 
 	VkPipeline vk_library = VK_NULL_HANDLE;
-	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &create_info, nullptr, &vk_library);
+	VkResult err = p_deferred ? _raytracing_pipeline_create_deferred(create_info, &vk_library) : device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &create_info, nullptr, &vk_library);
 	ERR_FAIL_COND_V_MSG(err, VK_NULL_HANDLE, vformat("Couldn't create a Vulkan raytracing pipeline library (VkResult error %d).", err));
 	return vk_library;
 }
@@ -7342,6 +7404,8 @@ bool RenderingDeviceDriverVulkan::_raytracing_libraries_link(RaytracingPipelineI
 	create_info.pLibraryInterface = &interface_info;
 	create_info.layout = p_pipeline.vk_layout;
 
+	// Not deferred: the libraries are compiled, a link has nothing to spread over threads (NVIDIA reports a concurrency of
+	// 0), and a deferred link gave a pipeline that crashed vkCmdTraceRaysKHR on NVIDIA (RTX 5070, 2026-10-19).
 	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &create_info, nullptr, &p_pipeline.vk_pipeline);
 	ERR_FAIL_COND_V_MSG(err, false, vformat("Couldn't link Vulkan raytracing pipeline libraries (VkResult error %d).", err));
 	return true;
@@ -7409,7 +7473,7 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 	if (raytracing_capabilities.pipeline_library_support && max_payload_size > 0) {
 		pipeline->max_payload_size = max_payload_size;
 		pipeline->max_hit_attribute_size = MIN(MAX(max_hit_attribute_size, 8u), raytracing_capabilities.max_hit_attribute_size);
-		const VkPipeline vk_library = _raytracing_library_create(stages, shader_groups, *pipeline);
+		const VkPipeline vk_library = _raytracing_library_create(stages.stages, shader_groups, *pipeline, true);
 		if (vk_library != VK_NULL_HANDLE) {
 			RaytracingLibraryInfo *library = memnew(RaytracingLibraryInfo);
 			library->vk_pipeline = vk_library;
@@ -7434,7 +7498,7 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 	pipeline_create_info.pGroups = shader_groups.ptr();
 	pipeline_create_info.maxPipelineRayRecursionDepth = p_max_trace_recursion_depth;
 
-	VkResult err = device_functions.CreateRaytracingPipelinesKHR(vk_device, VK_NULL_HANDLE, pipelines_cache.vk_cache, 1, &pipeline_create_info, nullptr, &pipeline->vk_pipeline);
+	VkResult err = _raytracing_pipeline_create_deferred(pipeline_create_info, &pipeline->vk_pipeline);
 	if (err) {
 		memdelete(pipeline);
 		ERR_FAIL_V_MSG(RaytracingPipelineID(), vformat("Couldn't create Vulkan raytracing pipelines (VkResult error %d).", err));
@@ -7465,6 +7529,25 @@ bool RenderingDeviceDriverVulkan::raytracing_pipeline_can_add_hit_groups(Raytrac
 #endif
 }
 
+void RenderingDeviceDriverVulkan::_raytracing_hit_group_library_create(uint32_t p_index, RaytracingLibraryBuild *p_build) {
+	// The hit group's own stages, its group indexing them from 0.
+	const HitGroup &hit_group = p_build->hit_groups[p_index];
+	FixedVector<VkPipelineShaderStageCreateInfo, 3> stages;
+	HitGroup local_hit_group;
+	auto add_stage = [&](uint32_t p_shader_index) -> uint32_t {
+		if (p_shader_index == UINT32_MAX) {
+			return UINT32_MAX;
+		}
+		stages.push_back(p_build->stages->stages[p_shader_index]);
+		return stages.size() - 1;
+	};
+	local_hit_group.closest_hit_shader_index = add_stage(hit_group.closest_hit_shader_index);
+	local_hit_group.any_hit_shader_index = add_stage(hit_group.any_hit_shader_index);
+	local_hit_group.intersection_shader_index = add_stage(hit_group.intersection_shader_index);
+	const VkRayTracingShaderGroupCreateInfoKHR group = _raytracing_hit_group_create_info(local_hit_group);
+	p_build->libraries[p_index] = _raytracing_library_create(VectorView(stages.ptr(), stages.size()), VectorView(&group, 1), *p_build->pipeline, p_build->hit_groups.size() == 1);
+}
+
 RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) {
 #if VULKAN_RAYTRACING_ENABLED
 	const RaytracingPipelineInfo *base = (const RaytracingPipelineInfo *)p_pipeline.id;
@@ -7482,12 +7565,6 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_add_h
 		return RaytracingPipelineID();
 	}
 
-	LocalVector<VkRayTracingShaderGroupCreateInfoKHR> shader_groups;
-	shader_groups.resize(p_hit_groups.size());
-	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
-		shader_groups[i] = _raytracing_hit_group_create_info(p_hit_groups[i]);
-	}
-
 	RaytracingPipelineInfo *pipeline = memnew(RaytracingPipelineInfo);
 	pipeline->vk_layout = base->vk_layout;
 	pipeline->vk_flags = base->vk_flags;
@@ -7495,20 +7572,47 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_add_h
 	pipeline->max_payload_size = base->max_payload_size;
 	pipeline->max_hit_attribute_size = base->max_hit_attribute_size;
 
-	const VkPipeline vk_library = _raytracing_library_create(stages, shader_groups, *pipeline);
-	if (vk_library == VK_NULL_HANDLE) {
+	// One library per hit group, made in parallel on WorkerThreadPool threads; a single one is a deferred operation joined
+	// by as many threads as it can use. A library holding one hit group is the same whatever was added with it: the
+	// driver's pipeline cache finds it again (one library of a whole batch missed whenever the batch differed).
+	RaytracingLibraryBuild build;
+	build.pipeline = pipeline;
+	build.stages = &stages;
+	build.hit_groups = p_hit_groups;
+	build.libraries.resize(p_hit_groups.size());
+	WorkerThreadPool *pool = WorkerThreadPool::get_singleton();
+	if (p_hit_groups.size() > 1 && pool && pool->get_thread_count() > 1) {
+		WorkerThreadPool::GroupID group = pool->add_template_group_task(this, &RenderingDeviceDriverVulkan::_raytracing_hit_group_library_create, &build, p_hit_groups.size(), p_hit_groups.size(), true, SNAME("Vulkan raytracing library compile"));
+		pool->wait_for_group_task_completion(group);
+	} else {
+		for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+			_raytracing_hit_group_library_create(i, &build);
+		}
+	}
+	bool all_created = true;
+	for (const VkPipeline vk_library : build.libraries) {
+		all_created = all_created && vk_library != VK_NULL_HANDLE;
+	}
+	if (!all_created) {
+		for (const VkPipeline vk_library : build.libraries) {
+			if (vk_library != VK_NULL_HANDLE) {
+				vkDestroyPipeline(vk_device, vk_library, nullptr);
+			}
+		}
 		memdelete(pipeline);
 		return RaytracingPipelineID();
 	}
-	// The base's libraries, shared, then the new one: the base's groups keep their indices, the new ones follow.
+	// The base's libraries, shared, then the new ones: the base's groups keep their indices, the new ones follow in order.
 	for (RaytracingLibraryInfo *library : base->libraries) {
 		library->references.ref();
 		pipeline->libraries.push_back(library);
 	}
-	RaytracingLibraryInfo *library = memnew(RaytracingLibraryInfo);
-	library->vk_pipeline = vk_library;
-	library->references.init();
-	pipeline->libraries.push_back(library);
+	for (const VkPipeline vk_library : build.libraries) {
+		RaytracingLibraryInfo *library = memnew(RaytracingLibraryInfo);
+		library->vk_pipeline = vk_library;
+		library->references.init();
+		pipeline->libraries.push_back(library);
+	}
 
 	if (!_raytracing_libraries_link(*pipeline)) {
 		for (RaytracingLibraryInfo *linked : pipeline->libraries) {

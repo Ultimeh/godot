@@ -147,6 +147,13 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		PFN_vkGetRayTracingShaderGroupHandlesKHR GetRayTracingShaderGroupHandlesKHR = nullptr;
 		PFN_vkCmdTraceRaysKHR CmdTraceRaysKHR = nullptr;
 
+		// Deferred host operations (VK_KHR_deferred_host_operations): ray tracing pipelines compiled on several threads.
+		PFN_vkCreateDeferredOperationKHR CreateDeferredOperationKHR = nullptr;
+		PFN_vkDestroyDeferredOperationKHR DestroyDeferredOperationKHR = nullptr;
+		PFN_vkGetDeferredOperationMaxConcurrencyKHR GetDeferredOperationMaxConcurrencyKHR = nullptr;
+		PFN_vkGetDeferredOperationResultKHR GetDeferredOperationResultKHR = nullptr;
+		PFN_vkDeferredOperationJoinKHR DeferredOperationJoinKHR = nullptr;
+
 		// Opacity micromaps (VK_EXT_opacity_micromap).
 		PFN_vkCreateMicromapEXT CreateMicromapEXT = nullptr;
 		PFN_vkDestroyMicromapEXT DestroyMicromapEXT = nullptr;
@@ -820,10 +827,22 @@ private:
 	};
 	bool _raytracing_stages_fill(VectorView<PipelineShader> p_shaders, RaytracingStagesStorage &r_storage, uint32_t &r_max_payload_size, uint32_t &r_max_hit_attribute_size);
 	// A library of these stages and groups, or VK_NULL_HANDLE.
-	VkPipeline _raytracing_library_create(const RaytracingStagesStorage &p_stages, const LocalVector<VkRayTracingShaderGroupCreateInfoKHR> &p_groups, const RaytracingPipelineInfo &p_pipeline);
+	VkPipeline _raytracing_library_create(VectorView<VkPipelineShaderStageCreateInfo> p_stages, VectorView<VkRayTracingShaderGroupCreateInfoKHR> p_groups, const RaytracingPipelineInfo &p_pipeline, bool p_deferred);
+	// Hit groups added to a pipeline, one library each (raytracing_pipeline_add_hit_groups()).
+	struct RaytracingLibraryBuild {
+		const RaytracingPipelineInfo *pipeline = nullptr;
+		const RaytracingStagesStorage *stages = nullptr;
+		VectorView<HitGroup> hit_groups;
+		LocalVector<VkPipeline> libraries; // Per hit group; VK_NULL_HANDLE if it failed.
+	};
+	void _raytracing_hit_group_library_create(uint32_t p_index, RaytracingLibraryBuild *p_build);
 	// p_pipeline.libraries linked into p_pipeline.vk_pipeline.
 	bool _raytracing_libraries_link(RaytracingPipelineInfo &p_pipeline);
 	void _raytracing_library_unreference(RaytracingLibraryInfo *p_library);
+	// vkCreateRayTracingPipelinesKHR for one pipeline or library, its compile spread over WorkerThreadPool threads with a
+	// deferred operation when VK_KHR_deferred_host_operations is enabled.
+	VkResult _raytracing_pipeline_create_deferred(const VkRayTracingPipelineCreateInfoKHR &p_create_info, VkPipeline *r_pipeline);
+	void _deferred_operation_join(uint32_t p_index, VkDeferredOperationKHR p_operation);
 
 public:
 	virtual RaytracingPipelineID raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) override final;

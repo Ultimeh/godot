@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "drivers/aftermath/aftermath.h"
 #include "drivers/aftermath/aftermath_context.h"
@@ -6658,20 +6659,60 @@ bool RenderingDeviceDriverD3D12::raytracing_pipeline_can_add_hit_groups(Raytraci
 	return p_pipeline && ((const RaytracingPipelineInfo *)p_pipeline.id)->allows_additions;
 }
 
+String RenderingDeviceDriverD3D12::_raytracing_hit_group_export_name(uint32_t p_generation, uint32_t p_index) {
+	return vformat("hit_group_subobject_g%d_%d", p_generation, p_index);
+}
+
+void RenderingDeviceDriverD3D12::_raytracing_collection_create(uint32_t p_index, RaytracingCollectionBuild *p_build) {
+	const HitGroup &hit_group = p_build->hit_groups[p_index];
+	CD3DX12_STATE_OBJECT_DESC collection_desc(D3D12_STATE_OBJECT_TYPE_COLLECTION);
+
+	// Its own library per shader, exported under names of its own: a shader several hit groups share (the base's any-hit)
+	// is in each of their collections, and an export name must be unique in the whole state object.
+	auto add_library = [&](uint32_t p_shader_index, const char *p_stage) -> String {
+		const Vector<uint8_t> &bytecode = (*p_build->shader_bytecodes)[p_shader_index];
+		CD3DX12_DXIL_LIBRARY_SUBOBJECT *dxil_library_subobject = collection_desc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+		D3D12_SHADER_BYTECODE d3d12_shader_bytecode = { bytecode.ptr(), (SIZE_T)bytecode.size() };
+		dxil_library_subobject->SetDXILLibrary(&d3d12_shader_bytecode);
+		const String export_name = vformat("dxil_library_subobject_g%d_h%d_%s", p_build->generation, p_index, p_stage);
+		dxil_library_subobject->DefineExport((LPCWSTR)export_name.utf16().ptr(), L"main");
+		return export_name;
+	};
+
+	CD3DX12_HIT_GROUP_SUBOBJECT *hit_group_subobject = collection_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+	hit_group_subobject->SetHitGroupExport((LPCWSTR)_raytracing_hit_group_export_name(p_build->generation, p_index).utf16().ptr());
+	hit_group_subobject->SetHitGroupType(hit_group.intersection_shader_index != UINT32_MAX ? D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE : D3D12_HIT_GROUP_TYPE_TRIANGLES);
+	if (hit_group.closest_hit_shader_index != UINT32_MAX) {
+		hit_group_subobject->SetClosestHitShaderImport((LPCWSTR)add_library(hit_group.closest_hit_shader_index, "closest_hit").utf16().ptr());
+	}
+	if (hit_group.any_hit_shader_index != UINT32_MAX) {
+		hit_group_subobject->SetAnyHitShaderImport((LPCWSTR)add_library(hit_group.any_hit_shader_index, "any_hit").utf16().ptr());
+	}
+	if (hit_group.intersection_shader_index != UINT32_MAX) {
+		hit_group_subobject->SetIntersectionShaderImport((LPCWSTR)add_library(hit_group.intersection_shader_index, "intersection").utf16().ptr());
+	}
+
+	// Every dependency resolved in the collection (its configs and global root signature, the pipeline's), so that the
+	// driver compiles it now; with ALLOW_STATE_OBJECT_ADDITIONS, as the pipeline that imports it (DXR spec,
+	// D3D12_STATE_OBJECT_FLAGS).
+	_raytracing_state_object_add_configs(collection_desc, *p_build->base);
+
+	ComPtr<ID3D12Device5> device_5;
+	device->QueryInterface(device_5.GetAddressOf());
+	p_build->results[p_index] = device_5->CreateStateObject(collection_desc, IID_PPV_ARGS(p_build->collections[p_index].GetAddressOf()));
+}
+
 RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_add_hit_groups(RaytracingPipelineID p_pipeline, VectorView<PipelineShader> p_shaders, VectorView<HitGroup> p_hit_groups) {
 	const RaytracingPipelineInfo *base = (const RaytracingPipelineInfo *)p_pipeline.id;
 	ERR_FAIL_COND_V(!base || !base->allows_additions, RaytracingPipelineID());
 
-	thread_local LocalVector<Vector<uint8_t>> shader_bytecodes;
-	struct ClearShaderBytecodes {
-		~ClearShaderBytecodes() {
-			shader_bytecodes.clear();
-		}
-	} clear_shader_bytecodes;
-
 	// The addition's exports are named after its generation: a name must be unique in the whole grown state object.
 	const uint32_t generation = base->generation + 1;
+	// GODOT_D3D12_RT_COLLECTIONS=0: every hit group compiled by the AddToStateObject call, on one thread (comparisons).
+	static const bool collections_disabled = OS::get_singleton()->get_environment("GODOT_D3D12_RT_COLLECTIONS") == "0";
+	const bool use_collections = !collections_disabled && p_hit_groups.size() > 1 && WorkerThreadPool::get_singleton() && WorkerThreadPool::get_singleton()->get_thread_count() > 1;
 	CD3DX12_STATE_OBJECT_DESC addition_desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
+	LocalVector<Vector<uint8_t>> shader_bytecodes; // Alive until the state objects are made: the descs point to them.
 	LocalVector<String> library_names;
 	uint32_t max_payload_size_in_bytes = 0;
 	uint32_t max_attribute_size_in_bytes = 0;
@@ -6686,14 +6727,15 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_add_hi
 		bool ok = _shader_apply_specialization_constants(shader_info_in, shader.specialization_constants, shader.shader_stage, shader_bytecode);
 		ERR_FAIL_COND_V(!ok, RaytracingPipelineID());
 
-		CD3DX12_DXIL_LIBRARY_SUBOBJECT *dxil_library_subobject = addition_desc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
-		D3D12_SHADER_BYTECODE d3d12_shader_bytecode = { shader_bytecode.ptr(), (SIZE_T)shader_bytecode.size() };
-		dxil_library_subobject->SetDXILLibrary(&d3d12_shader_bytecode);
-		shader_bytecodes.push_back(std::move(shader_bytecode)); // Store the shader bytecode to prevent stale pointers.
-
-		const String export_name = vformat("dxil_library_subobject_g%d_%d", generation, i);
-		dxil_library_subobject->DefineExport((LPCWSTR)export_name.utf16().ptr(), L"main");
-		library_names.push_back(export_name);
+		if (!use_collections) {
+			CD3DX12_DXIL_LIBRARY_SUBOBJECT *dxil_library_subobject = addition_desc.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+			D3D12_SHADER_BYTECODE d3d12_shader_bytecode = { shader_bytecode.ptr(), (SIZE_T)shader_bytecode.size() };
+			dxil_library_subobject->SetDXILLibrary(&d3d12_shader_bytecode);
+			const String export_name = vformat("dxil_library_subobject_g%d_%d", generation, i);
+			dxil_library_subobject->DefineExport((LPCWSTR)export_name.utf16().ptr(), L"main");
+			library_names.push_back(export_name);
+		}
+		shader_bytecodes.push_back(std::move(shader_bytecode));
 
 		const ShaderInfo::ShaderConfig *shader_config = shader_info_in->stages_shader_config.getptr(shader.shader_stage);
 		if (shader_config) {
@@ -6709,10 +6751,37 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_add_hi
 
 	TightLocalVector<String> group_names;
 	group_names = base->group_names;
-	for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+
+	if (use_collections) {
+		// Each hit group compiled by the driver on a thread of its own, as a collection: the addition then only links them
+		// (DXR spec, "Collection state object", "AddToStateObject"). One call compiling them all ran on one thread for
+		// seconds when a zone brought dozens of materials.
+		RaytracingCollectionBuild build;
+		build.base = base;
+		build.generation = generation;
+		build.hit_groups = p_hit_groups;
+		build.shader_bytecodes = &shader_bytecodes;
+		build.collections.resize(p_hit_groups.size());
+		build.results.resize(p_hit_groups.size());
+		const uint64_t collections_begin = OS::get_singleton()->get_ticks_usec();
+		WorkerThreadPool::GroupID group = WorkerThreadPool::get_singleton()->add_template_group_task(this, &RenderingDeviceDriverD3D12::_raytracing_collection_create, &build, p_hit_groups.size(), p_hit_groups.size(), true, SNAME("D3D12 raytracing collection compile"));
+		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group);
+		for (uint32_t i = 0; i < p_hit_groups.size(); i++) {
+			if (FAILED(build.results[i])) {
+				_report_device_removed("CreateStateObject (collection)");
+				ERR_FAIL_V_MSG(RaytracingPipelineID(), "CreateStateObject failed for a raytracing collection with error " + vformat("0x%08ux", (uint64_t)build.results[i]) + ".");
+			}
+			CD3DX12_EXISTING_COLLECTION_SUBOBJECT *collection_subobject = addition_desc.CreateSubobject<CD3DX12_EXISTING_COLLECTION_SUBOBJECT>();
+			collection_subobject->SetExistingCollection(build.collections[i].Get());
+			group_names.push_back(_raytracing_hit_group_export_name(generation, i));
+		}
+		print_verbose(vformat("D3D12: %d raytracing collections compiled in %d ms.", p_hit_groups.size(), int((OS::get_singleton()->get_ticks_usec() - collections_begin) / 1000)));
+	}
+
+	for (uint32_t i = 0; i < p_hit_groups.size() && !use_collections; i++) {
 		const HitGroup &hit_group = p_hit_groups[i];
 		CD3DX12_HIT_GROUP_SUBOBJECT *hit_group_subobject = addition_desc.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-		const String hit_group_export_name = vformat("hit_group_subobject_g%d_%d", generation, i);
+		const String hit_group_export_name = _raytracing_hit_group_export_name(generation, i);
 		hit_group_subobject->SetHitGroupExport((LPCWSTR)hit_group_export_name.utf16().ptr());
 		hit_group_subobject->SetHitGroupType(hit_group.intersection_shader_index != UINT32_MAX ? D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE : D3D12_HIT_GROUP_TYPE_TRIANGLES);
 		if (hit_group.closest_hit_shader_index != UINT32_MAX) {
@@ -6734,11 +6803,13 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_add_hi
 	device->QueryInterface(device_7.GetAddressOf());
 	ERR_FAIL_NULL_V(device_7, RaytracingPipelineID());
 	ComPtr<ID3D12StateObject> state_object;
+	const uint64_t addition_begin = OS::get_singleton()->get_ticks_usec();
 	HRESULT hr = device_7->AddToStateObject(addition_desc, base->pso.Get(), IID_PPV_ARGS(state_object.GetAddressOf()));
 	if (FAILED(hr)) {
 		_report_device_removed("AddToStateObject");
 		ERR_FAIL_V_MSG(RaytracingPipelineID(), "AddToStateObject failed with error " + vformat("0x%08ux", (uint64_t)hr) + ".");
 	}
+	print_verbose(vformat("D3D12: %d hit groups added to a raytracing pipeline (%s) in %d ms.", p_hit_groups.size(), use_collections ? "collections" : "DXIL libraries", int((OS::get_singleton()->get_ticks_usec() - addition_begin) / 1000)));
 
 	// Every identifier queried from the grown state object: the base's point into the base, which may be freed first.
 	ComPtr<ID3D12StateObjectProperties> state_object_properties;

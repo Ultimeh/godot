@@ -402,6 +402,11 @@ public:
 		SourceHash128 source_hash;
 		HGState state = HGState::Empty;
 		CustomShaderEntry entry;
+		// The TLAS met an instance of it (in or near the view) before its hit group was in the pipeline: built before the
+		// slots only precached, the nearest first (request_hit_group()).
+		bool requested = false;
+		float requested_distance = 0.0f;
+		uint64_t requested_frame = 0;
 	};
 
 	LocalVector<HitGroupSlot> hit_group_slots;
@@ -456,6 +461,8 @@ public:
 	uint32_t get_pipeline_swap_count() const { return pipeline_swap_count; }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+	// An instance in the TLAS, p_distance from the camera, waits for this slot's hit group: the next builds take it first.
+	void request_hit_group(uint32_t p_slot_index, float p_distance);
 	// Hit groups registered but not yet in the pipeline of the variant a view traced with last (0 before any trace):
 	// their surfaces trace with the compiling fallback, or not at all for cut-outs.
 	uint32_t get_pending_hit_group_count() const;

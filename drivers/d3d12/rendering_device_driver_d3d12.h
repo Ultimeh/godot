@@ -990,6 +990,19 @@ private:
 	// what is added to it (DXR spec, AddToStateObject).
 	void _raytracing_state_object_add_configs(CD3DX12_STATE_OBJECT_DESC &r_desc, const RaytracingPipelineInfo &p_pipeline);
 
+	// Hit groups added to a pipeline, each compiled by the driver as a collection of its own on a WorkerThreadPool thread
+	// (DXR spec, "Collection state object"), then added together (AddToStateObject, EXISTING_COLLECTION).
+	struct RaytracingCollectionBuild {
+		const RaytracingPipelineInfo *base = nullptr;
+		uint32_t generation = 0;
+		VectorView<HitGroup> hit_groups;
+		const LocalVector<Vector<uint8_t>> *shader_bytecodes = nullptr; // Per added shader, specialized.
+		LocalVector<Microsoft::WRL::ComPtr<ID3D12StateObject>> collections; // Per hit group.
+		LocalVector<HRESULT> results;
+	};
+	void _raytracing_collection_create(uint32_t p_index, RaytracingCollectionBuild *p_build);
+	static String _raytracing_hit_group_export_name(uint32_t p_generation, uint32_t p_index);
+
 public:
 	virtual RaytracingPipelineID raytracing_pipeline_create(VectorView<PipelineShader> p_shaders, VectorView<uint32_t> p_raygen_shader_indices, VectorView<uint32_t> p_miss_shader_indices, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, ShaderID p_layout_defining_shader) override final;
 	virtual void raytracing_pipeline_free(RaytracingPipelineID p_pipeline) override final;
