@@ -1758,7 +1758,9 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 	sorter.compare.slots = &hit_group_slots;
 	sorter.sort(pending.ptr(), pending.size());
 	uint32_t batch_size = pending.size();
-	if (!async_compilation_enabled) {
+	// GODOT_RT_HG_BATCHES=0: every pending hit group in one build, as before (comparisons).
+	static const bool batches_disabled = OS::get_singleton()->get_environment("GODOT_RT_HG_BATCHES") == "0";
+	if (!async_compilation_enabled || batches_disabled) {
 		// Compiled before the frame traces: all of them.
 	} else if (batch_size > 0 && hit_group_slots[pending[0]].requested) {
 		batch_size = 0;
