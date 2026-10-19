@@ -948,10 +948,11 @@ uint64_t _rt_material_address;
 #endif
 
 void main() {
+#ifdef RT_CUSTOM_HIT_GROUP
+	// Keeps the texture array table (set 2) in the intersection stage's layout; the arrays only exist in custom hit groups.
 	if (gl_InstanceCustomIndexEXT == -1 && textureLod(sampler2DArray(bindless_texture_arrays[nonuniformEXT(0)], SAMPLER_LINEAR_REPEAT), vec3(0.0), 0.0).r > 0.0) {
 		return;
 	}
-#ifdef RT_CUSTOM_HIT_GROUP
 	// Writable outputs.
 	vec2 m_HIT_UV = vec2(0.0);
 	vec3 m_HIT_NORMAL = vec3(0.0, 1.0, 0.0);
