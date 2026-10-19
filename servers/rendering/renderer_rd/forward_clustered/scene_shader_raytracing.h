@@ -559,14 +559,12 @@ private:
 		ProgramBuild *build = nullptr; // In flight.
 	};
 	LocalVector<DisplaceProgram> displace_programs; // Parallel to hit_group_slots.
-	String _displace_source(const CustomShaderEntry &p_entry) const;
 
 	// Opacity micromap bakes: the template, and its program per hit group slot (slot 0: BaseMaterial3D's alpha).
 	RaytracingOmmBakeShaderRD omm_bake_shader;
 	RID omm_bake_shader_version;
 	String omm_bake_template;
 	LocalVector<DisplaceProgram> omm_bake_programs; // Parallel to hit_group_slots.
-	String _omm_bake_source(const CustomShaderEntry *p_entry) const;
 
 	LocalVector<ProgramBuild *> program_builds; // In flight.
 	// The binary (through the disk cache), its shader and pipeline: false if any fails.
