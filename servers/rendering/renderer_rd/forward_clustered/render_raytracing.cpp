@@ -997,6 +997,14 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	bool data_changed = layout_changed ||
 			entry.cached_change_stamp != p_source.change_stamp ||
 			entry.cached_buffer_id != buffer_id;
+	// Out of view and far: the BLAS keeps the positions it has (and the hit shaders the vertices they match) until the
+	// surface's turn. Only a refit waits: a new or resized surface is built now.
+	const bool defer_update = p_source.defer_update && data_changed && !layout_changed && !p_source.force_rebuild && entry.ptr && entry.blas_built_once && entry.prev_pos_seeded &&
+			entry.cached_key_version == p_source.cache_version && entry.cached_surface_counter == p_source.surface_counter && entry.omm_micromap == entry.built_omm_micromap &&
+			entry.owned_vb_full_capacity >= full_size;
+	if (defer_update) {
+		data_changed = false;
+	}
 	// A micromap freed (evicted) is no longer one to build with.
 	if (entry.omm_micromap.is_valid() && !rd->acceleration_structure_is_valid(entry.omm_micromap)) {
 		entry.omm_micromap = RID();
@@ -1094,10 +1102,16 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 
 	surf->cached_final_transform_valid = false;
 
-	entry.cached_change_stamp = p_source.change_stamp;
+	if (defer_update) {
+		// Still a change for the next frame. The motion until the update is reported then: prev_pos_vb takes the positions
+		// owned_vb_full keeps, those the BLAS was last updated with.
+		out_of_view_deferred += first_touch_this_frame ? 1 : 0;
+	} else {
+		entry.cached_change_stamp = p_source.change_stamp;
+		entry.cached_buffer_id = buffer_id;
+	}
 	entry.cached_key_version = p_source.cache_version;
 	entry.cached_surface_counter = p_source.surface_counter;
-	entry.cached_buffer_id = buffer_id;
 	entry.cached_vertex_count = vertex_count;
 	entry.cached_full_size = full_size;
 	entry.last_used_frame = current_frame;
@@ -3880,6 +3894,33 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	LocalVector<RID> dirty_blas_list;
 	LocalVector<RID> dirty_blas_update_list;
 
+	// Out of view, geometry that keeps deforming (skinning, blend shapes, the wind on merged MultiMeshes) is updated, and
+	// its BLAS refit, every frame within out_of_view_update_distance of the camera and every N frames beyond, N growing
+	// with the distance: Unreal's dynamic geometry update budget for ray tracing. What is in view is updated every frame,
+	// so primary visibility never lags; only reflections and shadows of what is out of view and far do. The instances take
+	// turns, and the motion between two updates is reported on the update frame.
+	static const float out_of_view_update_distance = GLOBAL_GET("rendering/pathtracing/out_of_view_update_distance");
+	const uint32_t OUT_OF_VIEW_MAX_UPDATE_PERIOD = 8;
+	out_of_view_deferred = 0;
+	Vector<Plane> view_planes;
+	Vector3 view_points[8];
+	if (out_of_view_update_distance > 0.0f) {
+		view_planes = p_render_data->scene_data->cam_projection.get_projection_planes(p_render_data->scene_data->cam_transform);
+		if (!p_render_data->scene_data->cam_projection.get_endpoints(p_render_data->scene_data->cam_transform, view_points)) {
+			view_planes.clear();
+		}
+	}
+	// False when the instance's BLAS update waits for its next turn this frame.
+	auto update_turn = [&](const AABB &p_aabb, uint64_t p_key) -> bool {
+		if (view_planes.is_empty() || p_aabb.intersects_convex_shape(view_planes.ptr(), view_planes.size(), view_points, 8)) {
+			return true;
+		}
+		const Vector3 camera_origin = p_render_data->scene_data->cam_transform.origin;
+		const float distance = Vector3().max(p_aabb.position - camera_origin).max(camera_origin - (p_aabb.position + p_aabb.size)).length();
+		const uint32_t period = CLAMP(uint32_t(distance / out_of_view_update_distance), 1u, OUT_OF_VIEW_MAX_UPDATE_PERIOD);
+		return (current_frame + uint32_t(p_key)) % period == 0;
+	};
+
 #ifdef TOOLS_ENABLED
 	uint32_t tlas_instance_count = 0;
 	uint32_t tlas_primitive_count = 0;
@@ -4143,6 +4184,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					if (displace_cse && displace_cse->writes_vertex && rt_shader_singleton->get_displace_pipeline(mat_data->rt_sbt_offset, displace_shader).is_valid()) {
 						displace = true;
 						reevaluate = displace_cse->uses_vertex_time || (displace_cse->vertex_reads_camera && displace_camera_moved);
+						if (reevaluate && !update_turn(inst->transformed_aabb, mm_rid.get_id())) {
+							// The wind waits for its turn out of view; a change of the instances or the material still evaluates it.
+							reevaluate = false;
+							out_of_view_deferred++;
+						}
 					}
 				}
 
@@ -4280,6 +4326,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					src.cache_version = static_cast<uint32_t>(mi_id >> 32);
 					src.cache_key = (static_cast<uint64_t>(mi_index) << 16) | (surf->surface_index & 0xFFFFu);
 					src.surface_counter = surface_counter;
+					src.defer_update = !update_turn(inst->transformed_aabb, mi_index);
 					surf_data = process_deformed_surface(surf, mesh_surface, src, dirty_blas_list, dirty_blas_update_list);
 				}
 			}
@@ -4787,6 +4834,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				int(merged_mb[0] >> 20), int(merged_mb[1] >> 20), int(merged_mb[2] >> 20),
 				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_BUFFERS) >> 20), int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TEXTURES) >> 20)));
 		const SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+		print_line(vformat("RTCACHES out of view: %d BLAS updates waiting for their turn", out_of_view_deferred));
 		print_line(vformat("RTCACHES frame %d: TLAS %d instances, %d BLAS builds, %d refits | displaced %d (%d vertices), %d deferred | surfaces %d, merged MultiMeshes %d, deformed %d, LOD views %d, materials %d, dedicated UBOs %d | hit groups %d, pipeline swaps %d | video %d MB",
 				RSG::rasterizer->get_frame_number(), tlas_instance_count, rt_blas_builds, rt_blas_refits,
 				displaced_evaluated, int64_t(displaced_vertices), displaced_deferred,

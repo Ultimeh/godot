@@ -410,6 +410,7 @@ struct RTDeformedGeometrySource {
 	uint32_t surface_counter = 0; ///< Changes when the underlying mesh surface changes.
 	bool force_rebuild = false; ///< Rebuild instead of refitting when the data changed.
 	uint32_t prev_offset = UINT32_MAX; ///< When set and the data changed: previous positions read from `prev_vb` there.
+	bool defer_update = false; ///< A change of `current_vb` waits for a later frame (out of view and far): the BLAS keeps the positions it has.
 };
 
 // BaseMaterial3D's billboard modes, which place the instance in vertex().
@@ -720,6 +721,8 @@ class RenderRaytracing {
 	uint32_t displaced_evaluated = 0;
 	uint32_t displaced_deferred = 0;
 	uint64_t displaced_vertices = 0;
+	// The frame's BLAS updates of deforming geometry waiting for their turn out of view (out_of_view_update_distance).
+	uint32_t out_of_view_deferred = 0;
 	LocalVector<RD::Uniform> _displace_frame_uniforms(RID p_job_buffer);
 	void _displace_merged_multimeshes();
 
