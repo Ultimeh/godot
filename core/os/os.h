@@ -299,6 +299,8 @@ public:
 
 	virtual void disable_crash_handler() {}
 	virtual bool is_disable_crash_handler() const { return false; }
+	// Crash dumps of unhandled exceptions written into p_dir (Windows only for now).
+	virtual void enable_crash_minidumps(const String &p_dir) {}
 	virtual void initialize_debugging() {}
 
 	virtual uint64_t get_static_memory_usage() const;

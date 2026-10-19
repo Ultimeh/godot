@@ -327,6 +327,14 @@ static String unescape_cmdline(const String &p_str) {
 	return p_str.replace("%20", " ");
 }
 
+// Minidumps of the project's crashes in user://crashes, not of the editor or the project manager.
+// Calling it again puts the crash handler back in front of one installed since.
+static void _enable_crash_minidumps() {
+	if (!editor && !project_manager && !cmdline_tool && !OS::get_singleton()->is_disable_crash_handler() && GLOBAL_GET("debug/settings/crash_handler/write_minidump")) {
+		OS::get_singleton()->enable_crash_minidumps(OS::get_singleton()->get_user_data_dir().path_join("crashes"));
+	}
+}
+
 static String get_full_version_string() {
 	String hash = String(GODOT_VERSION_HASH);
 	if (!hash.is_empty()) {
@@ -2278,6 +2286,9 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	// Initialize user data dir.
 	OS::get_singleton()->ensure_user_data_dir();
 
+	// Crash minidumps of the project, from here on.
+	_enable_crash_minidumps();
+
 	OS::get_singleton()->set_low_processor_usage_mode(GLOBAL_DEF("application/run/low_processor_mode", false));
 	OS::get_singleton()->set_low_processor_usage_mode_sleep_usec(
 			GLOBAL_DEF(PropertyInfo(Variant::INT, "application/run/low_processor_mode_sleep_usec", PROPERTY_HINT_RANGE, "0,33200,1,or_greater"), 6900)); // Roughly 144 FPS
@@ -3904,6 +3915,9 @@ Error Main::setup2(bool p_show_boot_logo) {
 
 	// This loads global classes, so it must happen before custom loaders and savers are registered
 	ScriptServer::init_languages();
+
+	// Again, in front of the crash handler a scripting runtime may have installed (.NET does).
+	_enable_crash_minidumps();
 
 #if TOOLS_ENABLED
 

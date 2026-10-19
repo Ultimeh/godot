@@ -253,6 +253,7 @@ public:
 
 	virtual void disable_crash_handler() override;
 	virtual bool is_disable_crash_handler() const override;
+	virtual void enable_crash_minidumps(const String &p_dir) override;
 	virtual void initialize_debugging() override;
 
 	virtual Error move_to_trash(const String &p_path) override;

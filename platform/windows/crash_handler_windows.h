@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "core/string/ustring.h"
+
 #include <windows.h>
 
 // Crash handler exception only enabled with MSVC
@@ -50,6 +52,9 @@ public:
 
 	void disable();
 	bool is_disabled() const { return disabled; }
+
+	// Writes a minidump of any unhandled exception, on any thread, into p_dir (in every build type).
+	void enable_minidumps(const String &p_dir);
 
 	CrashHandler();
 	~CrashHandler();

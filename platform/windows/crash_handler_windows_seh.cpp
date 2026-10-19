@@ -167,7 +167,10 @@ DWORD CrashHandlerException(EXCEPTION_POINTERS *ep) {
 	print_error(vformat("Load address: %x\n", (uint64_t)base));
 
 	// Setup stuff:
-	CONTEXT *context = ep->ContextRecord;
+	// StackWalk64() updates the context as it unwinds: walk a copy, so that the exception record still
+	// holds the crashing context when the minidump filter (crash_handler_windows_minidump.cpp) writes it.
+	CONTEXT context_copy = *ep->ContextRecord;
+	CONTEXT *context = &context_copy;
 	STACKFRAME64 frame;
 	bool skip_first = false;
 

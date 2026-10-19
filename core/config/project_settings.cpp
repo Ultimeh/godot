@@ -1803,6 +1803,7 @@ ProjectSettings::ProjectSettings() {
 			String("Please include this when reporting the bug to the project developer."));
 	GLOBAL_DEF("debug/settings/crash_handler/message.editor",
 			String("Please include this when reporting the bug on: https://github.com/godotengine/godot/issues"));
+	GLOBAL_DEF_RST("debug/settings/crash_handler/write_minidump", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/occlusion_culling/bvh_build_quality", PROPERTY_HINT_ENUM, "Low,Medium,High"), 2);
 	GLOBAL_DEF_RST("rendering/occlusion_culling/jitter_projection", true);
 

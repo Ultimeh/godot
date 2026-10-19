@@ -2560,6 +2560,10 @@ bool OS_Windows::is_disable_crash_handler() const {
 	return crash_handler.is_disabled();
 }
 
+void OS_Windows::enable_crash_minidumps(const String &p_dir) {
+	crash_handler.enable_minidumps(p_dir);
+}
+
 Error OS_Windows::move_to_trash(const String &p_path) {
 	SHFILEOPSTRUCTW sf;
 
