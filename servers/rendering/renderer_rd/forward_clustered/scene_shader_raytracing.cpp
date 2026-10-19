@@ -35,6 +35,7 @@
 #include "core/error/error_macros.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/io/marshalls.h"
 #include "core/math/math_defs.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
@@ -42,6 +43,7 @@
 #include "core/string/string_builder.h"
 #include "core/version.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
+#include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_clustered/rt_alpha_dependencies.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
@@ -419,6 +421,7 @@ void SceneShaderRaytracing::invalidate_pipeline_bundles() {
 	}
 	pipeline_bundles.clear();
 	variant_compile_contexts.clear();
+	bake_compile_contexts.clear();
 }
 
 // Async bundle rebuild task (worker: SPIR-V + pipeline; main thread: SBT + swap). Single-lane globally.
@@ -936,7 +939,8 @@ const SceneShaderRaytracing::CustomShaderEntry *SceneShaderRaytracing::get_custo
 	return &slot.entry;
 }
 
-static String _program_texture_defines(const Vector<SceneShaderRaytracing::TextureUniformInfo> &p_texture_uniforms) {
+// The #defines that read a material's textures from the bindless tables, by their indices in its uniform buffer.
+static String _texture_defines(const Vector<SceneShaderRaytracing::TextureUniformInfo> &p_texture_uniforms) {
 	String tex_defines;
 	for (const SceneShaderRaytracing::TextureUniformInfo &tui : p_texture_uniforms) {
 		const String id = _uniform_identifier(tui.name);
@@ -950,7 +954,7 @@ String SceneShaderRaytracing::_displace_source(const CustomShaderEntry &p_entry)
 	source = source.replace("/* RT_CUSTOM_DEFINES */", p_entry.defines + (p_entry.writes_modelview ? "\n#define RT_MODELVIEW_WRITTEN\n" : ""));
 	source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", p_entry.fragment_globals);
 	source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", p_entry.uniform_members.is_empty() ? String("float _rt_pad;") : p_entry.uniform_members);
-	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", _program_texture_defines(p_entry.texture_uniforms));
+	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", _texture_defines(p_entry.texture_uniforms));
 	source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + p_entry.vertex_code + "\n}\n");
 	source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
 	return _apply_varying_code(source, p_entry.varyings);
@@ -962,7 +966,7 @@ String SceneShaderRaytracing::_omm_bake_source(const CustomShaderEntry *p_entry)
 		source = source.replace("/* RT_CUSTOM_DEFINES */", p_entry->defines);
 		source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", p_entry->fragment_globals);
 		source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", p_entry->uniform_members.is_empty() ? String("float _rt_pad;") : p_entry->uniform_members);
-		source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", _program_texture_defines(p_entry->texture_uniforms));
+		source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", _texture_defines(p_entry->texture_uniforms));
 		source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + p_entry->vertex_code + "\n}\n");
 		source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
 		source = source.replace("/* RT_CUSTOM_FRAGMENT_CODE */", p_entry->fragment_code);
@@ -1207,11 +1211,30 @@ String SceneShaderRaytracing::_binary_cache_key(const String &p_name, const Vect
 	return key.as_string().sha256_text();
 }
 
+String SceneShaderRaytracing::get_binary_cache_file_name(const String &p_key, const String &p_api) {
+	return p_key + "." + p_api + ".cache";
+}
+
+Vector<uint8_t> SceneShaderRaytracing::make_binary_cache_file(const Vector<uint8_t> &p_binary) {
+	Vector<uint8_t> bytes;
+	bytes.resize(12 + p_binary.size());
+	uint8_t *w = bytes.ptrw();
+	memcpy(w, rt_binary_cache_header, 4);
+	encode_uint32(rt_binary_cache_version, w + 4);
+	encode_uint32(p_binary.size(), w + 8);
+	memcpy(w + 12, p_binary.ptr(), p_binary.size());
+	return bytes;
+}
+
 Vector<uint8_t> SceneShaderRaytracing::_binary_cache_load(const String &p_key) const {
-	if (binary_cache_dir.is_empty()) {
-		return Vector<uint8_t>();
+	const String file_name = get_binary_cache_file_name(p_key, binary_cache_api);
+	Ref<FileAccess> f;
+	if (!binary_cache_dir.is_empty()) {
+		f = FileAccess::open(binary_cache_dir.path_join(file_name), FileAccess::READ);
 	}
-	Ref<FileAccess> f = FileAccess::open(binary_cache_dir.path_join(p_key + "." + binary_cache_api + ".cache"), FileAccess::READ);
+	if (f.is_null() && !binary_cache_res_dir.is_empty()) {
+		f = FileAccess::open(binary_cache_res_dir.path_join(file_name), FileAccess::READ);
+	}
 	if (f.is_null()) {
 		return Vector<uint8_t>();
 	}
@@ -1236,7 +1259,7 @@ void SceneShaderRaytracing::_binary_cache_save(const String &p_key, const Vector
 	if (binary_cache_dir.is_empty() || p_binary.is_empty()) {
 		return;
 	}
-	const String path = binary_cache_dir.path_join(p_key + "." + binary_cache_api + ".cache");
+	const String path = binary_cache_dir.path_join(get_binary_cache_file_name(p_key, binary_cache_api));
 	// Written aside, then renamed: a crash while writing leaves no truncated entry.
 	const String temporary_path = path + "." + itos(Thread::get_caller_id()) + ".tmp";
 	{
@@ -1274,10 +1297,7 @@ Vector<uint8_t> SceneShaderRaytracing::_compile_compute_binary(const String &p_s
 
 // Per-rt_flags base SPIR-V + HG templates (immutable cache for worker tasks).
 
-bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags) {
-	if (variant_compile_contexts.has(p_rt_flags)) {
-		return true;
-	}
+bool SceneShaderRaytracing::_build_variant_compile_context(uint32_t p_rt_flags, VariantCompileContext &r_ctx) {
 	ERR_FAIL_COND_V(!raygen_shader_version.is_valid(), false);
 
 	int variant = (int)_raygen_variant_from_rt_flags(p_rt_flags);
@@ -1326,20 +1346,31 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	int base_ah_ver = base_ah_src.find("#version");
 	ERR_FAIL_COND_V(base_ch_ver < 0 || base_ah_ver < 0, false);
 
-	VariantCompileContext ctx;
-	ctx.ch_template = base_ch_src.insert(base_ch_src.find("\n", base_ch_ver) + 1, custom_hg_define);
-	ctx.ah_template = base_ah_src.insert(base_ah_src.find("\n", base_ah_ver) + 1, custom_hg_define);
-	ctx.ah_procedural_src = _insert_after_version(base_ah_src, INTERSECTION_SHADERS_DEFINE);
+	r_ctx.ch_template = base_ch_src.insert(base_ch_src.find("\n", base_ch_ver) + 1, custom_hg_define);
+	r_ctx.ah_template = base_ah_src.insert(base_ah_src.find("\n", base_ah_ver) + 1, custom_hg_define);
+	r_ctx.ah_procedural_src = _insert_after_version(base_ah_src, INTERSECTION_SHADERS_DEFINE);
 	if (!intersection_source_template.is_empty()) {
 		int base_is_ver = intersection_source_template.find("#version");
 		if (base_is_ver >= 0) {
-			ctx.is_template = _insert_after_version(intersection_source_template.insert(intersection_source_template.find("\n", base_is_ver) + 1, custom_hg_define), INTERSECTION_SHADERS_DEFINE);
+			r_ctx.is_template = _insert_after_version(intersection_source_template.insert(intersection_source_template.find("\n", base_is_ver) + 1, custom_hg_define), INTERSECTION_SHADERS_DEFINE);
 		}
 	}
 
 	// Full base stages; CH/AH SPIR-V is HG0 default; RG+miss duplicated into each HG bytecode.
-	ctx.base_sources = sources;
-	ctx.base_sources_key = _binary_cache_key("RT_base", sources);
+	r_ctx.base_sources = sources;
+	r_ctx.base_sources_key = _binary_cache_key("RT_base", sources);
+	return true;
+}
+
+bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags) {
+	if (variant_compile_contexts.has(p_rt_flags)) {
+		return true;
+	}
+	VariantCompileContext ctx;
+	if (!_build_variant_compile_context(p_rt_flags, ctx)) {
+		return false;
+	}
+	const Vector<String> sources = ctx.base_sources;
 	variant_compile_contexts.insert(p_rt_flags, ctx);
 
 	// Creates layout-defining base_shader RID for uniform sets (immutable per variant).
@@ -1368,6 +1399,148 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	}
 
 	return true;
+}
+
+// Shader baker.
+
+SceneShaderRaytracing *SceneShaderRaytracing::get_singleton_if_initialized() {
+	return singleton && singleton->raygen_shader_version.is_valid() ? singleton : nullptr;
+}
+
+// The flags that change a variant's sources (RAYGEN_SHADER_OPTIONS; the fog is a specialization constant only, and the
+// debug draw is left out): every combination a run of the project can trace with.
+static LocalVector<uint32_t> _bake_rt_flags(bool p_simple_shadows, bool p_ser) {
+	LocalVector<uint32_t> flags;
+	const uint32_t shadows = p_simple_shadows ? SceneShaderRaytracing::RT_FLAG_RAY_QUERY_SHADOWS_ENABLED : 0;
+	for (const uint32_t rr : { uint32_t(0), uint32_t(SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED) }) {
+		// The hardware decides at run time (compute_rt_flags()): both when the project asks for it.
+		for (const uint32_t set : { uint32_t(0), uint32_t(p_ser ? SceneShaderRaytracing::RT_FLAG_SER_ENABLED : 0) }) {
+			const uint32_t f = shadows | rr | set;
+			if (!flags.has(f)) {
+				flags.push_back(f);
+			}
+		}
+	}
+	return flags;
+}
+
+static SceneShaderRaytracing::BakeProgram _compute_bake_program(const String &p_name, const String &p_source, const String &p_key) {
+	SceneShaderRaytracing::BakeProgram program;
+	program.cache_key = p_key;
+	program.name = p_name;
+	program.stages.push_back(RD::SHADER_STAGE_COMPUTE);
+	program.sources.push_back(p_source);
+	return program;
+}
+
+void SceneShaderRaytracing::get_bake_programs(bool p_simple_shadows, bool p_ser, LocalVector<BakeProgram> &r_programs) {
+	LocalVector<uint32_t> variants = _bake_rt_flags(p_simple_shadows, p_ser);
+	if (!variants.has(RT_FLAG_NONE)) {
+		variants.push_back(RT_FLAG_NONE); // init()'s probe builds its base.
+	}
+	for (const uint32_t flags : variants) {
+		if (!bake_compile_contexts.has(flags)) {
+			VariantCompileContext ctx;
+			if (!_build_variant_compile_context(flags, ctx)) {
+				continue;
+			}
+			bake_compile_contexts.insert(flags, ctx);
+		}
+		const VariantCompileContext &ctx = bake_compile_contexts[flags];
+		// As _ensure_variant_compile_context() compiles it (ShaderRD::compile_stages()).
+		BakeProgram program;
+		program.cache_key = ctx.base_sources_key;
+		program.name = "RT_base";
+		for (int i = 0; i < ctx.base_sources.size(); i++) {
+			if (!ctx.base_sources[i].strip_edges().is_empty()) {
+				program.stages.push_back(RD::ShaderStage(i));
+				program.sources.push_back(ctx.base_sources[i]);
+			}
+		}
+		r_programs.push_back(program);
+	}
+
+	if (!omm_bake_template.is_empty()) {
+		const String source = _omm_bake_source(nullptr);
+		Vector<String> sources;
+		sources.resize(RD::SHADER_STAGE_MAX);
+		sources.write[RD::SHADER_STAGE_COMPUTE] = source;
+		r_programs.push_back(_compute_bake_program("RT OMM bake", source, _binary_cache_key("RT OMM bake", sources)));
+	}
+}
+
+void SceneShaderRaytracing::get_material_bake_programs(RID p_material, bool p_simple_shadows, bool p_ser, LocalVector<BakeProgram> &r_programs) {
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	if (!material_storage->owns_material(p_material) || RenderRaytracing::is_base_material(p_material, material_storage->material_get_param(p_material, "albedo"))) {
+		return;
+	}
+
+	// As _register_slot() makes its slot: a procedural hit group for a material with an intersection(), as
+	// RTProceduralInstance3D registers it, a triangle one otherwise.
+	CustomShaderEntry entry;
+	bool valid = false;
+	if (material_storage->material_get_shader_code_rt(p_material).contains("intersection")) {
+		valid = _preprocess_shader(p_material, true, entry) && !entry.intersection_code.is_empty();
+	}
+	if (!valid) {
+		entry = CustomShaderEntry();
+		valid = _preprocess_shader(p_material, false, entry) && !(entry.fragment_code.is_empty() && entry.vertex_code.is_empty());
+	}
+	if (!valid) {
+		return;
+	}
+	entry.name = material_storage->material_get_shader_path_hint(p_material);
+
+	for (const uint32_t flags : _bake_rt_flags(p_simple_shadows, p_ser)) {
+		if (!bake_compile_contexts.has(flags)) {
+			VariantCompileContext ctx;
+			if (!_build_variant_compile_context(flags, ctx)) {
+				continue;
+			}
+			bake_compile_contexts.insert(flags, ctx);
+		}
+		const VariantCompileContext &ctx = bake_compile_contexts[flags];
+		const HitGroupSources sources = _hit_group_sources(entry, ctx);
+
+		// The stages _compile_hit_group() puts in the binary, in its order: the base's ray generation and miss stages,
+		// the closest hit, the any-hit (the slot's own, else the base's), the intersection.
+		BakeProgram program;
+		program.cache_key = _binary_cache_key("RT_hg", { sources.ch, sources.ah, sources.is }, ctx.base_sources_key);
+		program.name = entry.name.is_empty() ? String("RT_hg") : entry.name;
+		for (int i = 0; i < ctx.base_sources.size(); i++) {
+			if ((i == RD::SHADER_STAGE_RAYGEN || i == RD::SHADER_STAGE_MISS) && !ctx.base_sources[i].strip_edges().is_empty()) {
+				program.stages.push_back(RD::ShaderStage(i));
+				program.sources.push_back(ctx.base_sources[i]);
+			}
+		}
+		program.stages.push_back(RD::SHADER_STAGE_CLOSEST_HIT);
+		program.sources.push_back(sources.ch);
+		const String &any_hit = entry.uses_alpha_clip ? sources.ah : (entry.is_procedural ? ctx.ah_procedural_src : ctx.base_sources[RD::SHADER_STAGE_ANY_HIT]);
+		if (!any_hit.strip_edges().is_empty()) {
+			program.stages.push_back(RD::SHADER_STAGE_ANY_HIT);
+			program.sources.push_back(any_hit);
+		}
+		if (entry.is_procedural && !sources.is.is_empty()) {
+			program.stages.push_back(RD::SHADER_STAGE_INTERSECTION);
+			program.sources.push_back(sources.is);
+		}
+		r_programs.push_back(program);
+	}
+
+	if (entry.writes_vertex && !displace_template.is_empty()) {
+		const String source = _displace_source(entry);
+		Vector<String> sources;
+		sources.resize(RD::SHADER_STAGE_MAX);
+		sources.write[RD::SHADER_STAGE_COMPUTE] = source;
+		r_programs.push_back(_compute_bake_program("RT displace", source, _binary_cache_key("RT displace", sources)));
+	}
+	if (entry.alpha_bakeable && !omm_bake_template.is_empty()) {
+		const String source = _omm_bake_source(&entry);
+		Vector<String> sources;
+		sources.resize(RD::SHADER_STAGE_MAX);
+		sources.write[RD::SHADER_STAGE_COMPUTE] = source;
+		r_programs.push_back(_compute_bake_program("RT OMM bake", source, _binary_cache_key("RT OMM bake", sources)));
+	}
 }
 
 void SceneShaderRaytracing::_bundle_resize_for_slots(PipelineBundle &r_bundle) {
@@ -1556,84 +1729,86 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 			continue;
 		}
 
-		const CustomShaderEntry &entry = slot.entry;
 		si.needs_compile = true;
-
-		String tex_defines;
-		for (int ti = 0; ti < entry.texture_uniforms.size(); ti++) {
-			const TextureUniformInfo &tui = entry.texture_uniforms[ti];
-			const String id = _uniform_identifier(tui.name);
-			tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
-		}
-		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
-
-		String vertex_function;
-		String vertex_call;
-		if (!entry.vertex_code.is_empty()) {
-			vertex_function = "void rt_run_vertex_shader() {\n" + entry.vertex_code + "\n}\n";
-			vertex_call = "rt_run_vertex_shader();";
-		}
-
-		// Procedural with no fragment stage: default material shading.
-		String fragment_code = entry.fragment_code;
-		if (fragment_code.is_empty() && entry.is_procedural) {
-			fragment_code =
-					"vec2 mat_uv = uv_interp * rt_mat.uv1_scale + rt_mat.uv1_offset;\n"
-					"vec4 albedo_tex = sample_material_texture(rt_mat.albedo_texture_idx, mat_uv, rt_mat.flags);\n"
-					"albedo = albedo_tex.rgb * rt_mat.albedo_color.rgb;\n"
-					"alpha = albedo_tex.a * rt_mat.albedo_color.a;\n"
-					"vec3 orm = sample_material_texture(rt_mat.orm_texture_idx, mat_uv, rt_mat.flags).rgb;\n"
-					"roughness = orm.g * rt_mat.roughness;\n"
-					"metallic = orm.b * rt_mat.metallic;\n"
-					"if ((rt_mat.flags & 1u) != 0u) {\n"
-					"    normal_map = sample_material_texture(rt_mat.normal_texture_idx, mat_uv, rt_mat.flags).rgb;\n"
-					"    normal_map_depth = rt_mat.normal_map_depth;\n"
-					"}\n"
-					"if ((rt_mat.flags & 2u) != 0u) {\n"
-					"    emission = sample_material_texture(rt_mat.emission_texture_idx, mat_uv, rt_mat.flags).rgb\n"
-					"             * rt_mat.emission_color * rt_mat.emission_strength;\n"
-					"}\n";
-		}
-
-		{
-			String s = ctx.ch_template;
-			s = s.replace("/* RT_CUSTOM_DEFINES */", entry.defines);
-			s = s.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry.fragment_globals);
-			s = s.replace("/* RT_CUSTOM_FRAGMENT_CODE */", fragment_code);
-			s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
-			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
-			s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
-			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
-			si.ch_src = _apply_varying_code(s, entry.varyings);
-		}
-		if (entry.uses_alpha_clip) {
-			String s = ctx.ah_template;
-			s = s.replace("/* RT_CUSTOM_DEFINES */", entry.defines);
-			s = s.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry.fragment_globals);
-			s = s.replace("/* RT_CUSTOM_FRAGMENT_CODE */", fragment_code);
-			s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
-			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
-			s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
-			s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
-			si.ah_src = _apply_varying_code(s, entry.varyings);
-		}
-		if (entry.is_procedural) {
-			si.ch_src = _insert_after_version(si.ch_src, INTERSECTION_SHADERS_DEFINE);
-			if (!si.ah_src.is_empty()) {
-				si.ah_src = _insert_after_version(si.ah_src, INTERSECTION_SHADERS_DEFINE);
-			}
-		}
-		if (entry.is_procedural && !ctx.is_template.is_empty()) {
-			String s = ctx.is_template;
-			s = s.replace("/* RT_CUSTOM_INTERSECTION_GLOBALS */", entry.intersection_globals);
-			s = s.replace("/* RT_CUSTOM_INTERSECTION_CODE */", entry.intersection_code);
-			s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
-			s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
-			si.is_src = s;
-		}
+		const HitGroupSources sources = _hit_group_sources(slot.entry, ctx);
+		si.ch_src = sources.ch;
+		si.ah_src = sources.ah;
+		si.is_src = sources.is;
 	}
 
 	return task;
+}
+
+SceneShaderRaytracing::HitGroupSources SceneShaderRaytracing::_hit_group_sources(const CustomShaderEntry &p_entry, const VariantCompileContext &p_ctx) {
+	HitGroupSources r;
+	const String tex_defines = _texture_defines(p_entry.texture_uniforms);
+	const String uniform_members = p_entry.uniform_members.is_empty() ? String("float _rt_pad;") : p_entry.uniform_members;
+
+	String vertex_function;
+	String vertex_call;
+	if (!p_entry.vertex_code.is_empty()) {
+		vertex_function = "void rt_run_vertex_shader() {\n" + p_entry.vertex_code + "\n}\n";
+		vertex_call = "rt_run_vertex_shader();";
+	}
+
+	// Procedural with no fragment stage: default material shading.
+	String fragment_code = p_entry.fragment_code;
+	if (fragment_code.is_empty() && p_entry.is_procedural) {
+		fragment_code =
+				"vec2 mat_uv = uv_interp * rt_mat.uv1_scale + rt_mat.uv1_offset;\n"
+				"vec4 albedo_tex = sample_material_texture(rt_mat.albedo_texture_idx, mat_uv, rt_mat.flags);\n"
+				"albedo = albedo_tex.rgb * rt_mat.albedo_color.rgb;\n"
+				"alpha = albedo_tex.a * rt_mat.albedo_color.a;\n"
+				"vec3 orm = sample_material_texture(rt_mat.orm_texture_idx, mat_uv, rt_mat.flags).rgb;\n"
+				"roughness = orm.g * rt_mat.roughness;\n"
+				"metallic = orm.b * rt_mat.metallic;\n"
+				"if ((rt_mat.flags & 1u) != 0u) {\n"
+				"    normal_map = sample_material_texture(rt_mat.normal_texture_idx, mat_uv, rt_mat.flags).rgb;\n"
+				"    normal_map_depth = rt_mat.normal_map_depth;\n"
+				"}\n"
+				"if ((rt_mat.flags & 2u) != 0u) {\n"
+				"    emission = sample_material_texture(rt_mat.emission_texture_idx, mat_uv, rt_mat.flags).rgb\n"
+				"             * rt_mat.emission_color * rt_mat.emission_strength;\n"
+				"}\n";
+	}
+
+	{
+		String s = p_ctx.ch_template;
+		s = s.replace("/* RT_CUSTOM_DEFINES */", p_entry.defines);
+		s = s.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", p_entry.fragment_globals);
+		s = s.replace("/* RT_CUSTOM_FRAGMENT_CODE */", fragment_code);
+		s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
+		s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
+		s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
+		s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
+		r.ch = _apply_varying_code(s, p_entry.varyings);
+	}
+	if (p_entry.uses_alpha_clip) {
+		String s = p_ctx.ah_template;
+		s = s.replace("/* RT_CUSTOM_DEFINES */", p_entry.defines);
+		s = s.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", p_entry.fragment_globals);
+		s = s.replace("/* RT_CUSTOM_FRAGMENT_CODE */", fragment_code);
+		s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
+		s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
+		s = s.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", vertex_function);
+		s = s.replace("/* RT_CUSTOM_VERTEX_CALL */", vertex_call);
+		r.ah = _apply_varying_code(s, p_entry.varyings);
+	}
+	if (p_entry.is_procedural) {
+		r.ch = _insert_after_version(r.ch, INTERSECTION_SHADERS_DEFINE);
+		if (!r.ah.is_empty()) {
+			r.ah = _insert_after_version(r.ah, INTERSECTION_SHADERS_DEFINE);
+		}
+	}
+	if (p_entry.is_procedural && !p_ctx.is_template.is_empty()) {
+		String s = p_ctx.is_template;
+		s = s.replace("/* RT_CUSTOM_INTERSECTION_GLOBALS */", p_entry.intersection_globals);
+		s = s.replace("/* RT_CUSTOM_INTERSECTION_CODE */", p_entry.intersection_code);
+		s = s.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", uniform_members);
+		s = s.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
+		r.is = s;
+	}
+	return r;
 }
 
 void SceneShaderRaytracing::_load_hit_group_from_cache(uint32_t p_index, PipelineBuildTask *p_task) {
@@ -2241,17 +2416,23 @@ void SceneShaderRaytracing::init(const String p_defines) {
 	async_compilation_enabled = (bool)GLOBAL_GET("rendering/pathtracing/async_shader_compilation");
 
 	// Next to ShaderRD's cache, when it has one (rendering/shader_compiler/shader_cache/enabled, always in the editor).
+	binary_cache_api = String(RD::get_singleton()->get_device_api_name()).validate_filename().to_lower();
 	const String &shader_cache_dir = ShaderRD::get_shader_cache_user_dir();
 	if (!shader_cache_dir.is_empty()) {
 		const String dir = shader_cache_dir.path_join("SceneShaderRaytracing");
 		Ref<DirAccess> d = DirAccess::open(shader_cache_dir);
 		if (d.is_valid() && (d->dir_exists("SceneShaderRaytracing") || d->make_dir("SceneShaderRaytracing") == OK)) {
 			binary_cache_dir = dir;
-			binary_cache_api = String(RD::get_singleton()->get_device_api_name()).validate_filename().to_lower();
 		} else {
 			ERR_PRINT("Can't create the ray tracing shader cache folder, its shaders will be compiled at every launch: " + dir);
 		}
 	}
+	// The shader baker's, in an exported project (ShaderBakerExportPlugin). In the editor it is the user's.
+	const String &shader_cache_res_dir = ShaderRD::get_shader_cache_res_dir();
+	if (!shader_cache_res_dir.is_empty() && shader_cache_res_dir != shader_cache_dir && DirAccess::dir_exists_absolute(shader_cache_res_dir.path_join("SceneShaderRaytracing"))) {
+		binary_cache_res_dir = shader_cache_res_dir.path_join("SceneShaderRaytracing");
+	}
+	print_verbose(vformat("RT: shader binary cache \"%s\", baked binaries \"%s\".", binary_cache_dir, binary_cache_res_dir));
 
 	// Raygen: one mode per bitmask of RAYGEN_SHADER_OPTIONS.
 	const uint32_t variant_count = 1u << RAYGEN_SHADER_OPTION_COUNT;

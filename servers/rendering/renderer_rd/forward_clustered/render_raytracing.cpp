@@ -2390,7 +2390,7 @@ RTMaterialData *RenderRaytracing::_compiling_material_fallback(const RTMaterialD
 	return &s_compiling_mat;
 }
 
-bool RenderRaytracing::_is_base_material(RID p_material, const Variant &p_albedo) {
+bool RenderRaytracing::is_base_material(RID p_material, const Variant &p_albedo) {
 	// BaseMaterial3D's shaders are evaluated from their parameters (hit group 0); any other shader runs its own code, even
 	// when it names its uniforms as BaseMaterial3D does. A Shader resource converted from a StandardMaterial3D keeps the
 	// generated header, often with an edited vertex(): only the generated shaders have no resource path.
@@ -2414,7 +2414,7 @@ void RenderRaytracing::precache_hit_groups(const LocalVector<RID> &p_materials) 
 		}
 		seen.insert(material);
 		// Freed since its surface was built.
-		if (!material_storage->owns_material(material) || _is_base_material(material, material_storage->material_get_param(material, "albedo"))) {
+		if (!material_storage->owns_material(material) || is_base_material(material, material_storage->material_get_param(material, "albedo"))) {
 			continue;
 		}
 		const uint32_t slot = rt_shader->register_custom_shader(material_storage->material_get_shader_id(material), material);
@@ -2582,7 +2582,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// Colors declared with source_color in Godot shaders are stored in sRGB;
 	// material_get_param returns the raw sRGB value, so we convert to linear here.
 	Variant albedo_var = material_storage->material_get_param(p_material_rid, "albedo");
-	if (_is_base_material(p_material_rid, albedo_var)) {
+	if (is_base_material(p_material_rid, albedo_var)) {
 		Color c = ((Color)albedo_var).srgb_to_linear();
 		mat.albedo_color[0] = c.r;
 		mat.albedo_color[1] = c.g;

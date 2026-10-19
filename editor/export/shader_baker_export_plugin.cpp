@@ -38,6 +38,8 @@
 #include "editor/editor_node.h"
 #include "scene/3d/label_3d.h"
 #include "scene/3d/sprite_3d.h"
+#include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered_pt.h"
+#include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/rendering_shader_container.h"
@@ -118,6 +120,14 @@ bool ShaderBakerExportPlugin::_begin_customize_resources(const Ref<EditorExportP
 	to_hash.append(GODOT_VERSION_HASH);
 	to_hash.append("[Renderer]");
 	to_hash.append(shader_cache_renderer_name);
+	// The binaries are the driver's: resources customized for another one would not be visited again.
+	to_hash.append("[Driver]");
+	to_hash.append(shader_container_driver);
+	// The path tracer's variants follow these two (SceneShaderRaytracing::get_bake_programs()).
+	raytracing_simple_shadows = get_export_preset()->get_project_setting("rendering/pathtracing/use_simple_shadows");
+	raytracing_ser = get_export_preset()->get_project_setting("rendering/pathtracing/use_shader_execution_reordering");
+	to_hash.append("[PathTracing]");
+	to_hash.append(itos(bool(get_option("shader_baker/path_tracing"))) + itos(raytracing_simple_shadows) + itos(raytracing_ser));
 	customization_configuration_hash = to_hash.as_string().hash64();
 
 	BitField<RenderingShaderLibrary::FeatureBits> renderer_features = {};
@@ -139,6 +149,16 @@ bool ShaderBakerExportPlugin::_begin_customize_resources(const Ref<EditorExportP
 	renderer_features.set_flag(RenderingShaderLibrary::FEATURE_FP32_BIT);
 
 	RendererSceneRenderRD::get_singleton()->enable_features(renderer_features);
+
+	// The path tracer's shaders are set up at its first traced frame, which an exporting editor may never have had:
+	// set up now, its ShaderRD shaders and the transparent pass' ray traced shadow variants are baked below with the
+	// others, and its own programs (_customize_raytracing_programs()) from their templates. Forward+ always runs
+	// RenderForwardClusteredPT.
+	raytracing_baked = false;
+	if (bool(get_option("shader_baker/path_tracing"))) {
+		RendererSceneRenderImplementation::RenderForwardClustered *forward_clustered = RendererSceneRenderImplementation::RenderForwardClustered::get_singleton();
+		raytracing_baked = forward_clustered != nullptr && static_cast<RendererSceneRenderImplementation::RenderForwardClusteredPT *>(forward_clustered)->setup_raytracing_for_shader_baker();
+	}
 
 	// Included all shaders created by renderers and effects.
 	ShaderRD::shaders_embedded_set_lock();
@@ -164,6 +184,9 @@ bool ShaderBakerExportPlugin::_begin_customize_resources(const Ref<EditorExportP
 	}
 
 	material_storage->shader_embedded_set_unlock();
+
+	// The path tracer's programs that belong to no material.
+	_customize_raytracing_programs(RID());
 
 	return true;
 }
@@ -238,6 +261,37 @@ void ShaderBakerExportPlugin::_end_customize_resources() {
 		}
 	}
 
+	for (const RaytracingItem &item : raytracing_items) {
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(item.task);
+		if (tasks_cancelled) {
+			continue;
+		}
+
+		PackedByteArray binary;
+		{
+			MutexLock lock(shader_work_results_mutex);
+			binary = raytracing_work_results[item.cache_path];
+		}
+		if (binary.is_empty()) {
+			// Failed to compile: left to the run time, which reports it.
+			shader_paths_processed.erase(item.cache_path);
+			continue;
+		}
+
+		const PackedByteArray cache_file_bytes = RendererSceneRenderImplementation::SceneShaderRaytracing::make_binary_cache_file(binary);
+		add_file(shader_cache_user_dir.path_join(item.cache_path), cache_file_bytes, false);
+
+		String cache_file_path = shader_cache_export_path.path_join(item.cache_path);
+		if (!DirAccess::exists(cache_file_path.get_base_dir())) {
+			DirAccess::make_dir_recursive_absolute(cache_file_path.get_base_dir());
+		}
+
+		Ref<FileAccess> cache_file_access = FileAccess::open(cache_file_path, FileAccess::WRITE);
+		if (cache_file_access.is_valid()) {
+			cache_file_access->store_buffer(cache_file_bytes);
+		}
+	}
+
 	if (!tasks_cancelled) {
 		String file_cache_path = shader_cache_export_path.path_join("file_cache");
 		Ref<FileAccess> cache_list_access = FileAccess::open(file_cache_path, FileAccess::READ_WRITE);
@@ -270,6 +324,8 @@ void ShaderBakerExportPlugin::_end_customize_resources() {
 	shader_paths_processed.clear();
 	shader_work_results.clear();
 	shader_group_items.clear();
+	raytracing_items.clear();
+	raytracing_work_results.clear();
 
 	_cleanup_container_format();
 }
@@ -289,6 +345,7 @@ Ref<Resource> ShaderBakerExportPlugin::_customize_resource(const Ref<Resource> &
 					_customize_shader_version(shader_version_pair.first, shader_version_pair.second);
 				}
 			}
+			_customize_raytracing_programs(material_rid);
 		}
 	}
 
@@ -366,6 +423,12 @@ Node *ShaderBakerExportPlugin::_customize_scene(Node *p_root, const String &p_pa
 	return nullptr;
 }
 
+void ShaderBakerExportPlugin::_get_export_options(const Ref<EditorExportPlatform> &p_export_platform, List<EditorExportPlatform::ExportOption> *r_options) const {
+	// Forward+ only: the path tracer's shaders (Environment.pathtracing_enabled). Off for a project that never path
+	// traces, which would bake every custom material's hit groups for nothing.
+	r_options->push_back(EditorExportPlatform::ExportOption(PropertyInfo(Variant::BOOL, "shader_baker/path_tracing"), true));
+}
+
 uint64_t ShaderBakerExportPlugin::_get_customization_configuration_hash() const {
 	return customization_configuration_hash;
 }
@@ -441,6 +504,84 @@ void ShaderBakerExportPlugin::_process_work_item(WorkItem p_work_item) {
 					MutexLock lock(shader_work_results_mutex);
 					shader_work_results[p_work_item.cache_path].variant_data.ptrw()[p_work_item.variant] = shader_bytes;
 				}
+			}
+		}
+	}
+
+	{
+		MutexLock lock(tasks_mutex);
+		tasks_processed++;
+	}
+
+	tasks_condition.notify_one();
+}
+
+void ShaderBakerExportPlugin::_customize_raytracing_programs(RID p_material) {
+	using RendererSceneRenderImplementation::SceneShaderRaytracing;
+	if (!raytracing_baked) {
+		return;
+	}
+	SceneShaderRaytracing *raytracing = SceneShaderRaytracing::get_singleton_if_initialized();
+	if (raytracing == nullptr) {
+		return;
+	}
+
+	LocalVector<SceneShaderRaytracing::BakeProgram> programs;
+	if (p_material.is_valid()) {
+		raytracing->get_material_bake_programs(p_material, raytracing_simple_shadows, raytracing_ser, programs);
+	} else {
+		raytracing->get_bake_programs(raytracing_simple_shadows, raytracing_ser, programs);
+	}
+
+	for (const SceneShaderRaytracing::BakeProgram &program : programs) {
+		// Where SceneShaderRaytracing's binary cache keeps it, under the shader cache.
+		const String cache_path = String("SceneShaderRaytracing").path_join(SceneShaderRaytracing::get_binary_cache_file_name(program.cache_key, shader_container_driver));
+		if (shader_paths_processed.has(cache_path)) {
+			continue;
+		}
+		shader_paths_processed.insert(cache_path);
+
+		RaytracingWorkItem work_item;
+		work_item.cache_path = cache_path;
+		work_item.shader_name = program.name;
+		for (const RD::ShaderStage stage : program.stages) {
+			work_item.stages.push_back(stage);
+		}
+		work_item.stage_sources = program.sources;
+
+		RaytracingItem item;
+		item.cache_path = cache_path;
+		item.task = WorkerThreadPool::get_singleton()->add_template_task(this, &ShaderBakerExportPlugin::_process_raytracing_work_item, work_item);
+		raytracing_items.push_back(item);
+		tasks_total++;
+	}
+}
+
+void ShaderBakerExportPlugin::_process_raytracing_work_item(RaytracingWorkItem p_work_item) {
+	if (!tasks_cancelled) {
+		// As SceneShaderRaytracing compiles them at run time: each stage on its own, the binary from all of them.
+		Vector<RD::ShaderStageSPIRVData> spirv_data;
+		for (int i = 0; i < p_work_item.stages.size(); i++) {
+			RD::ShaderStageSPIRVData stage;
+			String error;
+			stage.shader_stage = RD::ShaderStage(p_work_item.stages[i]);
+			stage.spirv = RD::get_singleton()->shader_compile_spirv_from_source(stage.shader_stage, p_work_item.stage_sources[i], RD::SHADER_LANGUAGE_GLSL, &error);
+			if (stage.spirv.is_empty()) {
+				ERR_PRINT(vformat("Unable to compile the %s stage of the path tracing shader %s: %s", RD::SHADER_STAGE_NAMES[stage.shader_stage], p_work_item.shader_name, error));
+				spirv_data.clear();
+				break;
+			}
+			spirv_data.push_back(stage);
+		}
+
+		if (!spirv_data.is_empty()) {
+			Ref<RenderingShaderContainer> shader_container = shader_container_format->create_container();
+			if (unlikely(!shader_container->set_code_from_spirv(p_work_item.shader_name, spirv_data))) {
+				ERR_PRINT(vformat("Failed to compile the path tracing shader %s to native code.", p_work_item.shader_name));
+			} else {
+				PackedByteArray shader_bytes = shader_container->to_bytes();
+				MutexLock lock(shader_work_results_mutex);
+				raytracing_work_results[p_work_item.cache_path] = shader_bytes;
 			}
 		}
 	}

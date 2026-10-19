@@ -522,8 +522,21 @@ private:
 		String ah_procedural_src;
 	};
 	HashMap<uint32_t, VariantCompileContext> variant_compile_contexts;
+	HashMap<uint32_t, VariantCompileContext> bake_compile_contexts; // The shader baker's, which create no bundle.
 
+	bool _build_variant_compile_context(uint32_t p_rt_flags, VariantCompileContext &r_ctx);
 	bool _ensure_variant_compile_context(uint32_t p_rt_flags);
+
+	// A custom hit group's own stages, from the variant's templates (ah: empty without the slot's own any-hit, is: empty
+	// for a triangle hit group).
+	struct HitGroupSources {
+		String ch;
+		String ah;
+		String is;
+	};
+	static HitGroupSources _hit_group_sources(const CustomShaderEntry &p_entry, const VariantCompileContext &p_ctx);
+	String _displace_source(const CustomShaderEntry &p_entry) const;
+	String _omm_bake_source(const CustomShaderEntry *p_entry) const; // Null: hit group 0's (BaseMaterial3D's alpha).
 
 	RaytracingDisplaceShaderRD displace_shader;
 	RID displace_shader_version;
@@ -571,6 +584,8 @@ private:
 	// sources, the engine version and the API, as ShaderRD keys its own. Translating them (Mesa's SPIR-V to DXIL on
 	// D3D12) took seconds at every launch, the materials traced with a neutral fallback meanwhile.
 	String binary_cache_dir; // Empty: no cache (shader cache disabled).
+	// Read only, after binary_cache_dir: the binaries the shader baker put in an exported project (ShaderRD's res dir).
+	String binary_cache_res_dir;
 	String binary_cache_api; // In the file names, as ShaderRD's.
 	static String _binary_cache_key(const String &p_name, const Vector<String> &p_sources, const String &p_extra = String());
 	Vector<uint8_t> _binary_cache_load(const String &p_key) const;
@@ -579,6 +594,27 @@ private:
 	Vector<uint8_t> _compile_compute_binary(const String &p_source, const String &p_name) const;
 
 public:
+	// The shader baker (editor/export/shader_baker_export_plugin.cpp) compiles ahead of time the binaries this class
+	// builds from GLSL it assembles itself, outside ShaderRD: each variant's base, the hit group of every material, its
+	// displacement and opacity micromap bake programs. An exported project reads them from ShaderRD's res dir
+	// (res://.godot/shader_cache) under the names the binary cache gives them, after the user's cache.
+	struct BakeProgram {
+		String cache_key; // _binary_cache_key().
+		String name;
+		LocalVector<RD::ShaderStage> stages; // In the order the run time compiles them.
+		Vector<String> sources; // Parallel to stages.
+	};
+	// The variants' base programs and hit group 0's opacity micromap bake. p_simple_shadows and p_ser: the project's
+	// rendering/pathtracing/use_simple_shadows and use_shader_execution_reordering.
+	void get_bake_programs(bool p_simple_shadows, bool p_ser, LocalVector<BakeProgram> &r_programs);
+	// p_material's hit group in every such variant, and its displacement and opacity micromap bake programs; nothing for a
+	// material path traced by hit group 0.
+	void get_material_bake_programs(RID p_material, bool p_simple_shadows, bool p_ser, LocalVector<BakeProgram> &r_programs);
+	static String get_binary_cache_file_name(const String &p_key, const String &p_api);
+	static Vector<uint8_t> make_binary_cache_file(const Vector<uint8_t> &p_binary);
+	// Null when the path tracer's shaders were never initialized (no Forward+ renderer).
+	static SceneShaderRaytracing *get_singleton_if_initialized();
+
 	void invalidate_pipeline_bundles();
 
 	ShaderCompiler compiler;

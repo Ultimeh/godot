@@ -71,6 +71,19 @@ protected:
 		LocalVector<WorkerThreadPool::TaskID> variant_tasks;
 	};
 
+	// A program the path tracer builds outside ShaderRD (SceneShaderRaytracing::BakeProgram): one binary per file.
+	struct RaytracingWorkItem {
+		String cache_path; // Relative to the shader cache.
+		String shader_name;
+		Vector<int> stages; // RD::ShaderStage, in the order the run time compiles them.
+		Vector<String> stage_sources;
+	};
+
+	struct RaytracingItem {
+		String cache_path;
+		WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
+	};
+
 	String shader_cache_platform_name;
 	String shader_cache_renderer_name;
 	String shader_cache_export_path;
@@ -78,6 +91,11 @@ protected:
 	HashMap<String, WorkResult> shader_work_results;
 	Mutex shader_work_results_mutex;
 	LocalVector<ShaderGroupItem> shader_group_items;
+	LocalVector<RaytracingItem> raytracing_items;
+	HashMap<String, PackedByteArray> raytracing_work_results;
+	bool raytracing_baked = false; // shader_baker/path_tracing, on a device that can path trace.
+	bool raytracing_simple_shadows = false;
+	bool raytracing_ser = false;
 	RenderingShaderContainerFormat *shader_container_format = nullptr;
 	String shader_container_driver;
 	Vector<Ref<ShaderBakerExportPluginPlatform>> platforms;
@@ -98,9 +116,13 @@ protected:
 	virtual void _end_customize_resources() override;
 	virtual Ref<Resource> _customize_resource(const Ref<Resource> &p_resource, const String &p_path) override;
 	virtual Node *_customize_scene(Node *p_root, const String &p_path) override;
+	virtual void _get_export_options(const Ref<EditorExportPlatform> &p_export_platform, List<EditorExportPlatform::ExportOption> *r_options) const override;
 	virtual uint64_t _get_customization_configuration_hash() const override;
 	virtual void _customize_shader_version(ShaderRD *p_shader, RID p_version);
 	void _process_work_item(WorkItem p_work_item);
+	// The path tracer's programs for p_material (invalid: those of no material, each variant's base).
+	void _customize_raytracing_programs(RID p_material);
+	void _process_raytracing_work_item(RaytracingWorkItem p_work_item);
 
 public:
 	ShaderBakerExportPlugin();

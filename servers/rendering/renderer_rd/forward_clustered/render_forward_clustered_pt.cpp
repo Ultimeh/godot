@@ -657,6 +657,16 @@ bool RenderForwardClusteredPT::_setup_rt() {
 	return raytracing->get_shader()->is_usable();
 }
 
+bool RenderForwardClusteredPT::setup_raytracing_for_shader_baker() {
+	if (!_setup_rt()) {
+		return false;
+	}
+	if (_transparent_pass_traces_shadows()) {
+		scene_shader.enable_rt_shadows_shader_group();
+	}
+	return true;
+}
+
 bool RenderForwardClusteredPT::_rt_precaches_hit_groups() {
 	// GODOT_RT_HG_PRECACHE=0: a hit group is queued when the TLAS first meets its material, as before (comparisons).
 	static const bool off = OS::get_singleton()->get_environment("GODOT_RT_HG_PRECACHE") == "0";
