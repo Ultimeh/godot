@@ -651,6 +651,18 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// =================================================================
 	float specularLum = luminance(specularF0);
 	float diffuseLum = luminance(diffuseReflectance);
+	// The chance of sampling the specular lobe, as picked below.
+	const float specular_probability = diffuseLum < 0.0001 ? 1.0 : (specularLum < 0.0001 ? 0.0 : clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99));
+
+	// =================================================================
+	// NEE of the Environment: one direction from the sky's distribution, combined with the BRDF sampling below by
+	// multiple importance sampling (raytracing_environment_inc.glsl)
+	// =================================================================
+	RTEnvSampling env_sampling = rt_env_sampling_setup(specular_probability, m.roughness, !is_unextended(ps.packed_bounces_flags), dot(N, V));
+	if (env_sampling.diffuse || env_sampling.specular) {
+		vec3 env_light = rt_environment_nee(env_sampling, offset_ray_origin(h.hit_pos, h.geometry_normal), h.geometry_normal, N, V, brdf_mat, m.ao, ps.rng_state);
+		ps.radiance += ps.throughput * env_light;
+	}
 
 	int brdfType;
 	if (diffuseLum < 0.0001) {
@@ -658,7 +670,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	} else if (specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
-		float brdfProbability = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
+		float brdfProbability = specular_probability;
 		if (rand(ps.rng_state) < brdfProbability) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= brdfProbability;
@@ -671,6 +683,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec2 u = rand2(ps.rng_state);
 	vec3 next_dir;
 	vec3 brdf_weight;
+	bool recovered = false;
 	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
@@ -686,6 +699,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			return;
 		}
 		next_dir = recovered_dir;
+		recovered = true;
 	}
 
 	ps.throughput *= brdf_weight;
@@ -701,6 +715,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// If the next ray leaves the scene, it takes the Environment's light by this lobe: as raster's ambient_light for the
 	// diffuse lobe and indirect_specular_light for the specular one (scene_forward_clustered.glsl).
 	ps.packed_bounces_flags = set_specular_lobe(ps.packed_bounces_flags, brdfType == SPECULAR_TYPE);
+	// The share of that light next event estimation of the sky took for this direction, which the miss leaves to it.
+	ps.packed_bounces_flags = set_env_mis_share(ps.packed_bounces_flags, rt_env_bounce_share(env_sampling, brdfType == SPECULAR_TYPE, N, V, next_dir, recovered));
 
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.

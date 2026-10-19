@@ -43,6 +43,7 @@
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_lod_compact.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_output_copy.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_sky_guide.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_sky_sampling.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_tlas_expand.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/raytracing_volumetric_fog.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -613,6 +614,9 @@ struct RTViewportState {
 	uint32_t decal_grid_buffer_capacity = 0;
 	LocalVector<RT_DecalData> uploaded_decals;
 	LocalVector<uint32_t> uploaded_decal_grid;
+	// The sky's sampling distribution for next event estimation of the Environment (raytracing_sky_sampling_inc.glsl),
+	// rebuilt every frame the sky lights the scene (RenderRaytracing::build_sky_sampling()).
+	RID sky_sampling_buffer;
 	RID scene_uniform_set;
 
 	uint32_t frame_counter = 0;
@@ -753,6 +757,31 @@ class RenderRaytracing {
 		RID version_shader;
 		RID pipeline;
 	} sky_guide_shader;
+
+	// The sky's sampling distribution (RTViewportState::sky_sampling_buffer): the luminance of the radiance octmap, either
+	// layout, then its cumulative distributions.
+	struct SkySamplingShader {
+		enum Mode {
+			MODE_LUMINANCE,
+			MODE_LUMINANCE_ARRAY,
+			MODE_CDF,
+			MODE_MAX,
+		};
+		struct PushConstant {
+			float border_size[2];
+			uint32_t pad[2];
+		};
+		RaytracingSkySamplingShaderRD shader;
+		RID version;
+		RID version_shader[MODE_MAX];
+		RID pipeline[MODE_MAX];
+	} sky_sampling_shader;
+	// Must match RT_SKY_SAMPLING_SIZE and RT_SKY_SAMPLING_FLOATS (raytracing_sky_sampling_inc.glsl).
+	static constexpr uint32_t SKY_SAMPLING_SIZE = 128;
+	static constexpr uint32_t SKY_SAMPLING_FLOATS = 2 * SKY_SAMPLING_SIZE * SKY_SAMPLING_SIZE + SKY_SAMPLING_SIZE;
+	// Builds p_state's sky sampling distribution from the radiance octmap; false when next event estimation of the
+	// Environment is off (GODOT_RT_SKY_SAMPLING=0, for comparisons).
+	bool build_sky_sampling(RTViewportState *p_state, RID p_radiance_texture, bool p_octmap_array, float p_border_size);
 
 	// The path traced color into the scene's color buffer, with the raster's background where the camera rays missed.
 	struct OutputCopyShader {

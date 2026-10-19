@@ -22,7 +22,7 @@
 #define RT_PARAM_FRONT_LAYER_COUNT 4 // rt_params[1].x - Transparent surfaces in the TLAS (front layer reflections)
 #define RT_PARAM_DECAL_COUNT 5 // rt_params[1].y - Decals in the decal buffer (raytracing_decals_inc.glsl)
 #define RT_PARAM_PROCEDURAL_MASKS 6 // rt_params[1].z - RT_MASK_PROCEDURAL_* bits held by this frame's TLAS
-// Index 7 reserved for future use
+#define RT_PARAM_ENV_SAMPLING 7 // rt_params[1].w - 1 when the sky sampling distribution was built this frame (raytracing_environment_inc.glsl)
 #define RT_PARAM_BACKGROUND_COLOR 8 // rt_params[2].xyz - Background color seen by camera rays (linear, with its energy)
 #define RT_PARAM_BACKGROUND_COLOR_USED 11 // rt_params[2].w - 1 where the raster clears to the background color (no sky drawn)
 #define RT_PARAM_REFLECTION_BACKGROUND 12 // rt_params[3].x - 1 when reflections show the background color (REFLECTION_SOURCE_BG)
@@ -44,7 +44,7 @@
 
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:8][diffuse:8][total:8]
+	uint packed_bounces_flags; //  4 bytes - [flags:8][environment MIS:16][diffuse:4][total:4]
 	uint rng_state; //  4 bytes - RNG state for PCG
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
@@ -91,22 +91,35 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
 }
 
-// Bounce count helpers (bits 0-7: total, bits 8-15: diffuse)
+// Bounce count helpers (bits 0-3: total, bits 4-7: diffuse). A path ends at RT_MAX_BOUNCES (8) and MAX_DIFFUSE_BOUNCES.
 uint get_total_bounces(uint packed) {
-	return packed & 0xFFu;
+	return packed & 0xFu;
 }
 uint get_diffuse_bounces(uint packed) {
-	return (packed >> 8u) & 0xFFu;
+	return (packed >> 4u) & 0xFu;
 }
 uint pack_bounces(uint total, uint diffuse) {
-	return total | (diffuse << 8u);
+	return total | (diffuse << 4u);
 }
 uint inc_total_bounce(uint packed) {
 	return packed + 1u;
 }
 uint inc_diffuse_bounce(uint packed) {
-	return packed + 0x101u;
+	return packed + 0x11u;
 } // +1 to both total and diffuse
+
+// Bits 8-23: the share of the Environment's light that next event estimation of the sky took for this ray's direction,
+// in 1/65535 (raytracing_environment_inc.glsl). A miss adds the rest, so the two estimators' weights sum to one for every
+// direction (multiple importance sampling). 0, the default of every ray no bounce sampled with it, keeps all of it.
+const uint ENV_MIS_SHIFT = 8u;
+const uint ENV_MIS_MASK = 0xFFFFu << ENV_MIS_SHIFT;
+uint set_env_mis_share(uint packed, uint share) {
+	return (packed & ~ENV_MIS_MASK) | (min(share, 0xFFFFu) << ENV_MIS_SHIFT);
+}
+// The weight of the light a miss takes.
+float get_env_mis_weight(uint packed) {
+	return 1.0 - float((packed & ENV_MIS_MASK) >> ENV_MIS_SHIFT) / 65535.0;
+}
 
 // Sample 0 flag (bit 24) - only write DLSS RR outputs on first sample
 const uint SAMPLE_ZERO_FLAG = (1u << 24);
@@ -143,6 +156,16 @@ uint set_specular_lobe(uint packed, bool specular) {
 }
 bool is_specular_lobe(uint packed) {
 	return (packed & SPECULAR_LOBE_FLAG) != 0u;
+}
+
+// Unextended flag (bit 29): the raygen traces no ray after this one's hit (the front layer's reflection path ends there),
+// so the hit's next event estimation of the sky, which shares the light with the BRDF ray it would trace, is skipped.
+const uint UNEXTENDED_FLAG = (1u << 29);
+uint set_unextended(uint packed) {
+	return packed | UNEXTENDED_FLAG;
+}
+bool is_unextended(uint packed) {
+	return (packed & UNEXTENDED_FLAG) != 0u;
 }
 
 const uint PATH_TERMINATED_FLAG = (1u << 26);

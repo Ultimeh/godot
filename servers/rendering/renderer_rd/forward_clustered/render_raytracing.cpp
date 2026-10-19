@@ -103,6 +103,17 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	sky_guide_shader.version_shader = sky_guide_shader.shader.version_get_shader(sky_guide_shader.version, 0);
 	sky_guide_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_guide_shader.version_shader);
 
+	Vector<String> sky_sampling_modes;
+	sky_sampling_modes.push_back("\n"); // MODE_LUMINANCE
+	sky_sampling_modes.push_back("\n#define USE_RADIANCE_OCTMAP_ARRAY\n"); // MODE_LUMINANCE_ARRAY
+	sky_sampling_modes.push_back("\n#define MODE_CDF\n"); // MODE_CDF
+	sky_sampling_shader.shader.initialize(sky_sampling_modes);
+	sky_sampling_shader.version = sky_sampling_shader.shader.version_create();
+	for (int i = 0; i < SkySamplingShader::MODE_MAX; i++) {
+		sky_sampling_shader.version_shader[i] = sky_sampling_shader.shader.version_get_shader(sky_sampling_shader.version, i);
+		sky_sampling_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(sky_sampling_shader.version_shader[i]);
+	}
+
 	Vector<String> output_copy_modes;
 	output_copy_modes.push_back("\n");
 	output_copy_shader.shader.initialize(output_copy_modes);
@@ -158,6 +169,7 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 	volumetric_fog_shader.shader.version_free(volumetric_fog_shader.version);
 	sky_guide_shader.shader.version_free(sky_guide_shader.version);
+	sky_sampling_shader.shader.version_free(sky_sampling_shader.version);
 	output_copy_shader.shader.version_free(output_copy_shader.version);
 }
 
@@ -212,6 +224,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
+	}
+	if (p_state->sky_sampling_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->sky_sampling_buffer);
 	}
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
@@ -5359,6 +5374,53 @@ uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderD
 }
 
 // ---------------------------------------------------------------------------
+// Sky sampling distribution
+// ---------------------------------------------------------------------------
+
+// The payload counts a path's bounces on 4 bits (get_total_bounces(), raytracing_inc.glsl), next to the sky's MIS share.
+static_assert(SceneShaderRaytracing::RT_MAX_BOUNCES < 16, "The path payload's bounce counters hold 4 bits.");
+
+bool RenderRaytracing::build_sky_sampling(RTViewportState *p_state, RID p_radiance_texture, bool p_octmap_array, float p_border_size) {
+	// GODOT_RT_SKY_SAMPLING=0: the sky is found by BRDF sampling alone, as before (comparisons).
+	static const bool off = OS::get_singleton()->get_environment("GODOT_RT_SKY_SAMPLING") == "0";
+	if (off) {
+		return false;
+	}
+
+	RD *rd = RD::get_singleton();
+	if (!p_state->sky_sampling_buffer.is_valid()) {
+		p_state->sky_sampling_buffer = rd->storage_buffer_create(SKY_SAMPLING_FLOATS * sizeof(float));
+		rd->set_resource_name(p_state->sky_sampling_buffer, "RT Sky Sampling");
+	}
+
+	// Rebuilt every frame: a sky updated in real time or by parts (Sky.process_mode) changes it without telling, and both
+	// passes together cost a few microseconds.
+	SkySamplingShader::PushConstant push_constant = {};
+	push_constant.border_size[0] = p_border_size;
+	push_constant.border_size[1] = 1.0f - p_border_size * 2.0f;
+
+	const SkySamplingShader::Mode luminance_mode = p_octmap_array ? SkySamplingShader::MODE_LUMINANCE_ARRAY : SkySamplingShader::MODE_LUMINANCE;
+	RD::Uniform buffer(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, p_state->sky_sampling_buffer);
+	RD::Uniform radiance(RD::UNIFORM_TYPE_TEXTURE, 1, p_radiance_texture);
+	RD::Uniform sampler(RD::UNIFORM_TYPE_SAMPLER, 2, RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED));
+
+	RENDER_TIMESTAMP("RT Sky Sampling");
+	rd->draw_command_begin_label("RT Sky Sampling");
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, sky_sampling_shader.pipeline[luminance_mode]);
+	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_sampling_shader.version_shader[luminance_mode], 0, buffer, radiance, sampler), 0);
+	rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(SkySamplingShader::PushConstant));
+	rd->compute_list_dispatch_threads(compute_list, SKY_SAMPLING_SIZE, SKY_SAMPLING_SIZE, 1);
+	rd->compute_list_add_barrier(compute_list);
+	rd->compute_list_bind_compute_pipeline(compute_list, sky_sampling_shader.pipeline[SkySamplingShader::MODE_CDF]);
+	rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_sampling_shader.version_shader[SkySamplingShader::MODE_CDF], 0, buffer), 0);
+	rd->compute_list_dispatch(compute_list, 1, 1, 1);
+	rd->compute_list_end();
+	rd->draw_command_end_label();
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Uniform set update
 // ---------------------------------------------------------------------------
 
@@ -5459,6 +5521,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// The sky radiance octahedral map (binding 7), and the sky's sampling distribution made from it (binding 40), whose use
+	// the params tell the shaders (RT_PARAM_ENV_SAMPLING).
+	const bool use_octmap_array = owner->is_using_radiance_octmap_array();
+	RID radiance_texture;
+	bool sky_sampling = false;
+	if (p_render_data && p_render_data->environment.is_valid()) {
+		RID sky_rid = owner->environment_get_sky(p_render_data->environment);
+		if (sky_rid.is_valid()) {
+			radiance_texture = use_octmap_array
+					? owner->sky.sky_get_radiance_texture_rd(sky_rid)
+					: owner->sky.sky_get_radiance_2d_texture_rd(sky_rid);
+			if (radiance_texture.is_valid()) {
+				sky_sampling = build_sky_sampling(p_state, radiance_texture, use_octmap_array, owner->sky.sky_get_uv_border_size(sky_rid));
+			}
+		}
+	}
+
 	// Binding 6: Raytracing params + unjittered VP matrices.
 	{
 		struct {
@@ -5485,6 +5564,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRONT_LAYER_COUNT] = float(front_layer_instance_count);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PROCEDURAL_MASKS] = float(procedural_instance_masks);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ENV_SAMPLING] = sky_sampling ? 1.0 : 0.0;
 		if (p_background_is_color) {
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 0] = p_background_color.r;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 1] = p_background_color.g;
@@ -5540,17 +5620,6 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	// Binding 7: Sky radiance octahedral map (for pathtracing sky sampling).
 	{
 		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
-		const bool use_octmap_array = owner->is_using_radiance_octmap_array();
-		RID radiance_texture;
-
-		if (p_render_data && p_render_data->environment.is_valid()) {
-			RID sky_rid = owner->environment_get_sky(p_render_data->environment);
-			if (sky_rid.is_valid()) {
-				radiance_texture = use_octmap_array
-						? owner->sky.sky_get_radiance_texture_rd(sky_rid)
-						: owner->sky.sky_get_radiance_2d_texture_rd(sky_rid);
-			}
-		}
 
 		// Fall back to a default whose type matches the shader's declared binding.
 		if (!radiance_texture.is_valid()) {
@@ -5717,6 +5786,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 		// Binding 38: the directional light projector (gather_lights()), white when none.
 		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 38, rt_directional_projector.is_valid() ? rt_directional_projector : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE)));
+
+		// Binding 40: the sky's sampling distribution, read only where RT_PARAM_ENV_SAMPLING says it was built.
+		uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 40, p_state->sky_sampling_buffer.is_valid() ? p_state->sky_sampling_buffer : default_buffer));
 	}
 
 	RID shader_rd = shader ? shader->get_pipeline_shader_rd(p_rt_flags) : RID();
