@@ -317,8 +317,9 @@ void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buf
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	// Specular Albedo: RGB specular reflection color (RGBA16F; needs the accuracy, fixes banding artifacts).
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_ALBEDO, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
-	// Normal + Roughness: World space normals (RGB) + roughness (A).
-	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, RD::DATA_FORMAT_R8G8B8A8_SNORM, usage_bits, RD::TEXTURE_SAMPLES_1);
+	// Normal + Roughness: World space normals (RGB) + roughness (A). RGBA16F: the DLSS-RR programming guide asks for
+	// RGB_F16 or RGB_F32 normals (4.1.3), and the shaders declare the image rgba16f, a format the view must match.
+	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	// Specular Hit Distance: Single channel distance (R16F is sufficient).
 	p_render_buffers->create_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_SPECULAR_HIT_DIST, RD::DATA_FORMAT_R16_SFLOAT, usage_bits, RD::TEXTURE_SAMPLES_1);
 	// The noisy color before the transparent pass draws on it: RR tells the transparents apart and keeps them
