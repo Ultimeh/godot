@@ -73,12 +73,12 @@ public:
 
 	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines): each combination is a pipeline of its
 	// own, its hit groups compiled again. Only what changes the code goes here; the sample count and the bounces are read
-	// from the parameters buffer (RT_PARAM_*), so changing them keeps the pipeline.
+	// from the parameters buffer (RT_PARAM_*) and the fog from the scene data, so changing them keeps the pipeline.
 	enum RaytracingFlags {
 		RT_FLAG_NONE = 0,
 		RT_FLAG_DEBUG_VIS_ENABLED = (1 << 0),
 		RT_FLAG_DLSS_RR_ENABLED = (1 << 1),
-		RT_FLAG_FOG_ENABLED = (1 << 2),
+		// (1 << 2) was the fog: a variant of its own until it was read from the scene data (SCENE_DATA_FLAGS_USE_FOG).
 		RT_FLAG_SER_ENABLED = (1 << 3),
 		RT_FLAG_RAY_QUERY_SHADOWS_ENABLED = (1 << 4),
 	};
@@ -109,7 +109,7 @@ public:
 
 	// The rt_flags from pathtracing environment settings.
 	// `p_environment` may be invalid (RT active with no pathtracing environment).
-	static uint32_t compute_rt_flags(RID p_environment, bool p_fog_enabled);
+	static uint32_t compute_rt_flags(RID p_environment);
 
 	struct ShaderSpecialization {
 		union {

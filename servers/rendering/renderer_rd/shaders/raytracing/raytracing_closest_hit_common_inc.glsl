@@ -286,7 +286,7 @@ vec3 fog_sample_radiance(vec3 vertex, float mip_level) {
 /// Apply environment fog for the ray segment that was just traversed.
 /// Attenuates throughput and adds in-scattered fog color.
 void apply_segment_fog(float segment_dist, inout vec3 radiance, inout vec3 throughput) {
-	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) == 0u) {
+	if (!RT_FOG_ENABLED()) {
 		return;
 	}
 

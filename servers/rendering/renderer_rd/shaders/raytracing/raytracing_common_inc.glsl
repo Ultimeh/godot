@@ -6,7 +6,10 @@
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
-#define RT_FLAG_FOG_ENABLED (1u << 2)
+
+// The Environment's fog, from the scene data as raster reads it: uniform across the dispatch, so switching it keeps the
+// pipeline and its hit groups.
+#define RT_FOG_ENABLED() bool(scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_FOG)
 
 // From the parameters buffer (not in the any-hit stage): changing them does not build another pipeline.
 #define RT_GET_SAMPLE_COUNT() max(1u, uint(get_rt_param(RT_PARAM_SAMPLE_COUNT)))

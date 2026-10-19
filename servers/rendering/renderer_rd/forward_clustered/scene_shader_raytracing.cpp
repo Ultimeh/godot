@@ -1168,7 +1168,7 @@ void SceneShaderRaytracing::request_hit_group(uint32_t p_slot_index, float p_dis
 	slot.requested_frame = frame;
 }
 
-uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_enabled) {
+uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment) {
 	uint32_t flags = RT_FLAG_NONE;
 
 	if (p_environment.is_valid()) {
@@ -1185,10 +1185,6 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		if (env_storage->environment_get_pathtracing_denoiser(p_environment) == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION) {
 			flags |= RT_FLAG_DLSS_RR_ENABLED;
 		}
-	}
-
-	if (p_fog_enabled) {
-		flags |= RT_FLAG_FOG_ENABLED;
 	}
 
 	// Only where the shaders can be translated with it: a driver without it (D3D12 for now) fails the whole pipeline.
@@ -1430,8 +1426,7 @@ SceneShaderRaytracing *SceneShaderRaytracing::get_singleton_if_initialized() {
 	return singleton && singleton->raygen_shader_version.is_valid() ? singleton : nullptr;
 }
 
-// The flags that change a variant's sources (RAYGEN_SHADER_OPTIONS; the fog is a specialization constant only, and the
-// debug draw is left out): every combination a run of the project can trace with.
+// The flags that change a variant's sources (RAYGEN_SHADER_OPTIONS; the debug draw is left out): every combination a run of the project can trace with.
 static LocalVector<uint32_t> _bake_rt_flags(bool p_simple_shadows, bool p_ser) {
 	LocalVector<uint32_t> flags;
 	const uint32_t shadows = p_simple_shadows ? SceneShaderRaytracing::RT_FLAG_RAY_QUERY_SHADOWS_ENABLED : 0;

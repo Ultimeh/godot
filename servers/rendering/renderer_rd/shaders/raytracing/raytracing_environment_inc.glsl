@@ -16,7 +16,7 @@ vec2 rt_sky_uv(vec3 p_sky_dir) {
 
 // The fog over what a ray that leaves the scene sees (fog_sky_affect), as raster's over its sky.
 vec3 rt_environment_fog(vec3 p_color, vec2 p_sky_uv) {
-	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) == 0u) {
+	if (!RT_FOG_ENABLED()) {
 		return p_color;
 	}
 	vec3 fog_color = scene_data_block.data.fog_light_color;
