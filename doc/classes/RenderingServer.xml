@@ -1420,6 +1420,14 @@
 				Sets which objects out of view the path tracer leaves out of the scene it traces. See [member Environment.pathtracing_culling_enabled], [member Environment.pathtracing_culling_radius] and [member Environment.pathtracing_culling_angle] for more details.
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_sky_sampling">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<description>
+				If [param enable] is [code]true[/code], the path tracer samples the sky directly at every surface it shades. See [member Environment.pathtracing_sky_sampling] for more details.
+			</description>
+		</method>
 		<method name="environment_set_sdfgi">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

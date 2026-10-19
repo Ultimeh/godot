@@ -615,7 +615,7 @@ struct RTViewportState {
 	LocalVector<RT_DecalData> uploaded_decals;
 	LocalVector<uint32_t> uploaded_decal_grid;
 	// The sky's sampling distribution for next event estimation of the Environment (raytracing_sky_sampling_inc.glsl),
-	// rebuilt every frame the sky lights the scene (RenderRaytracing::build_sky_sampling()).
+	// rebuilt every frame with Environment.pathtracing_sky_sampling (RenderRaytracing::build_sky_sampling()).
 	RID sky_sampling_buffer;
 	RID scene_uniform_set;
 
@@ -779,9 +779,8 @@ class RenderRaytracing {
 	// Must match RT_SKY_SAMPLING_SIZE and RT_SKY_SAMPLING_FLOATS (raytracing_sky_sampling_inc.glsl).
 	static constexpr uint32_t SKY_SAMPLING_SIZE = 128;
 	static constexpr uint32_t SKY_SAMPLING_FLOATS = 2 * SKY_SAMPLING_SIZE * SKY_SAMPLING_SIZE + SKY_SAMPLING_SIZE;
-	// Builds p_state's sky sampling distribution from the radiance octmap; false when next event estimation of the
-	// Environment is off (GODOT_RT_SKY_SAMPLING=0, for comparisons).
-	bool build_sky_sampling(RTViewportState *p_state, RID p_radiance_texture, bool p_octmap_array, float p_border_size);
+	// Builds p_state's sky sampling distribution from the radiance octmap (Environment.pathtracing_sky_sampling).
+	void build_sky_sampling(RTViewportState *p_state, RID p_radiance_texture, bool p_octmap_array, float p_border_size);
 
 	// The path traced color into the scene's color buffer, with the raster's background where the camera rays missed.
 	struct OutputCopyShader {

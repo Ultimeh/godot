@@ -5380,13 +5380,7 @@ uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderD
 // The payload counts a path's bounces on 4 bits (get_total_bounces(), raytracing_inc.glsl), next to the sky's MIS share.
 static_assert(SceneShaderRaytracing::RT_MAX_BOUNCES < 16, "The path payload's bounce counters hold 4 bits.");
 
-bool RenderRaytracing::build_sky_sampling(RTViewportState *p_state, RID p_radiance_texture, bool p_octmap_array, float p_border_size) {
-	// GODOT_RT_SKY_SAMPLING=0: the sky is found by BRDF sampling alone, as before (comparisons).
-	static const bool off = OS::get_singleton()->get_environment("GODOT_RT_SKY_SAMPLING") == "0";
-	if (off) {
-		return false;
-	}
-
+void RenderRaytracing::build_sky_sampling(RTViewportState *p_state, RID p_radiance_texture, bool p_octmap_array, float p_border_size) {
 	RD *rd = RD::get_singleton();
 	if (!p_state->sky_sampling_buffer.is_valid()) {
 		p_state->sky_sampling_buffer = rd->storage_buffer_create(SKY_SAMPLING_FLOATS * sizeof(float));
@@ -5417,7 +5411,6 @@ bool RenderRaytracing::build_sky_sampling(RTViewportState *p_state, RID p_radian
 	rd->compute_list_dispatch(compute_list, 1, 1, 1);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
-	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -5532,8 +5525,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			radiance_texture = use_octmap_array
 					? owner->sky.sky_get_radiance_texture_rd(sky_rid)
 					: owner->sky.sky_get_radiance_2d_texture_rd(sky_rid);
-			if (radiance_texture.is_valid()) {
-				sky_sampling = build_sky_sampling(p_state, radiance_texture, use_octmap_array, owner->sky.sky_get_uv_border_size(sky_rid));
+			// Environment.pathtracing_sky_sampling: off, nothing is built and the sky is found by BRDF sampling alone.
+			if (radiance_texture.is_valid() && RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_sky_sampling(p_render_data->environment)) {
+				build_sky_sampling(p_state, radiance_texture, use_octmap_array, owner->sky.sky_get_uv_border_size(sky_rid));
+				sky_sampling = true;
 			}
 		}
 	}

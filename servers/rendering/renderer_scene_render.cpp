@@ -749,6 +749,10 @@ float RendererSceneRender::environment_get_pathtracing_culling_angle(RID p_env) 
 	return environment_storage.environment_get_pathtracing_culling_angle(p_env);
 }
 
+void RendererSceneRender::environment_set_pathtracing_sky_sampling(RID p_env, bool p_enable) {
+	environment_storage.environment_set_pathtracing_sky_sampling(p_env, p_enable);
+}
+
 void RendererSceneRender::environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) {
 	environment_storage.environment_set_adjustment(p_env, p_enable, p_brightness, p_contrast, p_saturation, p_use_1d_color_correction, p_color_correction);
 }

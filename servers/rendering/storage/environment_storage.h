@@ -181,6 +181,7 @@ private:
 		bool pathtracing_culling_enabled = true;
 		float pathtracing_culling_radius = 200.0;
 		float pathtracing_culling_angle = 1.0; // Degrees.
+		bool pathtracing_sky_sampling = false;
 
 		// Adjustments
 		bool adjustments_enabled = false;
@@ -345,6 +346,8 @@ public:
 	bool environment_get_pathtracing_culling_enabled(RID p_env) const;
 	float environment_get_pathtracing_culling_radius(RID p_env) const;
 	float environment_get_pathtracing_culling_angle(RID p_env) const;
+	void environment_set_pathtracing_sky_sampling(RID p_env, bool p_enable);
+	bool environment_get_pathtracing_sky_sampling(RID p_env) const;
 
 	// Adjustment
 	void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction);

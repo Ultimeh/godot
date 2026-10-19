@@ -267,6 +267,7 @@ public:
 	bool environment_get_pathtracing_culling_enabled(RID p_env) const;
 	float environment_get_pathtracing_culling_radius(RID p_env) const;
 	float environment_get_pathtracing_culling_angle(RID p_env) const;
+	void environment_set_pathtracing_sky_sampling(RID p_env, bool p_enable);
 	// A view path traced with p_env shadows its raster transparent pass with rays: of the shadow maps, only the
 	// volumetric fog's are read then.
 	virtual bool environment_pathtracing_replaces_shadow_maps(RID p_env) const { return false; }

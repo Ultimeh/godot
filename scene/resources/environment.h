@@ -201,6 +201,7 @@ private:
 	float pathtracing_culling_radius = 200.0;
 	float pathtracing_culling_angle = 1.0;
 	void _update_pathtracing_culling();
+	bool pathtracing_sky_sampling = false;
 
 	// Glow
 	bool glow_enabled = false;
@@ -406,6 +407,8 @@ public:
 	float get_pathtracing_culling_radius() const;
 	void set_pathtracing_culling_angle(float p_angle);
 	float get_pathtracing_culling_angle() const;
+	void set_pathtracing_sky_sampling(bool p_enabled);
+	bool is_pathtracing_sky_sampling() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

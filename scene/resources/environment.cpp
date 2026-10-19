@@ -691,6 +691,15 @@ void Environment::_update_pathtracing_culling() {
 	RS::get_singleton()->environment_set_pathtracing_culling(environment, pathtracing_culling_enabled, pathtracing_culling_radius, pathtracing_culling_angle);
 }
 
+void Environment::set_pathtracing_sky_sampling(bool p_enabled) {
+	pathtracing_sky_sampling = p_enabled;
+	RS::get_singleton()->environment_set_pathtracing_sky_sampling(environment, pathtracing_sky_sampling);
+}
+
+bool Environment::is_pathtracing_sky_sampling() const {
+	return pathtracing_sky_sampling;
+}
+
 // Glow
 
 void Environment::set_glow_enabled(bool p_enabled) {
@@ -1536,6 +1545,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_culling_radius"), &Environment::get_pathtracing_culling_radius);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_culling_angle", "angle"), &Environment::set_pathtracing_culling_angle);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_culling_angle"), &Environment::get_pathtracing_culling_angle);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_sky_sampling", "enabled"), &Environment::set_pathtracing_sky_sampling);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_sky_sampling"), &Environment::is_pathtracing_sky_sampling);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1544,6 +1555,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_sky_sampling"), "set_pathtracing_sky_sampling", "is_pathtracing_sky_sampling");
 	ADD_SUBGROUP("Culling", "pathtracing_culling_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_culling_enabled"), "set_pathtracing_culling_enabled", "is_pathtracing_culling_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_culling_radius", PROPERTY_HINT_RANGE, "0,4000,1,or_greater,suffix:m"), "set_pathtracing_culling_radius", "get_pathtracing_culling_radius");

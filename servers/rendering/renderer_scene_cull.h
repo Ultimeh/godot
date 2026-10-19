@@ -1430,6 +1430,7 @@ public:
 	PASS1RC(int, environment_get_pathtracing_max_bounces, RID)
 	PASS1RC(RSE::PathtracingDenoiser, environment_get_pathtracing_denoiser, RID)
 	PASS4(environment_set_pathtracing_culling, RID, bool, float, float)
+	PASS2(environment_set_pathtracing_sky_sampling, RID, bool)
 
 	// Adjustment
 	PASS7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)
