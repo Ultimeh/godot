@@ -1050,10 +1050,19 @@ void SceneShaderRaytracing::precompile_slot_programs(uint32_t p_slot_index, bool
 	if (p_slot_index != 0 && !entry) {
 		return;
 	}
-	if (entry && entry->writes_vertex && !displace_template.is_empty()) {
+	// Called again for every surface cache built (some instances rebuild theirs every frame): test the program's state
+	// before assembling its source, a dozen String::replace() over the whole template.
+	auto started = [p_slot_index](const LocalVector<DisplaceProgram> &p_programs) {
+		if (p_slot_index >= p_programs.size()) {
+			return false;
+		}
+		const DisplaceProgram &program = p_programs[p_slot_index];
+		return program.pipeline.is_valid() || program.failed || program.build != nullptr;
+	};
+	if (entry && entry->writes_vertex && !displace_template.is_empty() && !started(displace_programs)) {
 		_start_program_build(displace_programs, false, p_slot_index, _displace_source(*entry), "RT displace");
 	}
-	if (p_omm_bake && (!entry || entry->alpha_bakeable) && !omm_bake_template.is_empty()) {
+	if (p_omm_bake && (!entry || entry->alpha_bakeable) && !omm_bake_template.is_empty() && !started(omm_bake_programs)) {
 		_start_program_build(omm_bake_programs, true, p_slot_index, _omm_bake_source(entry), "RT OMM bake");
 	}
 }
