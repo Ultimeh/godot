@@ -370,6 +370,9 @@ SceneShaderRaytracing::SceneShaderRaytracing() {
 
 SceneShaderRaytracing::~SceneShaderRaytracing() {
 	_join_lane_for_shutdown();
+	while (!program_builds.is_empty()) {
+		_finish_program_build(program_builds[0]); // Into the programs freed below.
+	}
 	invalidate_pipeline_bundles();
 
 	if (raygen_shader_version.is_valid()) {
@@ -933,6 +936,124 @@ const SceneShaderRaytracing::CustomShaderEntry *SceneShaderRaytracing::get_custo
 	return &slot.entry;
 }
 
+static String _program_texture_defines(const Vector<SceneShaderRaytracing::TextureUniformInfo> &p_texture_uniforms) {
+	String tex_defines;
+	for (const SceneShaderRaytracing::TextureUniformInfo &tui : p_texture_uniforms) {
+		const String id = _uniform_identifier(tui.name);
+		tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
+	}
+	return tex_defines;
+}
+
+String SceneShaderRaytracing::_displace_source(const CustomShaderEntry &p_entry) const {
+	String source = displace_template;
+	source = source.replace("/* RT_CUSTOM_DEFINES */", p_entry.defines + (p_entry.writes_modelview ? "\n#define RT_MODELVIEW_WRITTEN\n" : ""));
+	source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", p_entry.fragment_globals);
+	source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", p_entry.uniform_members.is_empty() ? String("float _rt_pad;") : p_entry.uniform_members);
+	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", _program_texture_defines(p_entry.texture_uniforms));
+	source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + p_entry.vertex_code + "\n}\n");
+	source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
+	return _apply_varying_code(source, p_entry.varyings);
+}
+
+String SceneShaderRaytracing::_omm_bake_source(const CustomShaderEntry *p_entry) const {
+	String source = omm_bake_template;
+	if (p_entry) {
+		source = source.replace("/* RT_CUSTOM_DEFINES */", p_entry->defines);
+		source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", p_entry->fragment_globals);
+		source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", p_entry->uniform_members.is_empty() ? String("float _rt_pad;") : p_entry->uniform_members);
+		source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", _program_texture_defines(p_entry->texture_uniforms));
+		source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + p_entry->vertex_code + "\n}\n");
+		source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
+		source = source.replace("/* RT_CUSTOM_FRAGMENT_CODE */", p_entry->fragment_code);
+		source = _apply_varying_code(source, p_entry->varyings);
+	} else {
+		// Hit group 0's alpha. The template's defines are expanded already: the define goes after #version.
+		const int version_end = source.find("\n", source.find("#version"));
+		source = source.insert(version_end + 1, "#define RT_OMM_BAKE_STANDARD\n");
+	}
+	return source;
+}
+
+bool SceneShaderRaytracing::_create_compute_program(const String &p_source, const String &p_name, RID &r_shader, RID &r_pipeline) const {
+	const Vector<uint8_t> binary = _compile_compute_binary(p_source, p_name);
+	if (binary.is_empty()) {
+		return false;
+	}
+	r_shader = RD::get_singleton()->shader_create_from_bytecode(binary);
+	ERR_FAIL_COND_V(!r_shader.is_valid(), false);
+	r_pipeline = RD::get_singleton()->compute_pipeline_create(r_shader);
+	ERR_FAIL_COND_V(!r_pipeline.is_valid(), false);
+	return true;
+}
+
+static void _warn_program_failed(bool p_omm_bake, uint32_t p_slot_index) {
+	if (p_omm_bake) {
+		WARN_PRINT(vformat("RT: the opacity micromap bake of hit group %d failed to compile; its surfaces keep their any-hit tests.", p_slot_index));
+	} else {
+		WARN_PRINT(vformat("RT: the vertex() of hit group %d failed to compile for displacement; its surfaces are traced undisplaced.", p_slot_index));
+	}
+}
+
+void SceneShaderRaytracing::_program_build_worker(void *p_userdata) {
+	ProgramBuild *build = static_cast<ProgramBuild *>(p_userdata);
+	if (singleton) {
+		build->succeeded = singleton->_create_compute_program(build->source, build->name, build->shader, build->pipeline);
+	}
+}
+
+void SceneShaderRaytracing::_start_program_build(LocalVector<DisplaceProgram> &r_programs, bool p_omm_bake, uint32_t p_slot_index, const String &p_source, const String &p_name) {
+	if (r_programs.size() < hit_group_slots.size()) {
+		r_programs.resize(hit_group_slots.size());
+	}
+	DisplaceProgram &program = r_programs[p_slot_index];
+	if (program.pipeline.is_valid() || program.failed || program.build) {
+		return;
+	}
+	ProgramBuild *build = memnew(ProgramBuild);
+	build->source = p_source;
+	build->name = p_name;
+	build->omm_bake = p_omm_bake;
+	build->slot = p_slot_index;
+	build->task = WorkerThreadPool::get_singleton()->add_native_task(&SceneShaderRaytracing::_program_build_worker, build, false, "RT program precompile");
+	program.build = build;
+	program_builds.push_back(build);
+}
+
+void SceneShaderRaytracing::_finish_program_build(ProgramBuild *p_build) {
+	if (WorkerThreadPool::get_singleton()) {
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(p_build->task);
+	}
+	DisplaceProgram &program = (p_build->omm_bake ? omm_bake_programs : displace_programs)[p_build->slot];
+	program.build = nullptr;
+	if (p_build->succeeded) {
+		program.shader = p_build->shader;
+		program.pipeline = p_build->pipeline;
+	} else {
+		program.failed = true;
+		if (p_build->shader.is_valid()) {
+			RD::get_singleton()->free_rid(p_build->shader);
+		}
+		_warn_program_failed(p_build->omm_bake, p_build->slot);
+	}
+	program_builds.erase(p_build);
+	memdelete(p_build);
+}
+
+void SceneShaderRaytracing::precompile_slot_programs(uint32_t p_slot_index, bool p_omm_bake) {
+	// Slot 0: BaseMaterial3D's, which only has a bake program.
+	const CustomShaderEntry *entry = p_slot_index != 0 ? get_custom_shader_entry(p_slot_index) : nullptr;
+	if (p_slot_index != 0 && !entry) {
+		return;
+	}
+	if (entry && entry->writes_vertex && !displace_template.is_empty()) {
+		_start_program_build(displace_programs, false, p_slot_index, _displace_source(*entry), "RT displace");
+	}
+	if (p_omm_bake && (!entry || entry->alpha_bakeable) && !omm_bake_template.is_empty()) {
+		_start_program_build(omm_bake_programs, true, p_slot_index, _omm_bake_source(entry), "RT OMM bake");
+	}
+}
+
 RID SceneShaderRaytracing::get_displace_pipeline(uint32_t p_slot_index, RID &r_shader) {
 	const CustomShaderEntry *entry = get_custom_shader_entry(p_slot_index);
 	if (!entry || !entry->writes_vertex || displace_template.is_empty()) {
@@ -941,37 +1062,23 @@ RID SceneShaderRaytracing::get_displace_pipeline(uint32_t p_slot_index, RID &r_s
 	if (displace_programs.size() < hit_group_slots.size()) {
 		displace_programs.resize(hit_group_slots.size());
 	}
+	if (displace_programs[p_slot_index].build) {
+		_finish_program_build(displace_programs[p_slot_index].build);
+	}
 	DisplaceProgram &program = displace_programs[p_slot_index];
 	if (program.pipeline.is_valid() || program.failed) {
 		r_shader = program.shader;
 		return program.pipeline;
 	}
 	program.failed = true;
-
-	String tex_defines;
-	for (const TextureUniformInfo &tui : entry->texture_uniforms) {
-		const String id = _uniform_identifier(tui.name);
-		tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
-	}
-
-	String source = displace_template;
-	source = source.replace("/* RT_CUSTOM_DEFINES */", entry->defines + (entry->writes_modelview ? "\n#define RT_MODELVIEW_WRITTEN\n" : ""));
-	source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry->fragment_globals);
-	source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", entry->uniform_members.is_empty() ? String("float _rt_pad;") : entry->uniform_members);
-	source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
-	source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + entry->vertex_code + "\n}\n");
-	source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
-	source = _apply_varying_code(source, entry->varyings);
-
-	const Vector<uint8_t> binary = _compile_compute_binary(source, "RT displace");
-	if (binary.is_empty()) {
-		WARN_PRINT(vformat("RT: the vertex() of hit group %d failed to compile for displacement; its surfaces are traced undisplaced.", p_slot_index));
+	if (!_create_compute_program(_displace_source(*entry), "RT displace", program.shader, program.pipeline)) {
+		if (program.shader.is_valid()) {
+			RD::get_singleton()->free_rid(program.shader);
+			program.shader = RID();
+		}
+		_warn_program_failed(false, p_slot_index);
 		return RID();
 	}
-	program.shader = RD::get_singleton()->shader_create_from_bytecode(binary);
-	ERR_FAIL_COND_V(!program.shader.is_valid(), RID());
-	program.pipeline = RD::get_singleton()->compute_pipeline_create(program.shader);
-	ERR_FAIL_COND_V(!program.pipeline.is_valid(), RID());
 	program.failed = false;
 	r_shader = program.shader;
 	return program.pipeline;
@@ -991,43 +1098,23 @@ RID SceneShaderRaytracing::get_omm_bake_pipeline(uint32_t p_slot_index, RID &r_s
 	if (omm_bake_programs.size() < hit_group_slots.size()) {
 		omm_bake_programs.resize(hit_group_slots.size());
 	}
+	if (omm_bake_programs[p_slot_index].build) {
+		_finish_program_build(omm_bake_programs[p_slot_index].build);
+	}
 	DisplaceProgram &program = omm_bake_programs[p_slot_index];
 	if (program.pipeline.is_valid() || program.failed) {
 		r_shader = program.shader;
 		return program.pipeline;
 	}
 	program.failed = true;
-
-	String source = omm_bake_template;
-	if (entry) {
-		String tex_defines;
-		for (const TextureUniformInfo &tui : entry->texture_uniforms) {
-			const String id = _uniform_identifier(tui.name);
-			tex_defines += "#define " + id + (tui.is_array ? " bindless_texture_arrays" : " bindless_textures") + "[nonuniformEXT(material." + id + ")]\n";
+	if (!_create_compute_program(_omm_bake_source(entry), "RT OMM bake", program.shader, program.pipeline)) {
+		if (program.shader.is_valid()) {
+			RD::get_singleton()->free_rid(program.shader);
+			program.shader = RID();
 		}
-		source = source.replace("/* RT_CUSTOM_DEFINES */", entry->defines);
-		source = source.replace("/* RT_CUSTOM_FRAGMENT_GLOBALS */", entry->fragment_globals);
-		source = source.replace("/* RT_CUSTOM_UNIFORM_MEMBERS */", entry->uniform_members.is_empty() ? String("float _rt_pad;") : entry->uniform_members);
-		source = source.replace("/* RT_CUSTOM_TEXTURE_DEFINES */", tex_defines);
-		source = source.replace("/* RT_CUSTOM_VERTEX_FUNCTION */", "void rt_run_vertex_shader() {\n" + entry->vertex_code + "\n}\n");
-		source = source.replace("/* RT_CUSTOM_VERTEX_CALL */", "rt_run_vertex_shader();");
-		source = source.replace("/* RT_CUSTOM_FRAGMENT_CODE */", entry->fragment_code);
-		source = _apply_varying_code(source, entry->varyings);
-	} else {
-		// Hit group 0's alpha. The template's defines are expanded already: the define goes after #version.
-		const int version_end = source.find("\n", source.find("#version"));
-		source = source.insert(version_end + 1, "#define RT_OMM_BAKE_STANDARD\n");
-	}
-
-	const Vector<uint8_t> binary = _compile_compute_binary(source, "RT OMM bake");
-	if (binary.is_empty()) {
-		WARN_PRINT(vformat("RT: the opacity micromap bake of hit group %d failed to compile; its surfaces keep their any-hit tests.", p_slot_index));
+		_warn_program_failed(true, p_slot_index);
 		return RID();
 	}
-	program.shader = RD::get_singleton()->shader_create_from_bytecode(binary);
-	ERR_FAIL_COND_V(!program.shader.is_valid(), RID());
-	program.pipeline = RD::get_singleton()->compute_pipeline_create(program.shader);
-	ERR_FAIL_COND_V(!program.pipeline.is_valid(), RID());
 	program.failed = false;
 	r_shader = program.shader;
 	return program.pipeline;
@@ -2054,7 +2141,8 @@ uint32_t SceneShaderRaytracing::get_pending_hit_group_count() const {
 	if (!bundle) {
 		return 0;
 	}
-	uint32_t pending = 0;
+	// Displacement and opacity micromap bake programs too: built at first use, they stall that frame.
+	uint32_t pending = program_builds.size();
 	for (uint32_t i = 1; i < hit_group_slots.size(); i++) {
 		if (hit_group_slots[i].state != HGState::Ready) {
 			continue;
@@ -2071,6 +2159,14 @@ uint32_t SceneShaderRaytracing::get_pending_hit_group_count() const {
 }
 
 void SceneShaderRaytracing::drain_completed_compiles() {
+	for (uint32_t i = 0; i < program_builds.size();) {
+		if (WorkerThreadPool::get_singleton()->is_task_completed(program_builds[i]->task)) {
+			_finish_program_build(program_builds[i]); // Removes it.
+		} else {
+			i++;
+		}
+	}
+
 	while (true) {
 		PipelineBuildTask *finished = nullptr;
 		{

@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/object/worker_thread_pool.h"
 #include "core/templates/local_vector.h"
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h" // IWYU pragma: keep
@@ -460,11 +461,14 @@ public:
 	uint32_t get_pending_hit_group_count() const;
 
 	// Compute pipeline running the slot's vertex() on every vertex (raytracing_displace.glsl); invalid if the slot
-	// does not displace or failed to compile. Compiled on first use.
+	// does not displace or failed to compile. Compiled on first use, unless precompiled.
 	RID get_displace_pipeline(uint32_t p_slot_index, RID &r_shader);
 	// The program baking a slot's cut-out into opacity micromaps (raytracing_omm_bake.glsl); invalid when the slot's
 	// cut-out cannot be baked (CustomShaderEntry::alpha_bakeable) or failed to compile.
 	RID get_omm_bake_pipeline(uint32_t p_slot_index, RID &r_shader);
+	// Starts compiling, on a worker, the slot's displacement program and (p_omm_bake) its opacity micromap bake program,
+	// those it needs: compiled on the render thread at first use, they stalled the frame its surfaces first appeared in.
+	void precompile_slot_programs(uint32_t p_slot_index, bool p_omm_bake);
 	void drain_completed_compiles();
 	void finalize_custom_shaders();
 
@@ -524,18 +528,40 @@ private:
 	RaytracingDisplaceShaderRD displace_shader;
 	RID displace_shader_version;
 	String displace_template;
+	// A compute program compiled and created by a worker (precompile_slot_programs()), adopted by the render thread.
+	struct ProgramBuild {
+		String source;
+		String name;
+		RID shader;
+		RID pipeline;
+		bool succeeded = false;
+		bool omm_bake = false; // Its list: omm_bake_programs, else displace_programs.
+		uint32_t slot = 0;
+		WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
+	};
 	struct DisplaceProgram {
 		RID shader;
 		RID pipeline;
 		bool failed = false;
+		ProgramBuild *build = nullptr; // In flight.
 	};
 	LocalVector<DisplaceProgram> displace_programs; // Parallel to hit_group_slots.
+	String _displace_source(const CustomShaderEntry &p_entry) const;
 
 	// Opacity micromap bakes: the template, and its program per hit group slot (slot 0: BaseMaterial3D's alpha).
 	RaytracingOmmBakeShaderRD omm_bake_shader;
 	RID omm_bake_shader_version;
 	String omm_bake_template;
 	LocalVector<DisplaceProgram> omm_bake_programs; // Parallel to hit_group_slots.
+	String _omm_bake_source(const CustomShaderEntry *p_entry) const;
+
+	LocalVector<ProgramBuild *> program_builds; // In flight.
+	// The binary (through the disk cache), its shader and pipeline: false if any fails.
+	bool _create_compute_program(const String &p_source, const String &p_name, RID &r_shader, RID &r_pipeline) const;
+	static void _program_build_worker(void *p_userdata);
+	void _start_program_build(LocalVector<DisplaceProgram> &r_programs, bool p_omm_bake, uint32_t p_slot_index, const String &p_source, const String &p_name);
+	// Waits for its worker if needed, then installs its result into its program.
+	void _finish_program_build(ProgramBuild *p_build);
 
 	bool async_compilation_enabled = true;
 	CompileLane compile_lane;

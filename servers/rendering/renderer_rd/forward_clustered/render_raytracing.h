@@ -917,6 +917,8 @@ class RenderRaytracing {
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
 	// A BaseMaterial3D's generated shader, traced by hit group 0 from its parameters (p_albedo: its "albedo").
 	static bool _is_base_material(RID p_material, const Variant &p_albedo);
+	// rendering/pathtracing/opacity_micromaps, on a device that has them.
+	static bool _omm_enabled();
 	// The material a surface is traced with while its custom shader's hit group compiles, or null to leave it out.
 	RTMaterialData *_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out);
 	// Whether a MultiMesh surface goes into a merged BLAS (_build_merged_mm_blas()), or one TLAS instance per instance.

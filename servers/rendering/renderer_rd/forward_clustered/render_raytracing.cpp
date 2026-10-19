@@ -1635,12 +1635,16 @@ LocalVector<RD::Uniform> RenderRaytracing::_displace_frame_uniforms(RID p_job_bu
 // Opacity micromaps
 // ---------------------------------------------------------------------------
 
+bool RenderRaytracing::_omm_enabled() {
+	// GODOT_RT_OPACITY_MICROMAPS=0 turns them off without touching the project, for comparisons.
+	static const bool omm_enabled = GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && RD::get_singleton()->has_feature(RD::SUPPORTS_OPACITY_MICROMAP) &&
+			OS::get_singleton()->get_environment("GODOT_RT_OPACITY_MICROMAPS") != "0";
+	return omm_enabled;
+}
+
 RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh, uint32_t p_lod) {
 	RD *rd = RD::get_singleton();
-	// GODOT_RT_OPACITY_MICROMAPS=0 turns them off without touching the project, for comparisons.
-	static const bool omm_enabled = GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && rd->has_feature(RD::SUPPORTS_OPACITY_MICROMAP) &&
-			OS::get_singleton()->get_environment("GODOT_RT_OPACITY_MICROMAPS") != "0";
-	if (!omm_enabled || !p_mat_data || !p_material.is_valid() || !p_mesh_surface || !p_mesh.is_valid()) {
+	if (!_omm_enabled() || !p_mat_data || !p_material.is_valid() || !p_mesh_surface || !p_mesh.is_valid()) {
 		return nullptr;
 	}
 
@@ -2384,8 +2388,11 @@ bool RenderRaytracing::_is_base_material(RID p_material, const Variant &p_albedo
 void RenderRaytracing::precache_hit_groups(const LocalVector<RID> &p_materials) {
 	// Registering a material's shader queues its hit group for the next pipeline build (SceneShaderRaytracing): the
 	// build process_material() starts when the TLAS first meets it, a few seconds of a cut-out left out of the scene.
+	// The programs its surfaces need when they first appear are started too (displacement, opacity micromap bake), so
+	// that their first frame does not stall on compiling them; BaseMaterial3D's bake program once.
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	rt_shader->precompile_slot_programs(0, _omm_enabled());
 	HashSet<RID> seen;
 	for (const RID &material : p_materials) {
 		if (seen.has(material)) {
@@ -2396,7 +2403,10 @@ void RenderRaytracing::precache_hit_groups(const LocalVector<RID> &p_materials) 
 		if (!material_storage->owns_material(material) || _is_base_material(material, material_storage->material_get_param(material, "albedo"))) {
 			continue;
 		}
-		rt_shader->register_custom_shader(material_storage->material_get_shader_id(material), material);
+		const uint32_t slot = rt_shader->register_custom_shader(material_storage->material_get_shader_id(material), material);
+		if (slot != 0) {
+			rt_shader->precompile_slot_programs(slot, _omm_enabled());
+		}
 	}
 }
 
