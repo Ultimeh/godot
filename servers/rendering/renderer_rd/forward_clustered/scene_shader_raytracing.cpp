@@ -1471,7 +1471,9 @@ void SceneShaderRaytracing::get_bake_programs(bool p_simple_shadows, bool p_ser,
 
 void SceneShaderRaytracing::get_material_bake_programs(RID p_material, bool p_simple_shadows, bool p_ser, LocalVector<BakeProgram> &r_programs) {
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
-	if (!material_storage->owns_material(p_material) || RenderRaytracing::is_base_material(p_material, material_storage->material_get_param(p_material, "albedo"))) {
+	// Only spatial materials have hit groups: the export walks every material, particle process, canvas item, sky and fog
+	// ones included, which the hit group compiler would reject ("Invalid render mode").
+	if (!material_storage->owns_material(p_material) || material_storage->material_get_data(p_material, RendererRD::MaterialStorage::SHADER_TYPE_3D) == nullptr || RenderRaytracing::is_base_material(p_material, material_storage->material_get_param(p_material, "albedo"))) {
 		return;
 	}
 
