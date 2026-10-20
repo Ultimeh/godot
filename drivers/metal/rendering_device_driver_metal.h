@@ -181,7 +181,7 @@ protected:
 	void shader_cache_free_entry(const SHA256Digest &key);
 
 public:
-	virtual Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override = 0;
+	virtual Error initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) override = 0;
 
 #pragma mark - Memory
 

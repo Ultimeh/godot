@@ -7446,7 +7446,7 @@ RenderingDeviceDriverD3D12::RenderingDeviceDriverD3D12(RenderingContextDriverD3D
 RenderingDeviceDriverD3D12::~RenderingDeviceDriverD3D12() {
 	rtv_descriptor_heap_pool.free(null_rtv_alloc);
 
-	if (Streamline::get_singleton()) {
+	if (main_device && Streamline::get_singleton()) {
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY);
 	}
 	Aftermath::get_singleton()->emit_marker(AFTERMATH_MARKER_BEFORE_DEVICE_DESTROY);
@@ -7516,9 +7516,10 @@ Error RenderingDeviceDriverD3D12::_initialize_device() {
 		res = device_factory->CreateDevice(adapter.Get(), requested_feature_level, IID_PPV_ARGS(device.GetAddressOf()));
 
 		// Streamline did not create this device: replace it with Streamline's proxy, which takes over its reference.
+		// Streamline works with one device (ProgrammingGuide.md, 2.5): a local device stays a plain one.
 		typedef int (*SLUpgradeInterface)(void **r_interface);
 		SLUpgradeInterface sl_upgrade_interface = (SLUpgradeInterface)Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_slUpgradeInterface);
-		if (SUCCEEDED(res) && sl_upgrade_interface) {
+		if (SUCCEEDED(res) && main_device && sl_upgrade_interface) {
 			void *device_interface = device.Detach();
 			const int sl_result = sl_upgrade_interface(&device_interface);
 			device.Attach((ID3D12Device *)device_interface);
@@ -7528,7 +7529,7 @@ Error RenderingDeviceDriverD3D12::_initialize_device() {
 		PFN_D3D12_CREATE_DEVICE d3d_D3D12CreateDevice = (PFN_D3D12_CREATE_DEVICE)(void *)GetProcAddress(context_driver->lib_d3d12, "D3D12CreateDevice");
 		ERR_FAIL_NULL_V(d3d_D3D12CreateDevice, ERR_CANT_CREATE);
 
-		if (Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12CreateDevice)) {
+		if (main_device && Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12CreateDevice)) {
 			d3d_D3D12CreateDevice = (PFN_D3D12_CREATE_DEVICE)Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_D3D12CreateDevice);
 		}
 
@@ -7928,8 +7929,13 @@ Error RenderingDeviceDriverD3D12::_initialize_command_signatures() {
 	return OK;
 }
 
-Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p_frame_count) {
+Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) {
 	glsl_type_singleton_init_or_ref();
+
+	// Streamline supports one device and must be given it right after its creation (slSetD3DDevice(), ProgrammingGuide.md,
+	// 2.5): a local device (the editor's texture compression, RenderingServer.create_local_rendering_device()) is refused
+	// with eErrorInvalidIntegration, and its destruction would shut Streamline down for the main device.
+	main_device = p_main_device;
 
 	context_device = context_driver->device_get(p_device_index);
 	adapter.Attach(context_driver->create_adapter(p_device_index));
@@ -7939,7 +7945,9 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 	HRESULT res = adapter->GetDesc(&adapter_desc);
 	ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-	Streamline::get_singleton()->set_internal_parameter("d3d12_adapter_luid", (void *)&adapter_desc.AdapterLuid);
+	if (main_device) {
+		Streamline::get_singleton()->set_internal_parameter("d3d12_adapter_luid", (void *)&adapter_desc.AdapterLuid);
+	}
 
 	// Set the pipeline cache ID based on the adapter information.
 	pipeline_cache_id = String::hex_encode_buffer((uint8_t *)&adapter_desc.AdapterLuid, sizeof(LUID));
@@ -7948,7 +7956,9 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 	Error err = _initialize_device();
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 
-	Streamline::get_singleton()->set_internal_parameter("d3d12_device", (void *)device.Get());
+	if (main_device) {
+		Streamline::get_singleton()->set_internal_parameter("d3d12_device", (void *)device.Get());
+	}
 
 	Aftermath::get_singleton()->emit_marker(AFTERMATH_MARKER_INITIALIZE_D3D12);
 	AftermathContext::get().initialize_d3d12((void *)device.Get());
@@ -7968,7 +7978,9 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 	err = _initialize_command_signatures();
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 
-	Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_AFTER_DEVICE_CREATION);
+	if (main_device) {
+		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_AFTER_DEVICE_CREATION);
+	}
 
 	return OK;
 }

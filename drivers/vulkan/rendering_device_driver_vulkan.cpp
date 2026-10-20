@@ -1617,7 +1617,13 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		bool device_created = VulkanHooks::get_singleton()->create_vulkan_device(&create_info, &vk_device);
 		ERR_FAIL_COND_V_MSG(!device_created, ERR_CANT_CREATE, "Couldn't create a Vulkan device through the VulkanHooks singleton.");
 	} else {
-		VkResult err = vkCreateDevice(physical_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_DEVICE), &vk_device);
+		// Streamline works with one device (ProgrammingGuide.md, 2.5), and its interposer's vkCreateDevice makes the new
+		// device the one its plugins use: a local device is created with the Vulkan loader directly.
+		PFN_vkCreateDevice create_device = vkCreateDevice;
+		if (!main_device && context_driver->functions_get().CreateDeviceWithoutStreamline != nullptr) {
+			create_device = context_driver->functions_get().CreateDeviceWithoutStreamline;
+		}
+		VkResult err = create_device(physical_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_DEVICE), &vk_device);
 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan device (VkResult error %d).", err));
 	}
 
@@ -1965,10 +1971,11 @@ void RenderingDeviceDriverVulkan::_set_object_name(VkObjectType p_object_type, u
 	}
 }
 
-Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t p_frame_count) {
+Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) {
 	context_device = context_driver->device_get(p_device_index);
 	physical_device = context_driver->physical_device_get(p_device_index);
 	frame_count = p_frame_count;
+	main_device = p_main_device;
 
 	// Copy the queue family properties the context already retrieved.
 	uint32_t queue_family_count = context_driver->queue_family_get_count(p_device_index);
@@ -1989,7 +1996,7 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	ERR_FAIL_COND_V_MSG(err != OK, err, "Couldn't initialize Vulkan device capabilities. This may be caused by an incompatible or outdated graphics driver.");
 
 #ifdef STREAMLINE_ENABLED
-	if (Streamline::get_singleton()) {
+	if (main_device && Streamline::get_singleton()) {
 		Streamline::get_singleton()->set_internal_parameter("vulkan_physical_device", (void *)physical_device);
 	}
 #endif
@@ -2036,7 +2043,7 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 #endif
 
 #if defined(STREAMLINE_ENABLED)
-	if (Streamline::get_singleton()) {
+	if (main_device && Streamline::get_singleton()) {
 		_initialize_latency_sleep();
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_AFTER_DEVICE_CREATION);
 	}
@@ -8504,7 +8511,7 @@ RenderingDeviceDriverVulkan::RenderingDeviceDriverVulkan(RenderingContextDriverV
 
 RenderingDeviceDriverVulkan::~RenderingDeviceDriverVulkan() {
 #if defined(STREAMLINE_ENABLED)
-	if (Streamline::get_singleton()) {
+	if (main_device && Streamline::get_singleton()) {
 		_finalize_latency_sleep();
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY);
 	}

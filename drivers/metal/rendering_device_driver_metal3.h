@@ -85,7 +85,7 @@ protected:
 	void remove_residency_set_to_main_queue(MTL::ResidencySet *p_set) override;
 
 public:
-	Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override;
+	Error initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) override;
 
 	FenceID fence_create() override;
 	Error fence_wait(FenceID p_fence) override;

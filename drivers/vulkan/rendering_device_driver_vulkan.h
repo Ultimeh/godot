@@ -171,6 +171,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	RenderingContextDriverVulkan *context_driver = nullptr;
 	RenderingContextDriver::Device context_device = {};
 	uint32_t frame_count = 1;
+	bool main_device = false; // Only the main device is handed to Streamline.
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
 	VkPhysicalDeviceProperties physical_device_properties = {};
 	VkPhysicalDeviceFeatures physical_device_features = {};
@@ -254,7 +255,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	void _set_object_name(VkObjectType p_object_type, uint64_t p_object_handle, String p_object_name);
 
 public:
-	Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override final;
+	Error initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) override final;
 
 private:
 	/****************/

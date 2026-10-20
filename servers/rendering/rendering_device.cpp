@@ -9613,7 +9613,7 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	max_timestamp_query_elements = GLOBAL_GET("debug/settings/profiler/max_timestamp_query_elements");
 
 	device = context->device_get(device_index);
-	err = driver->initialize(device_index, frame_count);
+	err = driver->initialize(device_index, frame_count, is_main_instance);
 	ERR_FAIL_COND_V_MSG(err != OK, FAILED, "Failed to initialize driver for device.");
 
 	if (is_main_instance) {

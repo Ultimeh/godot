@@ -125,6 +125,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	RenderingContextDriver::Device context_device;
 	Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
 	Microsoft::WRL::ComPtr<ID3D12Device> device;
+	bool main_device = false; // Only the main device is handed to Streamline.
 	DeviceLimits device_limits;
 	RDD::Capabilities device_capabilities;
 	uint32_t feature_level = 0; // Major * 10 + minor.
@@ -250,7 +251,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	Error _initialize_command_signatures();
 
 public:
-	Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override final;
+	Error initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) override final;
 
 private:
 	/****************/

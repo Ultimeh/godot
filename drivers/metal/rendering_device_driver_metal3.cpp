@@ -102,7 +102,7 @@ Error RenderingDeviceDriverMetal::_create_device() {
 	return OK;
 }
 
-Error RenderingDeviceDriverMetal::initialize(uint32_t p_device_index, uint32_t p_frame_count) {
+Error RenderingDeviceDriverMetal::initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) {
 	Error err = _initialize(p_device_index, p_frame_count);
 	ERR_FAIL_COND_V(err, err);
 

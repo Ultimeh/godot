@@ -52,6 +52,9 @@ public:
 
 		// Device.
 		PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
+		// The Vulkan loader's vkCreateDevice, when vkCreateDevice is Streamline's interposer: Streamline works with the
+		// last device created through it, so a local device is created with this one instead.
+		PFN_vkCreateDevice CreateDeviceWithoutStreamline = nullptr;
 
 		// Surfaces.
 		PFN_vkGetPhysicalDeviceSurfaceSupportKHR GetPhysicalDeviceSurfaceSupportKHR = nullptr;
@@ -107,6 +110,9 @@ private:
 	VkDebugUtilsMessengerEXT debug_messenger = VK_NULL_HANDLE;
 	VkDebugReportCallbackEXT debug_report = VK_NULL_HANDLE;
 	Functions functions;
+#if defined(USE_VOLK) && defined(STREAMLINE_ENABLED) && defined(_WIN32)
+	PFN_vkGetInstanceProcAddr loader_get_instance_proc_addr = nullptr; // vulkan-1.dll's, under Streamline's interposer.
+#endif
 
 	Error _initialize_vulkan_version();
 	void _register_requested_instance_extension(const CharString &p_extension_name, bool p_required);

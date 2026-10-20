@@ -787,6 +787,11 @@ Error RenderingContextDriverVulkan::_initialize_instance() {
 
 	// Device.
 	functions.GetDeviceProcAddr = PFN_vkGetDeviceProcAddr(vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
+#if defined(USE_VOLK) && defined(STREAMLINE_ENABLED) && defined(_WIN32)
+	if (loader_get_instance_proc_addr != nullptr) {
+		functions.CreateDeviceWithoutStreamline = PFN_vkCreateDevice(loader_get_instance_proc_addr(instance, "vkCreateDevice"));
+	}
+#endif
 
 	// Surfaces.
 	functions.GetPhysicalDeviceSurfaceSupportKHR = PFN_vkGetPhysicalDeviceSurfaceSupportKHR(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSurfaceSupportKHR"));
@@ -926,6 +931,13 @@ Error RenderingContextDriverVulkan::initialize() {
 		// note: function pointer is cast through void function pointer to silence cast-function-type warning on gcc8
 		PFN_vkGetInstanceProcAddr vk_getInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)())GetProcAddress(module, "vkGetInstanceProcAddr");
 		volkInitializeCustom(vk_getInstanceProcAddr);
+
+		// The interposer forwards to the Vulkan loader, which local devices use to create their device (see
+		// Functions::CreateDeviceWithoutStreamline).
+		HMODULE loader = LoadLibraryA("vulkan-1.dll");
+		if (loader != nullptr) {
+			loader_get_instance_proc_addr = (PFN_vkGetInstanceProcAddr)(void (*)())GetProcAddress(loader, "vkGetInstanceProcAddr");
+		}
 	} else {
 		if (volkInitialize() != VK_SUCCESS) {
 			return FAILED;

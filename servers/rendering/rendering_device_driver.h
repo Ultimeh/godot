@@ -150,7 +150,10 @@ public:
 	/**** GENERIC ****/
 	/*****************/
 
-	virtual Error initialize(uint32_t p_device_index, uint32_t p_frame_count) = 0;
+	// p_main_device: the device of the RenderingDevice that presents to the windows, not a local one
+	// (RenderingDevice::create_local_device()). Integrations that support one device per process, such as
+	// Streamline, are only given the main device.
+	virtual Error initialize(uint32_t p_device_index, uint32_t p_frame_count, bool p_main_device) = 0;
 
 	/****************/
 	/**** MEMORY ****/
