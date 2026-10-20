@@ -239,6 +239,11 @@ namespace GodotTools.Build
             arguments.Add("--self-contained");
             arguments.Add("true");
 
+            // No persistent build servers (Roslyn's VBCSCompiler, MSBuild nodes): they outlive the export by about
+            // 10 minutes, and the Windows console wrapper waits for every process of its job, so a command-line
+            // export through `godot.*.console.exe` did not return until they exited.
+            arguments.Add("--disable-build-servers");
+
             // Verbosity
             AddVerbosityArguments(buildInfo, arguments, editorSettings);
 
