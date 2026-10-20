@@ -322,6 +322,7 @@ void ShaderBakerExportPlugin::_end_customize_resources() {
 	}
 
 	shader_paths_processed.clear();
+	shaders_customized.clear();
 	shader_work_results.clear();
 	shader_group_items.clear();
 	raytracing_items.clear();
@@ -334,9 +335,29 @@ Ref<Resource> ShaderBakerExportPlugin::_customize_resource(const Ref<Resource> &
 	RendererRD::MaterialStorage *singleton = RendererRD::MaterialStorage::get_singleton();
 	DEV_ASSERT(singleton != nullptr);
 
+	Ref<Shader> shader = p_resource;
+	if (shader.is_valid()) {
+		// A shader no saved material uses is only met here: the game builds its material at run time
+		// (`ShaderMaterial.shader = load(...)`). Its versions and hit groups follow its code and render modes, not a
+		// material's parameters, so a material made for the bake compiles what the game's will.
+		const RID shader_rid = shader->get_rid();
+		if (shader_rid.is_valid() && !shaders_customized.has(shader_rid)) {
+			Ref<ShaderMaterial> shader_material;
+			shader_material.instantiate();
+			shader_material->set_shader(shader);
+			_customize_resource(shader_material, String());
+		}
+		return Ref<Resource>();
+	}
+
 	Ref<Material> material = p_resource;
 	if (material.is_valid()) {
 		RID material_rid = material->get_rid();
+		// The export also visits a built-in material's shader: baked here already.
+		const Ref<ShaderMaterial> shader_material = material;
+		if (shader_material.is_valid() && shader_material->get_shader().is_valid()) {
+			shaders_customized.insert(shader_material->get_shader()->get_rid());
+		}
 		if (material_rid.is_valid()) {
 			RendererRD::MaterialStorage::ShaderData *shader_data = singleton->material_get_shader_data(material_rid);
 			if (shader_data != nullptr) {

@@ -33,6 +33,7 @@
 #include "core/object/object.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/condition_variable.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/rb_set.h"
 #include "editor/export/editor_export_plugin.h"
 
@@ -88,6 +89,7 @@ protected:
 	String shader_cache_renderer_name;
 	String shader_cache_export_path;
 	RBSet<String> shader_paths_processed;
+	HashSet<RID> shaders_customized; // Shaders whose material was customized.
 	HashMap<String, WorkResult> shader_work_results;
 	Mutex shader_work_results_mutex;
 	LocalVector<ShaderGroupItem> shader_group_items;
