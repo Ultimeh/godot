@@ -815,6 +815,9 @@ protected:
 		RID material_uniform_set;
 		SceneShaderForwardClustered::ShaderData *shader = nullptr;
 		SceneShaderForwardClustered::MaterialData *material = nullptr;
+		// The material this surface draws with: the surface's own, one of its next passes or the instance's overlay. Empty
+		// for the default material. The path tracer traces each surface with it.
+		RID material_rid;
 
 		void *surface_shadow = nullptr;
 		RID material_uniform_set_shadow;
@@ -1067,7 +1070,7 @@ protected:
 
 	void _update_global_pipeline_data_requirements_from_project();
 	void _update_global_pipeline_data_requirements_from_light_storage();
-	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh);
+	void _geometry_instance_add_surface_with_material(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, uint32_t p_material_id, uint32_t p_shader_id, RID p_mesh, RID p_material_rid);
 	void _geometry_instance_add_surface_with_material_chain(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, SceneShaderForwardClustered::MaterialData *p_material, RID p_mat_src, RID p_mesh);
 	void _geometry_instance_add_surface(GeometryInstanceForwardClustered *ginstance, uint32_t p_surface, RID p_material, RID p_mesh);
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);

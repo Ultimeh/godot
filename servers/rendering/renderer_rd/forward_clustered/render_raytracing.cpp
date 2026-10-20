@@ -1424,8 +1424,12 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 	displace_camera_transform = p_render_data->scene_data->cam_transform;
 	displace_camera_projection = p_render_data->scene_data->cam_projection;
 
-	// The material a surface draws with: override, then surface override, then mesh.
+	// The material a surface draws with: its own (a next pass or the overlay has one), else override, then surface
+	// override, then mesh.
 	auto surface_material = [mesh_storage](const RenderForwardClustered::GeometryInstanceSurfaceDataCache *p_surf) -> RID {
+		if (p_surf->material_rid.is_valid()) {
+			return p_surf->material_rid;
+		}
 		if (p_surf->owner->data->material_override.is_valid()) {
 			return p_surf->owner->data->material_override;
 		}
@@ -4143,7 +4147,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
 
 				RID material_rid;
-				if (mm_surf->owner->data->material_override.is_valid()) {
+				if (mm_surf->material_rid.is_valid()) {
+					material_rid = mm_surf->material_rid;
+				} else if (mm_surf->owner->data->material_override.is_valid()) {
 					material_rid = mm_surf->owner->data->material_override;
 				} else if (mm_surf->surface_index < mm_surf->owner->data->surface_materials.size() &&
 						mm_surf->owner->data->surface_materials[mm_surf->surface_index].is_valid()) {
@@ -4389,9 +4395,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
-			// Resolve material before TLAS so we can skip surfaces whose HG is not live yet (override > surface > mesh).
+			// Resolve material before TLAS so we can skip surfaces whose HG is not live yet (the surface's own, which is how
+			// a next pass or the overlay is traced with its material, then override > surface > mesh).
 			RID material_rid;
-			if (surf->owner->data->material_override.is_valid()) {
+			if (surf->material_rid.is_valid()) {
+				material_rid = surf->material_rid;
+			} else if (surf->owner->data->material_override.is_valid()) {
 				material_rid = surf->owner->data->material_override;
 			} else if (surf->surface_index < surf->owner->data->surface_materials.size() &&
 					surf->owner->data->surface_materials[surf->surface_index].is_valid()) {
