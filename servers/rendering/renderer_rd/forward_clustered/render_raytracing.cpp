@@ -2620,7 +2620,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 			for (const KeyValue<StringName, ShaderLanguage::ShaderNode::Uniform> &kv : cse->uniforms) {
 				const ShaderLanguage::ShaderNode::Uniform &u = kv.value;
-				if (ShaderLanguage::is_sampler_type(u.type)) {
+				// Instance uniforms live in the global buffer (rt_instance_uniforms_ofs), not in the material's: as raster's
+				// MaterialData::update_uniform_buffer(), skip them. Their order is left at 0, so packing one wrote over the
+				// material's first uniform (godot3d's grass: rain_wetness's global index, which then read grass_lod_width).
+				if (ShaderLanguage::is_sampler_type(u.type) || u.scope == ShaderLanguage::ShaderNode::Uniform::SCOPE_INSTANCE) {
 					continue;
 				}
 				if (u.order < 0 || u.order >= (int)cse->uniform_offsets.size()) {

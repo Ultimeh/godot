@@ -689,7 +689,8 @@ bool SceneShaderRaytracing::_finalize_uniforms_with_textures(
 	uint32_t raw_uniform_end = 0;
 	for (const KeyValue<StringName, ShaderLanguage::ShaderNode::Uniform> &kv : p_uniforms) {
 		const ShaderLanguage::ShaderNode::Uniform &uu = kv.value;
-		if (ShaderLanguage::is_sampler_type(uu.type) || uu.order < 0 || uu.order >= (int)p_gen_code.uniform_offsets.size()) {
+		// Instance uniforms are not in the material's buffer (their order is left at 0).
+		if (ShaderLanguage::is_sampler_type(uu.type) || uu.scope == ShaderLanguage::ShaderNode::Uniform::SCOPE_INSTANCE || uu.order < 0 || uu.order >= (int)p_gen_code.uniform_offsets.size()) {
 			continue;
 		}
 		// Sizes as ShaderCompiler lays them out: a global is an index, an array is padded to 16 bytes per element.
