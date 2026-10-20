@@ -932,6 +932,12 @@ bool EditorExportPlatform::_export_customize_object(Object *p_object, LocalVecto
 	List<PropertyInfo> props;
 	p_object->get_property_list(&props);
 	for (const PropertyInfo &E : props) {
+		// Only stored properties end up in the exported file. The others include properties that
+		// _validate_property() disabled, whose getters may error (e.g. GPUParticles3D's unused draw passes).
+		if (!(E.usage & PROPERTY_USAGE_STORAGE)) {
+			continue;
+		}
+
 		switch (E.type) {
 			case Variant::OBJECT: {
 				Ref<Resource> res = p_object->get(E.name);

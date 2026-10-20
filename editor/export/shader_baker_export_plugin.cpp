@@ -377,13 +377,13 @@ Node *ShaderBakerExportPlugin::_customize_scene(Node *p_root, const String &p_pa
 			properties["alpha_antialiasing_mode"] = StandardMaterial3D::ALPHA_ANTIALIASING_OFF;
 			properties["alpha_cut"] = SpriteBase3D::ALPHA_CUT_DISABLED;
 
-			List<PropertyInfo> property_list;
-			node->get_property_list(&property_list);
-			for (const PropertyInfo &info : property_list) {
+			// Read only the properties used below. Reading the whole property list would also read
+			// getters that error on a scene outside the tree, such as Node3D's global_transform.
+			for (KeyValue<StringName, Variant> &E : properties) {
 				bool valid = false;
-				Variant property = node->get(info.name, &valid);
+				Variant property = node->get(E.key, &valid);
 				if (valid) {
-					properties[info.name] = property;
+					E.value = property;
 				}
 			}
 
