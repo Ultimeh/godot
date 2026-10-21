@@ -857,15 +857,15 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 	}
 
 #ifdef D3D12_ENABLED
-	// The swap chain is recreated whenever DLSS-G is switched on or off, with sl.dlss_g loaded only
-	// while it is on. The D3D12 driver does it before its next Present.
+	// The first time DLSS-G is switched on, the swap chain is recreated with sl.dlss_g loaded. The D3D12
+	// driver does it before its next Present. Switching it off is then eOff alone: the plugin and its
+	// swap chain stay, as in most games, and eOff without eRetainResourcesWhenOff frees DLSS-G's
+	// resources (DLSS-G guide, section 6.4). Unloading it right after eOff (section 18) left the
+	// frame rate capped at the display limit divided by the generation factor until quit.
 	if (context->is_d3d12 && dlssg_is_provider()) {
 		StreamlineContext &sl = StreamlineContext::get();
 		if (p_params.dlss_g && !sl.dlssg_wanted) {
 			sl.dlssg_wanted = true;
-			Streamline::get_singleton()->bump_swap_chain_serial();
-		} else if (!p_params.dlss_g && sl.dlssg_wanted && sl.dlssg_viewport == sl::ViewportHandle(-1)) {
-			sl.dlssg_wanted = false;
 			Streamline::get_singleton()->bump_swap_chain_serial();
 		}
 	}

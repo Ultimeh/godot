@@ -110,7 +110,8 @@ public:
 	void dlssg_disable();
 
 	// D3D12, right before a swap chain is created: loads or unloads DLSS-G, Reflex and PCL for it.
-	// DLSS-G is loaded only while frame generation is wanted, so other swap chains stay native.
+	// DLSS-G is loaded once frame generation was turned on, and unloaded only for FSR frame
+	// generation, whose proxy swap chain cannot coexist with it.
 	void apply_frame_generation_features(bool p_fsr);
 	bool reflex_usable() const { return streamline_capabilities.reflex_available && reflex_loaded; }
 
@@ -139,7 +140,8 @@ public:
 	bool dlssg_ui_recomposition = false;
 	// Frames DLSS-G's enabling has waited for the HUD-less color and UI alpha to be tagged.
 	int dlssg_hudless_wait = 0;
-	// D3D12: DLSS-G loaded for the current swap chain, and wanted for the next one.
+	// D3D12: DLSS-G loaded for the current swap chain, and wanted for the next one (set the first
+	// time frame generation is turned on, never cleared).
 	bool dlssg_loaded = true;
 	bool dlssg_wanted = false;
 	bool reflex_loaded = true; // Reflex and PCL together.
