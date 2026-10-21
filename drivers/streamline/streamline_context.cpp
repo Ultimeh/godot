@@ -247,6 +247,49 @@ void StreamlineContext::dlssg_disable() {
 	}
 }
 
+void StreamlineContext::dlssg_unload_schedule() {
+	STREAMLINE_GAME_ONLY;
+	if (dlssg_off_usec.load() != 0) {
+		return;
+	}
+	// Ordered before the time: the present tick reads the time first.
+	dlssg_off_presents.store(presents.load());
+	dlssg_off_usec.store(MAX<uint64_t>(1, OS::get_singleton()->get_ticks_usec()));
+	print_line(vformat("Streamline: DLSS-G off; sl.dlss_g is unloaded after %d ms and %d presented frames.", DLSS_G_UNLOAD_DELAY_USEC / 1000, DLSS_G_UNLOAD_DELAY_PRESENTS));
+}
+
+void StreamlineContext::dlssg_unload_cancel() {
+	if (dlssg_off_usec.exchange(0) != 0) {
+		print_line("Streamline: DLSS-G on again before its unload; sl.dlss_g stays loaded.");
+	}
+}
+
+void StreamlineContext::dlssg_unload_present_tick() {
+	const uint64_t presented = presents.fetch_add(1) + 1;
+	uint64_t off_usec = dlssg_off_usec.load();
+	if (off_usec == 0) {
+		return;
+	}
+	const uint64_t now = OS::get_singleton()->get_ticks_usec();
+	if (now - off_usec < DLSS_G_UNLOAD_DELAY_USEC || presented - dlssg_off_presents.load() < DLSS_G_UNLOAD_DELAY_PRESENTS) {
+		return;
+	}
+	// The renderer may cancel at the same time: whoever clears the time first wins.
+	if (!dlssg_off_usec.compare_exchange_strong(off_usec, 0)) {
+		return;
+	}
+	dlssg_wanted = false;
+	print_line(vformat("Streamline: unloading sl.dlss_g, %d ms and %d presented frames after DLSS-G's eOff.", (now - off_usec) / 1000, presented - dlssg_off_presents.load()));
+#ifdef D3D12_ENABLED
+	if (fsr_switch_pending.exchange(false)) {
+		// One swap chain recreation unloads sl.dlss_g and creates the FSR proxy.
+		FSRFrameGenerationD3D12::set_requested(true);
+		return;
+	}
+#endif
+	Streamline::get_singleton()->bump_swap_chain_serial();
+}
+
 void StreamlineContext::reflex_set_options(const sl::ReflexOptions &opts) {
 	STREAMLINE_GAME_ONLY; // Disable reflex for editor or project settings.
 

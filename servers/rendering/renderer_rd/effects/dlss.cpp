@@ -756,7 +756,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 
 		// DLSS-G's HUD-less color and UI alpha, written later in this frame: eValidUntilPresent only
 		// requires them to be right at Present. Without them, the tags are nulled.
-		const bool dlssg_requested = p_params.dlss_g && dlssg_is_provider();
+		const bool dlssg_requested = StreamlineContext::get().dlssg_requested(p_params.dlss_g) && dlssg_is_provider();
 		if ((dlssg_requested || StreamlineContext::get().dlssg_viewport == context->viewport) && p_payload.hudless.valid && p_payload.ui_alpha.valid) {
 			assignResource(resources, resourceTags, numResources, p_payload.hudless, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle::eValidUntilPresent);
 			assignResource(resources, resourceTags, numResources, p_payload.ui_alpha, DLSS_BUFFER_TYPE_UI_ALPHA, sl::ResourceLifecycle::eValidUntilPresent);
@@ -779,7 +779,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 	// chain has been recreated with sl.dlss_g loaded.
 	if (StreamlineContext::get().slDLSSGSetOptions != nullptr && dlssg_is_provider() && StreamlineContext::get().dlssg_loaded) {
 		sl::DLSSGOptions dlssGOptions{};
-		bool wantActivateDLSSG = p_params.dlss_g;
+		// Off while a switch to FSR frame generation waits for sl.dlss_g's unload.
+		bool wantActivateDLSSG = StreamlineContext::get().dlssg_requested(p_params.dlss_g);
 		bool canActivateDLSSG = StreamlineContext::get().dlssg_delay == 0;
 
 		// The runtime refuses more generated frames than the device reports, so the count is clamped.
@@ -857,16 +858,22 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, DLSSCallbackPaylo
 	}
 
 #ifdef D3D12_ENABLED
-	// The first time DLSS-G is switched on, the swap chain is recreated with sl.dlss_g loaded. The D3D12
-	// driver does it before its next Present. Switching it off is then eOff alone: the plugin and its
-	// swap chain stay, as in most games, and eOff without eRetainResourcesWhenOff frees DLSS-G's
-	// resources (DLSS-G guide, section 6.4). Unloading it right after eOff (section 18) left the
-	// frame rate capped at the display limit divided by the generation factor until quit.
+	// When DLSS-G is switched on, the swap chain is recreated with sl.dlss_g loaded. The D3D12 driver
+	// does it before its next Present. Switching it off is eOff (without eRetainResourcesWhenOff, it
+	// frees DLSS-G's resources, guide section 6.4), then sl.dlss_g is unloaded with another swap chain
+	// recreation (section 18), but only a while after eOff: unloading it right away left the frame rate
+	// capped at the display limit divided by the generation factor until quit. Switched on again
+	// before that, sl.dlss_g simply stays.
 	if (context->is_d3d12 && dlssg_is_provider()) {
 		StreamlineContext &sl = StreamlineContext::get();
-		if (p_params.dlss_g && !sl.dlssg_wanted) {
-			sl.dlssg_wanted = true;
-			Streamline::get_singleton()->bump_swap_chain_serial();
+		if (sl.dlssg_requested(p_params.dlss_g)) {
+			sl.dlssg_unload_cancel();
+			if (!sl.dlssg_wanted) {
+				sl.dlssg_wanted = true;
+				Streamline::get_singleton()->bump_swap_chain_serial();
+			}
+		} else if (sl.dlssg_wanted && (uint32_t)sl.dlssg_viewport == UINT_MAX) {
+			sl.dlssg_unload_schedule();
 		}
 	}
 #endif

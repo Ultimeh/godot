@@ -65,6 +65,12 @@ public:
 	uint32_t get_swap_chain_serial() const { return swap_chain_serial.get(); }
 	void bump_swap_chain_serial() { swap_chain_serial.increment(); }
 
+	// D3D12, switching the frame generation provider to AMD FSR: returns true when sl.dlss_g is wanted,
+	// so the switch must wait for its deferred unload (DLSS-G off meanwhile; the unload then completes
+	// the switch). cancel_switch_to_fsr() drops a waiting switch and returns whether there was one.
+	bool defer_switch_to_fsr();
+	bool cancel_switch_to_fsr();
+
 	// Present markers must carry the token of the frame being presented, which the render thread has already left.
 	// 0 (the default on every thread) uses the draw's own token.
 	uint64_t get_render_frame_token() const;

@@ -125,6 +125,31 @@ void Streamline::set_latency_sleep_callback(LatencySleepCallback p_callback, voi
 #endif
 }
 
+bool Streamline::defer_switch_to_fsr() {
+#ifdef STREAMLINE_ENABLED
+	StreamlineContext &sl_context = StreamlineContext::get();
+	if (!sl_context.is_game || !sl_context.is_d3d12 || !sl_context.dlssg_wanted) {
+		return false;
+	}
+	sl_context.fsr_switch_pending = true;
+	// With DLSS-G on, the renderer sends eOff on its next frame and starts the unload delay then.
+	if ((uint32_t)sl_context.dlssg_viewport == UINT_MAX) {
+		sl_context.dlssg_unload_schedule();
+	}
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool Streamline::cancel_switch_to_fsr() {
+#ifdef STREAMLINE_ENABLED
+	return StreamlineContext::get().fsr_switch_pending.exchange(false);
+#else
+	return false;
+#endif
+}
+
 void Streamline::emit_marker(StreamlineMarkerType marker) {
 #ifdef STREAMLINE_ENABLED
 	StreamlineContext &sl_context = StreamlineContext::get();
@@ -173,6 +198,11 @@ void Streamline::emit_marker(StreamlineMarkerType marker) {
 			return;
 		default:
 			break;
+	}
+
+	// D3D12: sl.dlss_g's deferred unload counts real presents, with or without Reflex.
+	if (marker == StreamlineMarkerType::STREAMLINE_MARKER_END_PRESENT && sl_context.is_game && sl_context.is_d3d12) {
+		sl_context.dlssg_unload_present_tick();
 	}
 
 	if (!sl_context.is_game || !sl_context.reflex_usable()) {

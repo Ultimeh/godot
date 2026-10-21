@@ -227,7 +227,19 @@ bool FSRFrameGenerationD3D12::is_requested() {
 }
 
 void FSRFrameGenerationD3D12::set_requested(bool p_fsr) {
-	if (!is_game_process() || is_requested() == p_fsr) {
+	if (!is_game_process()) {
+		return;
+	}
+	if (!p_fsr && Streamline::get_singleton()->cancel_switch_to_fsr()) {
+		print_line("Frame generation provider: NVIDIA DLSS-G again, before sl.dlss_g was unloaded.");
+		return;
+	}
+	if (is_requested() == p_fsr) {
+		return;
+	}
+	// The FSR proxy cannot coexist with sl.dlss_g, which is unloaded only a while after DLSS-G's eOff.
+	if (p_fsr && Streamline::get_singleton()->defer_switch_to_fsr()) {
+		print_line("Frame generation provider: AMD FSR once sl.dlss_g is unloaded (no frame generation until then).");
 		return;
 	}
 	fsr_provider.store(p_fsr ? 1 : 0);
