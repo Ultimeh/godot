@@ -59,7 +59,8 @@ struct DisplaceJob {
 	uint mm_use_remap; // 1: the merged vertices are a LOD view's, mm_remap maps them to the mesh's.
 	uint mm_color_offset; // In floats in an instance, or 0xFFFFFFFF without colors.
 	uint mm_custom_offset; // Same for the custom data.
-	uint mm_pad;
+	// 1: the BLAS is refit with this output, which must keep every vertex's activity of its last build (main()).
+	uint refit_guard;
 };
 
 layout(set = 0, binding = 30, std430) readonly buffer DisplaceJobs {
@@ -95,6 +96,18 @@ layout(set = 3, binding = 4, std430) restrict writeonly buffer MultiMeshPrevious
 	uint v[];
 }
 mm_previous;
+
+// The positions the BLAS was last built or refit from (the deformed path's own copy), read by a refit job.
+layout(set = 3, binding = 5, std430) restrict readonly buffer BlasPositions {
+	uint v[];
+}
+blas_positions;
+
+// Per job: the vertices a refit job kept as the BLAS has them; any makes the CPU rebuild that BLAS a few frames later.
+layout(set = 3, binding = 6, std430) restrict buffer GuardCounts {
+	uint v[];
+}
+guard_counts;
 
 layout(push_constant, std430) uniform Params {
 	uint job_index;
@@ -208,8 +221,9 @@ void main() {
 		float value = global_shader_uniforms.data[0].x + scene_data_block.data.time;
 		value += texelFetch(sampler2D(bindless_textures[nonuniformEXT(index)], SAMPLER_NEAREST_CLAMP), ivec2(0), 0).r;
 		value += texelFetch(sampler2DArray(bindless_texture_arrays[nonuniformEXT(index)], SAMPLER_NEAREST_CLAMP), ivec3(0), 0).r;
-		dst.v[0] = material_dependency.v[0] + floatBitsToUint(value) + floatBitsToUint(mm_transforms.v[0]) + mm_remap.v[0];
+		dst.v[0] = material_dependency.v[0] + floatBitsToUint(value) + floatBitsToUint(mm_transforms.v[0]) + mm_remap.v[0] + blas_positions.v[0];
 		mm_previous.v[0] = 0u;
+		guard_counts.v[0] = 0u;
 	}
 
 	if (job.mm_instance_count != 0u) {
@@ -296,6 +310,20 @@ void main() {
 	// uniforms stay current), for the motion of the previous position.
 	vec3 previous = displace_vertex(job, rest_position, tbn, index, true);
 	vec3 displaced = displace_vertex(job, rest_position, tbn, index, false);
+
+	// A refit may not turn a triangle on or off: DXR "Inactive primitives and instances" (inactive primitives may not
+	// become active in an update, active ones may not become inactive), Vulkan "Inactive Primitives and Instances" (any
+	// transition between the active and inactive states requires a full rebuild). A triangle is inactive when a vertex
+	// has a NaN x, and displace_vertex() makes a removed point all NaN: a vertex keeping its NaN state keeps its
+	// triangles' state. One that would change it stays as the BLAS has it (its position, or NaN), and the count makes
+	// the CPU rebuild the BLAS, from vertex()'s output, a few frames later (_displace_guard_arrived()).
+	if (job.refit_guard != 0u) {
+		vec3 built = vec3(uintBitsToFloat(blas_positions.v[index * 3u]), uintBitsToFloat(blas_positions.v[index * 3u + 1u]), uintBitsToFloat(blas_positions.v[index * 3u + 2u]));
+		if (isnan(built.x) != isnan(displaced.x)) {
+			displaced = built;
+			atomicAdd(guard_counts.v[params.job_index], 1u);
+		}
+	}
 
 	uint vertex_count = geom.vertex_count;
 	dst.v[index * 3u] = floatBitsToUint(displaced.x);

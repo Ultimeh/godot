@@ -3272,6 +3272,9 @@
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/displaced_refit" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the path tracer refits the acceleration structure of a mesh surface whose material's [code]vertex()[/code] function keeps moving it, instead of building it again. It is still built again when the instance or the material changes, periodically, and when [code]vertex()[/code] removes or restores points. If [code]false[/code], it is built again on every evaluation (for comparison). Read every frame; a change builds every such surface again.
+		</member>
 		<member name="rendering/pathtracing/displacement_update_distance" type="float" setter="" getter="" default="30.0">
 			Distance from the camera within which the path tracer updates every frame a mesh surface whose material's [code]vertex()[/code] function keeps moving it: it uses [code]TIME[/code], reads the moving camera, or has a shader parameter set every frame (such as a terrain's geomorphing). Beyond this distance the surface is updated once every [code]N[/code] frames, [code]N[/code] being its distance divided by this value, up to 8, which saves the evaluation of its vertices and the rebuild of its acceleration structure on the other frames. Set to [code]0.0[/code] to update every such surface every frame.
 			[b]Note:[/b] Requires a restart to take effect.

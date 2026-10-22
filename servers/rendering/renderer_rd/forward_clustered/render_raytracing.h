@@ -322,7 +322,8 @@ struct alignas(16) RT_DisplaceJob {
 	uint32_t mm_use_remap; // 1: the merged vertices are a LOD view's (binding 3 maps them to the mesh's).
 	uint32_t mm_color_offset; // In floats in an instance, or UINT32_MAX without colors.
 	uint32_t mm_custom_offset; // Same for the custom data.
-	uint32_t mm_pad;
+	// 1: the BLAS is refit with the output, which keeps the activity of each vertex of its last build (bindings 5 and 6).
+	uint32_t refit_guard;
 };
 static_assert(sizeof(RT_DisplaceJob) == 480, "RT_DisplaceJob must be 480 bytes for std430");
 
@@ -481,7 +482,9 @@ struct RTDeformedCacheEntry {
 	uint32_t displaced_vb_capacity = 0; // Bytes; grow-only.
 	uint32_t displaced_frame = 0; // Last frame the surface was displaced; 0 = never.
 	uint64_t displaced_stamp = 0; // Bumped on each evaluation.
-	bool displaced_rebuild = false; // Evaluated this frame: vertex() may turn triangles on or off, so no refit.
+	bool displaced_rebuild = false; // Evaluated this frame and the BLAS is to be built again, not refit (_displace_surfaces()).
+	uint32_t displaced_refits = 0; // Since the last rebuild.
+	bool displaced_guard_rebuild = false; // A refit kept vertices vertex() turned on or off (raytracing_displace.glsl).
 	uint32_t displaced_slot = 0;
 	uint32_t displaced_prev_offset = 0; // Bytes to the previous frame's positions in displaced_vb.
 	uint16_t displaced_material_counter = 0;
@@ -727,6 +730,8 @@ class RenderRaytracing {
 	uint32_t displaced_evaluated = 0;
 	uint32_t displaced_deferred = 0;
 	uint64_t displaced_vertices = 0;
+	uint32_t displaced_refitted = 0; // Of displaced_evaluated, refit instead of built again.
+	uint32_t displaced_guard_rebuilds = 0; // BLASes the NaN guard asked to build again, since the previous log.
 	// The frame's BLAS updates of deforming geometry waiting for their turn out of view (out_of_view_update_distance).
 	uint32_t out_of_view_deferred = 0;
 	LocalVector<RD::Uniform> _displace_frame_uniforms(RID p_job_buffer);
@@ -837,6 +842,16 @@ class RenderRaytracing {
 	Transform3D displace_camera_transform;
 	Projection displace_camera_projection;
 	void _displace_surfaces(const RenderDataRD *p_render_data);
+	bool displaced_refit_used = true; // rendering/pathtracing/displaced_refit in the previous frame.
+	// The refit jobs' NaN guard counts (raytracing_displace.glsl), one per job, read back without waiting: the surfaces of
+	// the jobs that kept vertices are built again once they arrive.
+	RID displace_guard_buffer;
+	uint32_t displace_guard_capacity = 0;
+	uint64_t displace_guard_serial = 0;
+	HashMap<uint64_t, LocalVector<RID>> displace_guard_pending; // Per readback, the deformed handle of each job (RID() if not a refit).
+	static RenderRaytracing *displace_guard_target;
+	static void _displace_guard_arrived_static(const Vector<uint8_t> &p_data, uint64_t p_serial);
+	void _displace_guard_arrived(const Vector<uint8_t> &p_data, uint64_t p_serial);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
 	void _free_merged_mm_entry(RID p_handle);
 	const RTMergedMMEntry *_get_merged_mm_entry(RID p_mm_rid, uint32_t p_surface_index); // With a BLAS built, or null.

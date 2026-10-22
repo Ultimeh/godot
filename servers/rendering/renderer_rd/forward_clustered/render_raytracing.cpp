@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "core/templates/pair.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
@@ -50,8 +51,11 @@ using namespace RendererSceneRenderImplementation;
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+RenderRaytracing *RenderRaytracing::displace_guard_target = nullptr;
+
 void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
+	displace_guard_target = this;
 	bindless_block = memnew(BindlessBlock);
 	bindless_array_block = memnew(BindlessBlock);
 
@@ -123,6 +127,10 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 }
 
 RenderRaytracing::~RenderRaytracing() {
+	// A guard readback still in flight arrives after this object.
+	if (displace_guard_target == this) {
+		displace_guard_target = nullptr;
+	}
 	for (KeyValue<RenderSceneBuffersRD *, RTViewportState *> &kv : viewport_states) {
 		_free_viewport_state_internal(kv.value);
 	}
@@ -506,6 +514,12 @@ void RenderRaytracing::cleanup_caches() {
 		displace_job_buffer = RID();
 		displace_job_capacity = 0;
 	}
+	if (displace_guard_buffer.is_valid()) {
+		rd->free_rid(displace_guard_buffer);
+		displace_guard_buffer = RID();
+		displace_guard_capacity = 0;
+	}
+	displace_guard_pending.clear();
 
 	// Free all merged MultiMesh BLAS data.
 	{
@@ -1030,8 +1044,9 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 			entry.cached_surface_counter != p_source.surface_counter ||
 			entry.omm_micromap != entry.built_omm_micromap;
 
+	// Storage: a displaced surface's refit reads the positions its BLAS has (raytracing_displace.glsl's NaN guard).
 	BitField<RD::BufferCreationBits> owned_full_flags = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT |
-			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
+			RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT | RD::BUFFER_CREATION_AS_STORAGE_BIT;
 	BitField<RD::BufferCreationBits> prev_flags = RD::BUFFER_CREATION_AS_STORAGE_BIT |
 			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT;
 
@@ -1432,6 +1447,15 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 	displace_camera_moved = camera_moved;
 	static const float update_distance = GLOBAL_GET("rendering/pathtracing/displacement_update_distance");
 	const uint32_t MAX_UPDATE_PERIOD = 8;
+	// Refits between two builds of a displaced surface. godot3d's forest (wind, D3D12, 2026-10-22): the path tracer traced
+	// as fast with no periodic build at all as with one every 15 refits, which cost 0.25 ms of BLAS builds more; one every
+	// 60 costs ~0.1 ms and bounds the drift of larger motion (a terrain's geomorphing).
+	const uint32_t DISPLACED_REBUILD_PERIOD = 60;
+	// Read every frame, so it can be compared in place; a change builds every displaced surface again, so that both modes
+	// start from clean BLASes.
+	const bool displaced_refit = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/displaced_refit");
+	const bool refit_switched = displaced_refit != displaced_refit_used;
+	displaced_refit_used = displaced_refit;
 	const Vector3 camera_origin = p_render_data->scene_data->cam_transform.origin;
 	displace_camera_transform = p_render_data->scene_data->cam_transform;
 	displace_camera_projection = p_render_data->scene_data->cam_projection;
@@ -1457,13 +1481,16 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 
 	struct Job {
 		RTDeformedCacheEntry *entry = nullptr;
+		RID handle;
 		RID shader;
 		RID pipeline;
 		RID material_buffer;
+		RID blas_positions; // A refit's: the positions its BLAS has.
 		uint32_t vertex_count = 0;
 	};
 	LocalVector<Job> jobs;
 	LocalVector<RT_DisplaceJob> job_data;
+	displaced_refitted = 0;
 
 	const PagedArray<RenderGeometryInstance *> &rt_instances = *p_render_data->rt_instances;
 	for (uint32_t i = 0; i < (uint32_t)rt_instances.size(); i++) {
@@ -1511,7 +1538,10 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			RTDeformedCacheEntry *entry = _access_deformed_slot(surf->rt_deformed_handle);
 			// An instance uniform animated by a script (a wall growing out of the ground) moves the geometry too.
 			const uint32_t instance_uniforms_hash = material_storage->global_shader_parameters_instance_hash(inst->shader_uniforms_offset);
-			bool evaluate = entry->displaced_frame == 0 || entry->displaced_slot != mat_data->rt_sbt_offset || entry->displaced_transform != inst->transform;
+			const bool first = entry->displaced_frame == 0;
+			bool reshaped = first || entry->displaced_slot != mat_data->rt_sbt_offset || entry->displaced_transform != inst->transform;
+			// A refit kept vertices vertex() turned on or off: built again now, even if nothing else moves.
+			bool evaluate = reshaped || entry->displaced_guard_rebuild || refit_switched;
 			if (!evaluate && (entry->displaced_deferred || entry->displaced_material_counter != material_counter || entry->displaced_instance_uniforms_hash != instance_uniforms_hash || cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved))) {
 				// What vertex() keeps moving (TIME, the camera, a parameter set every frame: Terrain3D's geomorphing, an
 				// instance uniform) is evaluated, and its BLAS rebuilt, every frame near the camera and every N frames beyond,
@@ -1537,12 +1567,29 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 				rd->set_resource_name(entry->displaced_vb, "RT displaced VB");
 				entry->displaced_vb_capacity = size;
 				evaluate = true;
+				reshaped = true;
 			}
+			// What can turn triangles on or off builds the BLAS again: a new surface or buffer, another material or a
+			// parameter change, the instance moved (Terrain3D's clipmap: the only time its holes move), another micromap.
+			// Otherwise (TIME, the camera, instance uniforms) it is refit, and every DISPLACED_REBUILD_PERIOD refits built
+			// again, as the BVH of a refit keeps the topology of its build. The refit keeps the triangles' state
+			// (raytracing_displace.glsl). rendering/pathtracing/displaced_refit off builds again every time.
+			const bool rebuild = !displaced_refit || refit_switched || reshaped || entry->displaced_guard_rebuild || entry->displaced_refits >= DISPLACED_REBUILD_PERIOD ||
+					entry->displaced_material_counter != material_counter || !entry->ptr || !rd->acceleration_structure_is_valid(entry->ptr->blas) || !entry->blas_built_once ||
+					!entry->owned_vb_full.is_valid() || entry->cached_vertex_count != vertex_count || entry->omm_micromap != entry->built_omm_micromap;
 			entry->displaced_frame = current_frame;
-			entry->displaced_rebuild = evaluate;
+			entry->displaced_rebuild = evaluate && rebuild;
 			entry->displaced_prev_offset = vertex_count * (3 + tbn_words + 3) * sizeof(uint32_t);
 			if (!evaluate) {
 				continue;
+			}
+			if (rebuild) {
+				// The surfaces built together (a level loaded) take their periodic rebuilds in turns.
+				entry->displaced_refits = first ? uint32_t(surf->rt_deformed_handle.get_id() % DISPLACED_REBUILD_PERIOD) : 0;
+				entry->displaced_guard_rebuild = false;
+			} else {
+				entry->displaced_refits++;
+				displaced_refitted++;
 			}
 			entry->displaced_stamp++;
 			entry->displaced_deferred = false;
@@ -1574,11 +1621,14 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			data.tbn_words = tbn_words;
 			data.instance_uniforms_ofs = uint32_t(inst->shader_uniforms_offset);
 			data.mm_instance_count = 0;
+			data.refit_guard = rebuild ? 0 : 1;
 			job_data.push_back(data);
 
 			mat_ubo_pool_ensure_initialized();
 			Job job;
 			job.entry = entry;
+			job.handle = surf->rt_deformed_handle;
+			job.blas_positions = rebuild ? RID() : entry->owned_vb_full;
 			job.shader = program_shader;
 			job.pipeline = pipeline;
 			job.material_buffer = mat_data->uniform_buffer.is_valid() ? mat_data->uniform_buffer : mat_ubo_pool_buffer;
@@ -1610,6 +1660,25 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 		rd->set_resource_name(displace_job_buffer, "RT displace jobs");
 	}
 	rd->buffer_update(displace_job_buffer, 0, job_data.size() * sizeof(RT_DisplaceJob), job_data.ptr());
+	if (displace_guard_capacity < displace_job_capacity) {
+		if (displace_guard_buffer.is_valid()) {
+			rd->free_rid(displace_guard_buffer);
+		}
+		displace_guard_capacity = displace_job_capacity;
+		displace_guard_buffer = rd->storage_buffer_create(displace_guard_capacity * sizeof(uint32_t));
+		rd->set_resource_name(displace_guard_buffer, "RT displace guard counts");
+	}
+	const uint32_t guard_size = jobs.size() * sizeof(uint32_t);
+	LocalVector<RID> guard_handles;
+	for (const Job &job : jobs) {
+		if (job.blas_positions.is_valid()) {
+			guard_handles.resize(jobs.size());
+			break;
+		}
+	}
+	if (!guard_handles.is_empty()) {
+		rd->buffer_clear(displace_guard_buffer, 0, guard_size);
+	}
 
 	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(displace_job_buffer);
 
@@ -1632,9 +1701,14 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 		RD::Uniform mm_transforms(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, lod_view_dummy_buffer);
 		RD::Uniform mm_remap(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, lod_view_dummy_buffer);
 		RD::Uniform mm_previous(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, displace_dummy_buffer);
-		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous }, job.shader, 3, /*p_linear_pool=*/true);
+		RD::Uniform blas_positions(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, job.blas_positions.is_valid() ? job.blas_positions : lod_view_dummy_buffer);
+		RD::Uniform guard_counts(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, displace_guard_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous, blas_positions, guard_counts }, job.shader, 3, /*p_linear_pool=*/true);
 		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
 		job_sets.push_back(job_set);
+		if (job.blas_positions.is_valid()) {
+			guard_handles[i] = job.handle;
+		}
 
 		const uint32_t push_constant[4] = { i, 0, 0, 0 };
 		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
@@ -1644,7 +1718,39 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 	for (const RID &job_set : job_sets) {
 		rd->free_rid(job_set);
 	}
+	if (!guard_handles.is_empty()) {
+		// Read when the GPU is done with the frame, without waiting for it.
+		displace_guard_serial++;
+		displace_guard_pending.insert(displace_guard_serial, guard_handles);
+		rd->buffer_get_data_async(displace_guard_buffer, callable_mp_static(&RenderRaytracing::_displace_guard_arrived_static).bind(displace_guard_serial), 0, guard_size);
+	}
 	RD::get_singleton()->draw_command_end_label();
+}
+
+void RenderRaytracing::_displace_guard_arrived_static(const Vector<uint8_t> &p_data, uint64_t p_serial) {
+	if (displace_guard_target) {
+		displace_guard_target->_displace_guard_arrived(p_data, p_serial);
+	}
+}
+
+void RenderRaytracing::_displace_guard_arrived(const Vector<uint8_t> &p_data, uint64_t p_serial) {
+	const LocalVector<RID> *handles = displace_guard_pending.getptr(p_serial);
+	if (!handles) {
+		return;
+	}
+	const uint32_t *counts = reinterpret_cast<const uint32_t *>(p_data.ptr());
+	const uint32_t count = MIN(handles->size(), uint32_t(p_data.size() / sizeof(uint32_t)));
+	for (uint32_t i = 0; i < count; i++) {
+		if (counts[i] == 0 || !(*handles)[i].is_valid()) {
+			continue;
+		}
+		RTDeformedCacheEntry *entry = deformed_pool.get_or_null((*handles)[i]);
+		if (entry) {
+			entry->displaced_guard_rebuild = true;
+			displaced_guard_rebuilds++;
+		}
+	}
+	displace_guard_pending.erase(p_serial);
 }
 
 LocalVector<RD::Uniform> RenderRaytracing::_displace_frame_uniforms(RID p_job_buffer) {
@@ -2083,7 +2189,10 @@ void RenderRaytracing::_displace_merged_multimeshes() {
 		RD::Uniform mm_transforms(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, request.mm_gpu_buffer);
 		RD::Uniform mm_remap(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, request.remap_buffer.is_valid() ? request.remap_buffer : lod_view_dummy_buffer);
 		RD::Uniform mm_previous(RD::UNIFORM_TYPE_STORAGE_BUFFER, 4, request.merged_prev_buffer);
-		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous }, job.shader, 3, /*p_linear_pool=*/true);
+		// A merged MultiMesh folds removed points onto the origin, it needs no guard.
+		RD::Uniform blas_positions(RD::UNIFORM_TYPE_STORAGE_BUFFER, 5, lod_view_dummy_buffer);
+		RD::Uniform guard_counts(RD::UNIFORM_TYPE_STORAGE_BUFFER, 6, displace_dummy_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ output, material, mm_transforms, mm_remap, mm_previous, blas_positions, guard_counts }, job.shader, 3, /*p_linear_pool=*/true);
 		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
 		job_sets.push_back(job_set);
 
@@ -4922,6 +5031,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				int(RD::get_singleton()->get_memory_usage(RD::MEMORY_BUFFERS) >> 20), int(RD::get_singleton()->get_memory_usage(RD::MEMORY_TEXTURES) >> 20)));
 		const SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
 		print_line(vformat("RTCACHES out of view: %d BLAS updates waiting for their turn", out_of_view_deferred));
+		print_line(vformat("RTCACHES displaced: %d refit, %d guard rebuilds since the previous log", displaced_refitted, displaced_guard_rebuilds));
+		displaced_guard_rebuilds = 0;
 		print_line(vformat("RTCACHES frame %d: TLAS %d instances, %d BLAS builds, %d refits | displaced %d (%d vertices), %d deferred | surfaces %d, merged MultiMeshes %d, deformed %d, LOD views %d, materials %d, dedicated UBOs %d | hit groups %d, pipeline swaps %d | video %d MB",
 				RSG::rasterizer->get_frame_number(), tlas_instance_count, rt_blas_builds, rt_blas_refits,
 				displaced_evaluated, int64_t(displaced_vertices), displaced_deferred,
