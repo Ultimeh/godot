@@ -3279,6 +3279,9 @@
 			Distance from the camera within which the path tracer updates every frame a mesh surface whose material's [code]vertex()[/code] function keeps moving it: it uses [code]TIME[/code], reads the moving camera, or has a shader parameter set every frame (such as a terrain's geomorphing). Beyond this distance the surface is updated once every [code]N[/code] frames, [code]N[/code] being its distance divided by this value, up to 8, which saves the evaluation of its vertices and the rebuild of its acceleration structure on the other frames. Set to [code]0.0[/code] to update every such surface every frame.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/light_sampling_ris" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], the path tracer picks the light it samples at each surface in proportion to the light that light can bring there (its energy, distance, spot cone and angle), among every light in the scene it traces: a strong light among many weak ones (a sun shaft among torches) is sampled almost every time instead of now and then, and the image is much less noisy. If [code]false[/code], it picks uniformly among the lights in range (for comparison). Both converge to the same image. Read every frame; changing it rebuilds nothing.
+		</member>
 		<member name="rendering/pathtracing/multimesh_blas_cache_ttl_frames" type="int" setter="" getter="" default="3600">
 			Number of frames a merged MultiMesh BLAS is kept alive in the path tracer cache after its last visible frame. At 60 fps, the default of 3600 corresponds to approximately one minute. Once this threshold is exceeded the BLAS and all merged vertex, attribute, and index buffers are freed. Decrease this value to reclaim GPU memory when MultiMeshes disappear from the scene.
 			[b]Note:[/b] Requires a restart to take effect.

@@ -10,10 +10,8 @@
 #define RT_LIGHT_TYPE_DIRECTIONAL 1 // Sun/moon with angular size
 #define RT_LIGHT_TYPE_SPOT 3 // Spot light with cone falloff
 
-// Reservoir sampling batch size for stochastic light selection.
-#ifndef RT_LIGHT_RESERVOIR_SIZE
-#define RT_LIGHT_RESERVOIR_SIZE 16
-#endif
+// Lights drawn as candidates for the choice of light after the first bounce (lights_evaluate_direct_lighting()).
+#define RT_LIGHT_RIS_CANDIDATES 8u
 
 // ============================================================================
 // Light Data (matches C++ RT_LightData, 128 bytes, std430)
@@ -289,8 +287,67 @@ vec3 lights_backlight_term(vec3 p_brdf_diffuse, MaterialProperties p_material, v
 	return max(diffuse_reflectance * ONE_OVER_PI - p_brdf_diffuse, vec3(0.0)) * p_backlight;
 }
 
-// Evaluate direct lighting using NEE with stochastic light selection.
-// Uses mini-batch reservoir sampling for importance-weighted light selection.
+// The weight a light is picked by (resampled importance sampling, below): its unshadowed contribution at the point,
+// estimated from the light's center (luminance of the emission, distance attenuation, spot cone, cosine). It is 0 only
+// where the light cannot light the point (other layers, out of range, the whole light outside the spot cone, behind a
+// surface without BACKLIGHT), so the estimate stays unbiased; elsewhere a floor on the cosine keeps it above 0 where a
+// light with a size can still reach the point while its center cannot.
+float lights_target_weight(RTLightData p_light, vec3 p_hit_pos, vec3 p_N, bool p_has_backlight, bool p_is_indirect, uint p_layer_mask) {
+	if ((p_light.cull_mask & p_layer_mask) == 0u) {
+		return 0.0;
+	}
+	// A negative light (Light3D.light_negative) takes light away: weighted by its magnitude.
+	float weight = abs(dot(p_light.emission, vec3(0.2126, 0.7152, 0.0722))) * (p_is_indirect ? p_light.indirect_energy : 1.0);
+	vec3 L;
+	float sin_size;
+	if (p_light.type == RT_LIGHT_TYPE_DIRECTIONAL) {
+		L = -normalize(p_light.position);
+		sin_size = sin(p_light.radius);
+	} else {
+		vec3 to_light = p_light.position - p_hit_pos;
+		float dist_sq = dot(to_light, to_light);
+		if (p_light.max_range_squared != 0.0 && dist_sq > p_light.max_range_squared) {
+			return 0.0;
+		}
+		float dist = sqrt(dist_sq);
+		L = to_light / max(dist, 0.0001);
+		sin_size = p_light.radius > 0.01 ? clamp(p_light.radius / max(dist, 0.0001), 0.0, 1.0) : 0.0;
+		LightSample ls_atten;
+		ls_atten.distance_sq = dist_sq;
+		weight *= lights_get_attenuation(ls_atten, p_light.inv_max_range, p_light.attenuation);
+		if (p_light.type == RT_LIGHT_TYPE_SPOT) {
+			float scos = dot(-L, p_light.spot_direction);
+			if (sin_size == 0.0) {
+				if (scos <= p_light.cos_spot_angle) {
+					return 0.0;
+				}
+				float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - p_light.cos_spot_angle));
+				weight *= 1.0 - pow(spot_rim, p_light.inv_spot_attenuation);
+			} else if (acos(clamp(scos, -1.0, 1.0)) - asin(sin_size) >= acos(p_light.cos_spot_angle)) {
+				return 0.0; // Every point of the sphere is outside the cone.
+			}
+		}
+	}
+	float cos_theta = dot(p_N, L);
+	if (p_has_backlight) {
+		cos_theta = abs(cos_theta);
+	} else if (sin_size == 0.0 && cos_theta <= 0.0) {
+		return 0.0;
+	}
+	return weight * max(cos_theta, 0.05);
+}
+
+vec3 lights_evaluate_light(RTLightData light, vec3 hit_pos, vec3 hit_pos_back, vec3 geometry_normal, vec3 N, vec3 V, MaterialProperties material, vec3 backlight, bool specular_disabled, inout uint rng_state, bool is_indirect_bounce);
+
+// Evaluate direct lighting using NEE: one light, picked among all of them in proportion to lights_target_weight()
+// (resampled importance sampling with every light as a candidate: Talbot et al. 2005, "Importance Resampling for Global
+// Illumination"; Bitterli et al. 2020, "Spatiotemporal reservoir resampling", section 3), and one shadow ray toward it.
+// The estimate f(y) * sum(w) / w(y) is unbiased: the weight is above 0 wherever the light's contribution can be
+// (measured: the mean matches every light summed, each with its shadow ray, within the noise).
+// Every invocation walks the lights in the same order: the loads are uniform across a wave. Without
+// rendering/pathtracing/light_sampling_ris (RT_PARAM_FLAG_LIGHT_SAMPLING_RIS), the light is picked uniformly among those
+// in range, as before: a strong light among many weak ones is then sampled now and then, and its light is noise (and
+// that choice came out 0.6 % darker than every light summed on a sunlit wall, a cause not looked into).
 // A light behind the surface reaches it only through BACKLIGHT, and its shadow ray then leaves from hit_pos_back, on
 // that side of the surface.
 vec3 lights_evaluate_direct_lighting(
@@ -304,6 +361,7 @@ vec3 lights_evaluate_direct_lighting(
 		bool specular_disabled,
 		inout uint rng_state,
 		bool is_indirect_bounce,
+		bool is_camera_hit,
 		uint light_count,
 		uint layer_mask) {
 	bool has_backlight = any(greaterThan(backlight, vec3(0.0)));
@@ -311,44 +369,87 @@ vec3 lights_evaluate_direct_lighting(
 		return vec3(0.0);
 	}
 
-	// Mini-batch reservoir sampling: sample k lights, pick the best valid one.
-	const uint k = uint(min(RT_LIGHT_RESERVOIR_SIZE, int(light_count)));
-	uint valid_found = 0u;
 	uint selected_idx = 0u;
-
-	for (uint i = 0u; i < k; i++) {
-		uint idx = min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
-		RTLightData test_light = rt_lights[idx];
-
-		// Range check for positional lights; a light lights only the layers of its cull mask.
-		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT);
-		bool is_valid = !is_positional;
-		if ((test_light.cull_mask & layer_mask) == 0u) {
-			continue;
-		}
-		if (!is_valid) {
-			vec3 to_l = test_light.position - hit_pos;
-			float d2 = dot(to_l, to_l);
-			is_valid = (test_light.max_range_squared == 0.0 || d2 <= test_light.max_range_squared);
-		}
-
-		if (is_valid) {
-			valid_found++;
-			if (rand(rng_state) < 1.0 / float(valid_found)) {
+	float light_select_pdf; // The probability the light was picked with.
+	if ((uint(get_rt_param(RT_PARAM_FLAGS)) & RT_PARAM_FLAG_LIGHT_SAMPLING_RIS) != 0u) {
+		// One reservoir (weighted reservoir sampling, Bitterli et al. 2020, algorithm 2; one random number per candidate).
+		// The surface the camera sees takes every light (at most RT_LIGHTS_MAX) as a candidate: there the noise shows.
+		// Later bounces take RT_LIGHT_RIS_CANDIDATES drawn uniformly, a fixed cost whatever the number of lights: every
+		// light at every bounce cost 3 ms with 64 lights at 3 bounces (godot3d's Drowned Ossuary). With candidates drawn
+		// with probability 1 / light_count, each weighs w * light_count and the pick's probability is w * M / sum
+		// (resampled importance sampling with M candidates, Talbot et al. 2005).
+		const bool every_light = is_camera_hit || light_count <= RT_LIGHT_RIS_CANDIDATES;
+		const uint candidates = every_light ? light_count : RT_LIGHT_RIS_CANDIDATES;
+		float weight_sum = 0.0;
+		float selected_weight = 0.0;
+		for (uint i = 0u; i < candidates; i++) {
+			uint idx = every_light ? i : min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
+			float w = lights_target_weight(rt_lights[idx], hit_pos, N, has_backlight, is_indirect_bounce, layer_mask);
+			if (w <= 0.0) {
+				continue;
+			}
+			float wi = every_light ? w : w * float(light_count);
+			weight_sum += wi;
+			if (rand(rng_state) * weight_sum < wi) {
 				selected_idx = idx;
+				selected_weight = w;
 			}
 		}
+		if (selected_weight <= 0.0) {
+			return vec3(0.0);
+		}
+		light_select_pdf = selected_weight * (every_light ? 1.0 : float(candidates)) / weight_sum;
+	} else {
+		// rendering/pathtracing/light_sampling_ris off (for comparison): k lights drawn uniformly, one of those in range
+		// kept uniformly, the count of lights in range estimated from the draws.
+		const uint k = min(16u, light_count);
+		uint valid_found = 0u;
+		for (uint i = 0u; i < k; i++) {
+			uint idx = min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
+			RTLightData test_light = rt_lights[idx];
+
+			// Range check for positional lights; a light lights only the layers of its cull mask.
+			bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT);
+			bool is_valid = !is_positional;
+			if ((test_light.cull_mask & layer_mask) == 0u) {
+				continue;
+			}
+			if (!is_valid) {
+				vec3 to_l = test_light.position - hit_pos;
+				float d2 = dot(to_l, to_l);
+				is_valid = (test_light.max_range_squared == 0.0 || d2 <= test_light.max_range_squared);
+			}
+
+			if (is_valid) {
+				valid_found++;
+				if (rand(rng_state) < 1.0 / float(valid_found)) {
+					selected_idx = idx;
+				}
+			}
+		}
+		if (valid_found == 0u) {
+			return vec3(0.0);
+		}
+		light_select_pdf = 1.0 / max(float(light_count) * (float(valid_found) / float(k)), 1.0);
 	}
 
-	if (valid_found == 0u) {
-		return vec3(0.0);
-	}
+	return lights_evaluate_light(rt_lights[selected_idx], hit_pos, hit_pos_back, geometry_normal, N, V, material, backlight, specular_disabled, rng_state, is_indirect_bounce) / max(light_select_pdf, 1e-10);
+}
 
-	// Estimate valid count from sample ratio, PDF = 1/validCount.
-	float valid_count_estimate = float(light_count) * (float(valid_found) / float(k));
-	float light_select_pdf = 1.0 / max(valid_count_estimate, 1.0);
-
-	RTLightData light = rt_lights[selected_idx];
+// The light one light brings to the point, before the probability of having picked it: one shadow ray toward it.
+vec3 lights_evaluate_light(
+		RTLightData light,
+		vec3 hit_pos,
+		vec3 hit_pos_back,
+		vec3 geometry_normal,
+		vec3 N,
+		vec3 V,
+		MaterialProperties material,
+		vec3 backlight,
+		bool specular_disabled,
+		inout uint rng_state,
+		bool is_indirect_bounce) {
+	bool has_backlight = any(greaterThan(backlight, vec3(0.0)));
 	vec2 u = rand2(rng_state);
 
 	// === POSITIONAL LIGHT PATH (omni + spot) ===
@@ -416,8 +517,7 @@ vec3 lights_evaluate_direct_lighting(
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * visibility;
-		return contribution / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * atten * indirect_mul * visibility;
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
@@ -452,6 +552,6 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * projector * indirect_mul * visibility / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * projector * indirect_mul * visibility;
 	}
 }

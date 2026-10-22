@@ -5743,6 +5743,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRONT_LAYER_COUNT] = float(front_layer_instance_count);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PROCEDURAL_MASKS] = float(procedural_instance_masks);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ENV_SAMPLING] = sky_sampling ? 1.0 : 0.0;
+		uint32_t rt_param_flags = 0;
+		if (GLOBAL_GET_CACHED(bool, "rendering/pathtracing/light_sampling_ris")) {
+			rt_param_flags |= SceneShaderRaytracing::RT_PARAM_FLAG_LIGHT_SAMPLING_RIS;
+		}
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FLAGS] = float(rt_param_flags);
 		if (p_background_is_color) {
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 0] = p_background_color.r;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 1] = p_background_color.g;

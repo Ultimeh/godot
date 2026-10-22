@@ -100,7 +100,11 @@ public:
 	static constexpr int RT_PARAM_ENV_SAMPLING = 7; // 1: the sky sampling distribution (binding 40) was built this frame.
 	static constexpr int RT_PARAM_BACKGROUND_COLOR = 8; // 8-10: linear RGB, with the background energy.
 	static constexpr int RT_PARAM_BACKGROUND_COLOR_USED = 11;
-	static constexpr int RT_PARAM_REFLECTION_BACKGROUND = 12; // 1: REFLECTION_SOURCE_BG with a color background. 13 reserved.
+	static constexpr int RT_PARAM_REFLECTION_BACKGROUND = 12; // 1: REFLECTION_SOURCE_BG with a color background.
+	// RT_PARAM_FLAG_* bits: switches changed at runtime, read by the shaders (not in the pipeline variant key, so toggling
+	// one rebuilds nothing). The 16 slots are all taken: a later live switch takes the next bit here.
+	static constexpr int RT_PARAM_FLAGS = 13;
+	static constexpr uint32_t RT_PARAM_FLAG_LIGHT_SAMPLING_RIS = 1u << 0; // rendering/pathtracing/light_sampling_ris.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 
