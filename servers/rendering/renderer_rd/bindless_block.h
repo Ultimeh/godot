@@ -83,4 +83,5 @@ private:
 	uint64_t secondary_textures_versions[SECONDARY_LAYOUT_MAX] = {};
 
 	RID _create_uniform_set(RID p_shader, uint32_t p_set_index);
+	bool _scrub_dead_textures();
 };

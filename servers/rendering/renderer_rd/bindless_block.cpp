@@ -53,28 +53,33 @@ void BindlessBlock::begin_frame() {
 	}
 
 	// Uniform set was externally invalidated (a texture was destroyed/recreated).
-	// Scrub dead RIDs: replace with default and add slots to the freelist.
 	uniform_set = RID();
-
-	texture_to_index.clear();
-	texture_to_index[default_texture] = 0;
+	_scrub_dead_textures();
 	textures_version++;
-
-	for (uint32_t i = 1; i < textures.size(); i++) {
-		if (!rd->texture_is_valid(textures[i])) {
-			textures[i] = default_texture;
-			if (free_indices_count < free_indices.size()) {
-				free_indices[free_indices_count] = i;
-			} else {
-				free_indices.push_back(i);
-			}
-			++free_indices_count;
-		} else {
-			texture_to_index[textures[i]] = i;
-		}
-	}
-
 	needs_refinalize = true;
+}
+
+// Replaces the textures destroyed since they were added with the default texture and frees their slots. Returns whether
+// any was. begin_frame() only scrubs when the uniform set was invalidated, which misses a texture added after the set was
+// created and destroyed before the next one (textures replaced while a map loads): uniform_set_create() then failed on
+// it ("is not a valid texture"), and the tracer went a frame without its textures.
+bool BindlessBlock::_scrub_dead_textures() {
+	bool scrubbed = false;
+	for (uint32_t i = 1; i < textures.size(); i++) {
+		if (textures[i] == default_texture || rd->texture_is_valid(textures[i])) {
+			continue;
+		}
+		texture_to_index.erase(textures[i]);
+		textures[i] = default_texture;
+		if (free_indices_count < free_indices.size()) {
+			free_indices[free_indices_count] = i;
+		} else {
+			free_indices.push_back(i);
+		}
+		++free_indices_count;
+		scrubbed = true;
+	}
+	return scrubbed;
 }
 
 uint32_t BindlessBlock::add_texture(RID p_texture) {
@@ -148,6 +153,10 @@ RID BindlessBlock::get_secondary_uniform_set(RID p_shader, uint32_t p_set_index,
 }
 
 RID BindlessBlock::_create_uniform_set(RID p_shader, uint32_t p_set_index) {
+	if (_scrub_dead_textures()) {
+		textures_version++;
+	}
+
 	RD::Uniform u;
 	u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 	u.binding = 0;
