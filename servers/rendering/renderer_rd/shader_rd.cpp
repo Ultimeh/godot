@@ -33,10 +33,12 @@
 #include "core/config/engine.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/object/callable_mp.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "core/string/string_builder.h"
 #include "core/version.h"
+#include "servers/rendering/rendering_server.h"
 #include "servers/rendering/shader_include_db.h"
 
 #define ENABLE_SHADER_CACHE 1
@@ -261,6 +263,22 @@ void ShaderRD::_initialize_version(Version *p_version) {
 	p_version->group_loaded_from_cache.resize_initialized(group_enabled.size());
 }
 
+// RenderingDevice frees only on the render thread, but a version is also cleared and recompiled by whichever thread
+// validates it: mesh_create_from_surfaces() checks its materials' shaders on the loading thread, and a shader whose code
+// changed since its last use is recompiled there, its old variants freed. Those frees go to the render thread.
+void ShaderRD::_free_variant(RID p_variant) {
+	RenderingServer *rs = RenderingServer::get_singleton();
+	if (rs && !rs->is_on_render_thread()) {
+		rs->call_on_render_thread(callable_mp_static(&ShaderRD::_free_variant_on_render_thread).bind(p_variant));
+	} else {
+		RD::get_singleton()->free_rid(p_variant);
+	}
+}
+
+void ShaderRD::_free_variant_on_render_thread(RID p_variant) {
+	RD::get_singleton()->free_rid(p_variant);
+}
+
 void ShaderRD::_clear_version(Version *p_version) {
 	_compile_ensure_finished(p_version);
 
@@ -268,7 +286,7 @@ void ShaderRD::_clear_version(Version *p_version) {
 	if (!p_version->variants.is_empty()) {
 		for (int i = 0; i < variant_defines.size(); i++) {
 			if (p_version->variants[i].is_valid()) {
-				RD::get_singleton()->free_rid(p_version->variants[i]);
+				_free_variant(p_version->variants[i]);
 			}
 		}
 
@@ -763,7 +781,7 @@ void ShaderRD::_compile_version_end(Version *p_version, int p_group) {
 				continue; // Disabled.
 			}
 			if (!p_version->variants[i].is_null()) {
-				RD::get_singleton()->free_rid(p_version->variants[i]);
+				_free_variant(p_version->variants[i]);
 			}
 		}
 

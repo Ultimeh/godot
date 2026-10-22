@@ -107,6 +107,8 @@ private:
 	void _compile_version_end(Version *p_version, int p_group);
 	void _compile_ensure_finished(Version *p_version);
 	void _allocate_placeholders(Version *p_version, int p_group);
+	static void _free_variant(RID p_variant);
+	static void _free_variant_on_render_thread(RID p_variant);
 
 	RID_Owner<Version, true> version_owner;
 	Mutex versions_mutex;
