@@ -453,7 +453,9 @@ public:
 		LocalVector<PipelineBuildTask *> queue;
 	};
 
-	uint32_t register_custom_shader(uint32_t p_shader_id, RID p_material);
+	// 0 for the default hit group; r_failed: the material's shader cannot run in a hit group (an unsupported texture type,
+	// a compile error), so the default one stands in for it.
+	uint32_t register_custom_shader(uint32_t p_shader_id, RID p_material, bool *r_failed = nullptr);
 	uint32_t register_procedural_shader(uint32_t p_shader_id, RID p_material);
 
 	const CustomShaderEntry *get_custom_shader_entry(uint32_t p_slot_index) const;
@@ -491,7 +493,7 @@ public:
 
 private:
 	// Source-hash slot management.
-	uint32_t _register_slot(uint32_t p_shader_id, RID p_material, bool p_is_procedural);
+	uint32_t _register_slot(uint32_t p_shader_id, RID p_material, bool p_is_procedural, bool *r_failed = nullptr);
 	bool _preprocess_shader(RID p_material, bool p_is_procedural, CustomShaderEntry &r_entry);
 	void _strip_texture_globals(String &r_globals, const String &p_tex_name);
 	bool _finalize_uniforms_with_textures(CustomShaderEntry &r_entry, const ShaderCompiler::GeneratedCode &p_gen_code, const HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> &p_uniforms, bool p_strip_intersection_globals);

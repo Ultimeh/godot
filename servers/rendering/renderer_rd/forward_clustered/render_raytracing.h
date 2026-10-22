@@ -428,6 +428,7 @@ struct RTMaterialData {
 	uint32_t global_buffer_index = UINT32_MAX;
 	uint32_t rt_sbt_offset = 0;
 	bool is_custom_shader = false;
+	bool shader_failed = false; // A custom shader no hit group can run (SceneShaderRaytracing::register_custom_shader()).
 	RID uniform_buffer; // Buffer pointer for mats > 512 bytes.
 	uint32_t uniform_buffer_size = 0; // Its size: a rebuild of the same size updates it in place.
 	uint32_t uniform_pool_slot = UINT32_MAX; // Index into the material UBO pool, or UINT32_MAX (unused)
@@ -950,6 +951,8 @@ class RenderRaytracing {
 	static bool _omm_enabled();
 	// The material a surface is traced with while its custom shader's hit group compiles, or null to leave it out.
 	RTMaterialData *_compiling_material_fallback(const RTMaterialData *p_mat_data, bool p_cut_out);
+	// A surface of the raster transparent pass that the front layer rays leave out.
+	static bool _front_layer_skipped(const void *p_surf);
 	// Whether a MultiMesh surface goes into a merged BLAS (_build_merged_mm_blas()), or one TLAS instance per instance.
 	bool _mm_fits_merged_blas(void *p_mesh_surface, uint32_t p_mm_count, const RTLodView *p_lod_view) const;
 	bool _build_merged_mm_blas(

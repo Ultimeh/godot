@@ -762,15 +762,18 @@ bool SceneShaderRaytracing::_finalize_uniforms_with_textures(
 
 // Slot table: append-only by 128-bit source hash (stable across reloads).
 
-uint32_t SceneShaderRaytracing::register_custom_shader(uint32_t /*p_shader_id*/, RID p_material) {
-	return _register_slot(/*p_shader_id*/ 0, p_material, /*p_is_procedural=*/false);
+uint32_t SceneShaderRaytracing::register_custom_shader(uint32_t /*p_shader_id*/, RID p_material, bool *r_failed) {
+	return _register_slot(/*p_shader_id*/ 0, p_material, /*p_is_procedural=*/false, r_failed);
 }
 
 uint32_t SceneShaderRaytracing::register_procedural_shader(uint32_t /*p_shader_id*/, RID p_material) {
 	return _register_slot(/*p_shader_id*/ 0, p_material, /*p_is_procedural=*/true);
 }
 
-uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_material, bool p_is_procedural) {
+uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_material, bool p_is_procedural, bool *r_failed) {
+	if (r_failed) {
+		*r_failed = false;
+	}
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	SourceHash128 hash;
 	hash.a = material_storage->material_get_shader_code_rt_hash(p_material);
@@ -781,6 +784,9 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 
 	HashMap<SourceHash128, uint32_t, SourceHash128Hasher>::Iterator it = source_hash_to_slot.find(hash);
 	if (it != source_hash_to_slot.end()) {
+		if (r_failed) {
+			*r_failed = hit_group_slots[it->value].state == HGState::Failed;
+		}
 		return it->value;
 	}
 
@@ -799,6 +805,9 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 		for (KeyValue<uint32_t, PipelineBundle> &kv : pipeline_bundles) {
 			_bundle_resize_for_slots(kv.value);
 			kv.value.per_hg_states[failed_index] = HGState::Failed;
+		}
+		if (r_failed) {
+			*r_failed = true;
 		}
 		return 0;
 	}

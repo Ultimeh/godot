@@ -347,6 +347,10 @@ public:
 			return rt ? rt->cull_mode : cull_mode;
 		}
 
+		_FORCE_INLINE_ DepthTest rt_depth_test() const {
+			return rt ? rt->depth_test : depth_test;
+		}
+
 		_FORCE_INLINE_ bool uses_shared_shadow_material() const {
 			bool backface_culling = cull_mode == RSE::CULL_MODE_BACK;
 			return !uses_particle_trails && !writes_modelview_or_projection && !uses_vertex && !uses_position && !uses_discard && !uses_depth_prepass_alpha && !uses_alpha_clip && !uses_alpha_antialiasing && backface_culling && !uses_point_size && !uses_world_coordinates && !wireframe && !uses_z_clip_scale && !stencil_enabled;

@@ -1400,6 +1400,18 @@ static void _rt_dispatch_linear(RenderingDevice *p_rd, RD::ComputeListID p_compu
 	p_rd->compute_list_dispatch(p_compute_list, x, Math::division_round_up(groups, x), 1);
 }
 
+// The front layer rays (build_tlas()) leave out an unshaded transparent surface: it has no
+// reflection. One drawn without the depth test is not where its triangles are: raster draws it over everything, from its
+// fragment code (a decal or a volume projected from the depth buffer, in a box drawn cull_front). Traced, its box hid the
+// surfaces behind it, which lost their reflection, and lent its own to the water where its walls cross it (godot3d's
+// Rot Blossom: a dark outline on the water).
+bool RenderRaytracing::_front_layer_skipped(const void *p_surf) {
+	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf =
+			static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
+	return !surf->shader || surf->shader->unshaded ||
+			surf->shader->rt_depth_test() != SceneShaderForwardClustered::ShaderData::DEPTH_TEST_ENABLED;
+}
+
 // ---------------------------------------------------------------------------
 // Displacement by material vertex() code
 // ---------------------------------------------------------------------------
@@ -1463,9 +1475,9 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 		}
 
 		for (const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches; surf; surf = surf->next) {
-			// Transparent surfaces too, as build_tlas() traces them for their reflections; not the unshaded ones.
+			// Transparent surfaces too, as build_tlas() traces them for their reflections; not those it leaves out.
 			const bool front_layer = surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA;
-			if ((front_layer && (!surf->shader || surf->shader->unshaded)) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
+			if ((front_layer && _front_layer_skipped(surf)) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
 				continue;
 			}
 			const RID material_rid = surface_material(surf);
@@ -2486,7 +2498,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		if (entry->ptr->is_custom_shader) {
 			uint32_t shader_id = RendererRD::MaterialStorage::get_singleton()->material_get_shader_id(p_material_rid);
 			uint32_t old_sbt = entry->ptr->rt_sbt_offset;
-			uint32_t new_sbt = SceneShaderRaytracing::get_singleton()->register_custom_shader(shader_id, p_material_rid);
+			uint32_t new_sbt = SceneShaderRaytracing::get_singleton()->register_custom_shader(shader_id, p_material_rid, &entry->ptr->shader_failed);
 			entry->ptr->rt_sbt_offset = new_sbt;
 			// HG slot change invalidates cached UBO layout / BDA.
 			if (old_sbt != new_sbt) {
@@ -2610,10 +2622,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.albedo_color[3] = c.a;
 		mat_data->rt_sbt_offset = 0;
 		mat_data->is_custom_shader = false;
+		mat_data->shader_failed = false;
 	} else {
 		mat_data->is_custom_shader = true;
 		uint32_t shader_id = material_storage->material_get_shader_id(p_material_rid);
-		mat_data->rt_sbt_offset = SceneShaderRaytracing::get_singleton()->register_custom_shader(shader_id, p_material_rid);
+		mat_data->rt_sbt_offset = SceneShaderRaytracing::get_singleton()->register_custom_shader(shader_id, p_material_rid, &mat_data->shader_failed);
 
 		const SceneShaderRaytracing::CustomShaderEntry *cse =
 				SceneShaderRaytracing::get_singleton()->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -4329,10 +4342,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
-			// Surfaces of the raster transparent pass are only seen by the front layer rays, for their reflections; an
-			// unshaded one has none.
+			// Surfaces of the raster transparent pass are only seen by the front layer rays, for their reflections.
 			const bool front_layer = surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA;
-			if (front_layer && (!surf->shader || surf->shader->unshaded)) {
+			if (front_layer && _front_layer_skipped(surf)) {
 				surf = surf->next;
 				continue;
 			}
@@ -4414,6 +4426,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
+			// The front layer only gives a transparent surface the reflection its own material shapes; the raster
+			// transparent pass draws it either way. A stand-in (for a shader no hit group can run, or one still
+			// compiling) would hide the surfaces behind it with a reflection of the wrong material: they keep theirs.
+			if (front_layer && mat_data->shader_failed) {
+				surf = surf->next;
+				continue;
+			}
 			// Not the stand-in of a hit group still compiling: its cut-out may be baked.
 			bool material_ready = true;
 
@@ -4421,6 +4440,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 				material_ready = false;
 				request_hit_group(mat_data->rt_sbt_offset, inst->transformed_aabb);
+				if (front_layer) {
+					surf = surf->next;
+					continue;
+				}
 				const SceneShaderForwardClustered::ShaderData *cut_shader = surf->shader;
 				mat_data = _compiling_material_fallback(mat_data, cut_shader && (cut_shader->uses_alpha || cut_shader->uses_blend_alpha || cut_shader->uses_alpha_clip || cut_shader->uses_alpha_antialiasing || cut_shader->uses_discard));
 				if (!mat_data) {
