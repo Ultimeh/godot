@@ -399,6 +399,7 @@ struct RTOmmEntry {
 	uint32_t first_seen_frame = 0; // Baked once the surface lasts: a mesh replaced every frame (sprites) is not.
 	uint32_t last_used_frame = 0;
 	bool failed = false;
+	bool superseded = false; // Its surface or material changed since: no key will ask for it again.
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -921,6 +922,8 @@ class RenderRaytracing {
 	// Opacity micromaps: the cut-outs the any-hit shaders test, baked per surface and material
 	// (rt_alpha_dependencies.h, raytracing_omm_bake.glsl), the surface's BLAS built again with them.
 	HashMap<RTOmmKey, RTOmmEntry, RTOmmKey> omm_entries;
+	// The current key of each {mesh, surface, material, LOD} (the key with its counters at 0): a new one supersedes it.
+	HashMap<RTOmmKey, RTOmmKey, RTOmmKey> omm_current_keys;
 	struct PendingOmmBake {
 		RID shader;
 		RID pipeline;

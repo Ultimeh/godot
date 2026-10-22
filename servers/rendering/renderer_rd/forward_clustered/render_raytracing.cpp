@@ -1719,6 +1719,23 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	static constexpr uint32_t RT_OMM_STABLE_FRAMES = 10;
 	RTOmmEntry *existing = omm_entries.getptr(key);
 	if (!existing) {
+		// The material's counter moves with every parameter or shader change, the surface's with its data: the entry of
+		// the previous key can never be asked for again. Kept until the TTL, every change held one more micromap and its
+		// BLAS (+13 MB per tree surface, a minute of shader swaps under path tracing: +1.6 GB). It goes at the next sweep,
+		// once nothing traced in the current frame uses it.
+		RTOmmKey slot = key;
+		slot.surface_counter = 0;
+		slot.material_counter = 0;
+		RTOmmKey *previous = omm_current_keys.getptr(slot);
+		if (previous) {
+			RTOmmEntry *stale = omm_entries.getptr(*previous);
+			if (stale) {
+				stale->superseded = true;
+			}
+			*previous = key;
+		} else {
+			omm_current_keys.insert(slot, key);
+		}
 		RTOmmEntry &waiting = omm_entries.insert(key, RTOmmEntry())->value;
 		waiting.first_seen_frame = current_frame;
 		waiting.last_used_frame = current_frame;
@@ -1939,13 +1956,23 @@ void RenderRaytracing::_omm_evict(bool p_all) {
 	for (KeyValue<RTOmmKey, RTOmmEntry> &E : omm_entries) {
 		// An entry still waiting to be baked holds nothing: one a second or two old is a surface that did not last.
 		const uint32_t entry_ttl = (E.value.micromap.is_valid() || E.value.failed) ? ttl : 120;
-		if (p_all || current_frame - E.value.last_used_frame > entry_ttl) {
+		// A superseded entry still used in the last frames waits: another viewport may trace it in this frame, or still
+		// ask for it with a counter it read before the change.
+		const bool superseded = E.value.superseded && current_frame - E.value.last_used_frame > 2;
+		if (p_all || superseded || current_frame - E.value.last_used_frame > entry_ttl) {
 			_omm_free_entry(E.value);
 			expired.push_back(E.key);
 		}
 	}
 	for (const RTOmmKey &key : expired) {
 		omm_entries.erase(key);
+		RTOmmKey slot = key;
+		slot.surface_counter = 0;
+		slot.material_counter = 0;
+		const RTOmmKey *current = omm_current_keys.getptr(slot);
+		if (current && *current == key) {
+			omm_current_keys.erase(slot);
+		}
 	}
 	if (p_all) {
 		pending_omm_bakes.clear();
