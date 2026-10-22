@@ -2617,7 +2617,11 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 				uint32_t pitch = get_compressed_image_format_pixels_shifted(texture->format, width * pixel_size * block_w);
 				uint32_t pitch_step = driver->api_trait_get(RDD::API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP);
 				pitch = STEPIFY(pitch, pitch_step);
-				uint32_t to_allocate = get_compressed_image_format_pixels_shifted(texture->format, pitch * height);
+				// The pitch is the size of a row of blocks, and _copy_region_block_or_regular() writes height / block_h of them
+				// (height is a multiple of block_h). Sized from the height in pixels, a BC7 texture reserved 4 times what it
+				// uses, and a transfer worker keeps its largest staging buffer: an 8K BC7 sprite sheet left 512 MB of upload
+				// heap (shared GPU memory) allocated for the whole session.
+				uint32_t to_allocate = pitch * (height / block_h);
 
 				if (copy_pass) {
 					const uint8_t *read_ptr_mipmap_layer = read_ptr_mipmap + (tight_mip_size / depth) * z;
@@ -2752,7 +2756,8 @@ Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vec
 					uint32_t region_pitch = get_compressed_image_format_pixels_shifted(texture->format, region_w * pixel_size * block_w);
 					uint32_t pitch_step = driver->api_trait_get(RDD::API_TRAIT_TEXTURE_DATA_ROW_PITCH_STEP);
 					region_pitch = STEPIFY(region_pitch, pitch_step);
-					uint32_t to_allocate = region_pitch * region_h;
+					// One row of blocks per region_pitch, as in _texture_initialize().
+					uint32_t to_allocate = region_pitch * (region_h / block_h);
 					uint32_t alloc_offset = 0, alloc_size = 0;
 					StagingRequiredAction required_action;
 					Error err = _staging_buffer_allocate(upload_staging_buffers, to_allocate, required_align, alloc_offset, alloc_size, required_action, false);
