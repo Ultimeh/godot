@@ -10,9 +10,6 @@
 #define RT_LIGHT_TYPE_DIRECTIONAL 1 // Sun/moon with angular size
 #define RT_LIGHT_TYPE_SPOT 3 // Spot light with cone falloff
 
-// Lights drawn as candidates for the choice of light after the first bounce (lights_evaluate_direct_lighting()).
-#define RT_LIGHT_RIS_CANDIDATES 8u
-
 // ============================================================================
 // Light Data (matches C++ RT_LightData, 128 bytes, std430)
 // ============================================================================
@@ -374,12 +371,13 @@ vec3 lights_evaluate_direct_lighting(
 	if ((uint(get_rt_param(RT_PARAM_FLAGS)) & RT_PARAM_FLAG_LIGHT_SAMPLING_RIS) != 0u) {
 		// One reservoir (weighted reservoir sampling, Bitterli et al. 2020, algorithm 2; one random number per candidate).
 		// The surface the camera sees takes every light (at most RT_LIGHTS_MAX) as a candidate: there the noise shows.
-		// Later bounces take RT_LIGHT_RIS_CANDIDATES drawn uniformly, a fixed cost whatever the number of lights: every
-		// light at every bounce cost 3 ms with 64 lights at 3 bounces (godot3d's Drowned Ossuary). With candidates drawn
-		// with probability 1 / light_count, each weighs w * light_count and the pick's probability is w * M / sum
-		// (resampled importance sampling with M candidates, Talbot et al. 2005).
-		const bool every_light = is_camera_hit || light_count <= RT_LIGHT_RIS_CANDIDATES;
-		const uint candidates = every_light ? light_count : RT_LIGHT_RIS_CANDIDATES;
+		// Later bounces take rendering/pathtracing/light_sampling_ris_bounce_candidates drawn uniformly (0: every light), a
+		// fixed cost whatever the number of lights: every light at every bounce cost 3 ms with 64 lights at 3 bounces
+		// (godot3d's Drowned Ossuary). With candidates drawn with probability 1 / light_count, each weighs w * light_count
+		// and the pick's probability is w * M / sum (resampled importance sampling with M candidates, Talbot et al. 2005).
+		const uint bounce_candidates = (uint(get_rt_param(RT_PARAM_FLAGS)) >> RT_PARAM_FLAG_RIS_CANDIDATES_SHIFT) & RT_PARAM_FLAG_RIS_CANDIDATES_MASK;
+		const bool every_light = is_camera_hit || bounce_candidates == 0u || light_count <= bounce_candidates;
+		const uint candidates = every_light ? light_count : bounce_candidates;
 		float weight_sum = 0.0;
 		float selected_weight = 0.0;
 		for (uint i = 0u; i < candidates; i++) {

@@ -28,6 +28,8 @@
 #define RT_PARAM_REFLECTION_BACKGROUND 12 // rt_params[3].x - 1 when reflections show the background color (REFLECTION_SOURCE_BG)
 #define RT_PARAM_FLAGS 13 // rt_params[3].y - RT_PARAM_FLAG_* bits, runtime switches (a later one takes the next bit)
 #define RT_PARAM_FLAG_LIGHT_SAMPLING_RIS 1u // rendering/pathtracing/light_sampling_ris
+#define RT_PARAM_FLAG_RIS_CANDIDATES_SHIFT 1u // Bits 1-7: rendering/pathtracing/light_sampling_ris_bounce_candidates (0: every light)
+#define RT_PARAM_FLAG_RIS_CANDIDATES_MASK 0x7Fu
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 

@@ -3845,6 +3845,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/displacement_update_distance", PROPERTY_HINT_RANGE, "0,500,0.1,or_greater,suffix:m"), 30.0);
 	GLOBAL_DEF("rendering/pathtracing/displaced_refit", true);
 	GLOBAL_DEF("rendering/pathtracing/light_sampling_ris", true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/light_sampling_ris_bounce_candidates", PROPERTY_HINT_RANGE, "0,64,1"), 0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/out_of_view_update_distance", PROPERTY_HINT_RANGE, "0,500,0.1,or_greater,suffix:m"), 10.0);
 	GLOBAL_DEF_RST("rendering/pathtracing/opacity_micromaps", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/opacity_micromap_subdivision_level", PROPERTY_HINT_RANGE, "1,8,1"), 6);

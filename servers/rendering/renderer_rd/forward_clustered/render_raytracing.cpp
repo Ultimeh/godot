@@ -5747,6 +5747,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		if (GLOBAL_GET_CACHED(bool, "rendering/pathtracing/light_sampling_ris")) {
 			rt_param_flags |= SceneShaderRaytracing::RT_PARAM_FLAG_LIGHT_SAMPLING_RIS;
 		}
+		const uint32_t bounce_candidates = CLAMP(GLOBAL_GET_CACHED(int, "rendering/pathtracing/light_sampling_ris_bounce_candidates"), 0, int(SceneShaderRaytracing::RT_PARAM_FLAG_RIS_CANDIDATES_MASK));
+		rt_param_flags |= bounce_candidates << SceneShaderRaytracing::RT_PARAM_FLAG_RIS_CANDIDATES_SHIFT;
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FLAGS] = float(rt_param_flags);
 		if (p_background_is_color) {
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 0] = p_background_color.r;
