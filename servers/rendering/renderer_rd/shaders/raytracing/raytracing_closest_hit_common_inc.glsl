@@ -707,6 +707,22 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.throughput *= m.ao; // As raster's AO on the ambient (indirect diffuse) light.
 	}
 
+	// Russian roulette, as pbrt-v4's PathIntegrator::Li: from the path's second vertex on, a path whose throughput has
+	// fallen below 1 goes on with a probability equal to its largest component and is divided by it; the others end here.
+	// Unbiased: what the surviving paths bring is scaled by one over the probability they had to survive. The paths that
+	// would bring little are the ones that end. rendering/pathtracing/russian_roulette.
+	if (total_bounces >= 1u && (uint(get_rt_param(RT_PARAM_FLAGS)) & RT_PARAM_FLAG_RUSSIAN_ROULETTE) != 0u) {
+		const float survival = max(ps.throughput.r, max(ps.throughput.g, ps.throughput.b));
+		if (survival < 1.0) {
+			if (rand(ps.rng_state) >= survival) {
+				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+				path_pack(payload, ps);
+				return;
+			}
+			ps.throughput /= survival;
+		}
+	}
+
 	if (brdfType == DIFFUSE_TYPE) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {

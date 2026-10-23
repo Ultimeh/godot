@@ -105,6 +105,7 @@ public:
 	// one rebuilds nothing). The 16 slots are all taken: a later live switch takes the next bit here.
 	static constexpr int RT_PARAM_FLAGS = 13;
 	static constexpr uint32_t RT_PARAM_FLAG_LIGHT_SAMPLING_RIS = 1u << 0; // rendering/pathtracing/light_sampling_ris.
+	static constexpr uint32_t RT_PARAM_FLAG_RUSSIAN_ROULETTE = 1u << 1; // rendering/pathtracing/russian_roulette.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 
