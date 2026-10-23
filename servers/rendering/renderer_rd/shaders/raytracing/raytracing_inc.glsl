@@ -194,24 +194,41 @@ bool is_path_terminated(uint packed) {
 // RANDOM NUMBER GENERATION - PCG (Permuted Congruential Generator)
 // ============================================================================
 
-/// PCG random number generator - improved XSH-RR variant with better avalanche
-uint pcg_hash(uint seed) {
-	uint state = seed * 747796405u + 2891336453u;
+/// PCG's output permutation of a 32-bit state (O'Neill 2014, pcg-c's pcg_output_rxs_m_xs_32_32).
+uint pcg_output_rxs_m_xs(uint state) {
 	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
 	return (word >> 22u) ^ word;
 }
 
-/// Initialize RNG state with improved mixing to eliminate patterns
-uint init_rng(uvec2 pixel, uint frame, uint sample_idx) {
-	// Use Wang hash for better mixing - eliminates linear patterns
-	uint seed = pixel.x + pixel.y * 65536u + frame * 1000000u + sample_idx * 100000000u;
-	return pcg_hash(seed);
+/// pcg4d (Jarzynski and Olano 2020, "Hash Functions for GPU Rendering", JCGT 9(3), section 5): four inputs hashed
+/// together. Their section 4.1 shows that hashing a linear combination of the inputs instead (pixel + 65536 * y +
+/// 1000000 * frame...) destroys the hash's quality, with repeating patterns.
+uvec4 pcg4d(uvec4 v) {
+	v = v * 1664525u + 1013904223u;
+	v.x += v.y * v.w;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	v.w += v.y * v.z;
+	v ^= v >> 16u;
+	v.x += v.y * v.w;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	v.w += v.y * v.z;
+	return v;
 }
 
-/// Random float in [0, 1)
+/// The random sequence of one path sample: its first state, from the pixel, the frame and the sample.
+uint init_rng(uvec2 pixel, uint frame, uint sample_idx) {
+	return pcg4d(uvec4(pixel, frame, sample_idx)).x;
+}
+
+/// Random float in [0, 1): PCG with a 32-bit state (pcg-c's pcg_oneseq_32_rxs_m_xs_32_random_r): the state advances by
+/// its linear congruential step, and the number is the output permutation of the state before the step. The top 24 bits
+/// make the float, exactly, never 1.0.
 float rand(inout uint state) {
-	state = pcg_hash(state);
-	return float(state) / 4294967296.0;
+	uint old_state = state;
+	state = state * 747796405u + 2891336453u;
+	return float(pcg_output_rxs_m_xs(old_state) >> 8u) * (1.0 / 16777216.0);
 }
 
 /// Random vec2 in [0, 1)
