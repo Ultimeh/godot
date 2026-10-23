@@ -80,7 +80,9 @@ private:
 		String description;
 		Semaphore done_semaphore; // For user threads awaiting.
 		bool completed : 1;
-		bool pending_notify_yield_over : 1;
+		// notify_yield_over() was called and this task's yield() has not returned for it yet. On the task, not the
+		// thread: a task that yields while nested in another's wait on the same thread must not take its wake-up.
+		bool yield_is_over : 1;
 		bool is_pump_task : 1;
 		Group *group = nullptr;
 		SelfList<Task> task_elem;
@@ -93,7 +95,7 @@ private:
 		void free_template_userdata();
 		Task() :
 				completed(false),
-				pending_notify_yield_over(false),
+				yield_is_over(false),
 				is_pump_task(false),
 				task_elem(this) {}
 	};
@@ -115,7 +117,6 @@ private:
 		uint32_t index = 0;
 		Thread thread;
 		bool signaled : 1;
-		bool yield_is_over : 1;
 		bool pre_exited_languages : 1;
 		bool exited_languages : 1;
 		bool has_pump_task : 1; // Threads can only have one pump task.
@@ -126,7 +127,6 @@ private:
 
 		ThreadData() :
 				signaled(false),
-				yield_is_over(false),
 				pre_exited_languages(false),
 				exited_languages(false),
 				has_pump_task(false) {}

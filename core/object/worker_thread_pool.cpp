@@ -79,9 +79,6 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 		prev_task = curr_thread.current_task;
 		curr_thread.current_task = p_task;
 		curr_thread.has_pump_task = p_task->is_pump_task;
-		if (p_task->pending_notify_yield_over) {
-			curr_thread.yield_is_over = true;
-		}
 		task_mutex.unlock();
 	}
 #endif
@@ -165,6 +162,8 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 #ifdef THREADS_ENABLED
 	{
 		curr_thread.current_task = prev_task;
+		// Back to the task this one was nested in: a pump task running its wait must still refuse other pump tasks.
+		curr_thread.has_pump_task = prev_task && prev_task->is_pump_task;
 		if (low_priority) {
 			low_priority_threads_used--;
 
@@ -520,8 +519,9 @@ void WorkerThreadPool::_wait_collaboratively(ThreadData *p_caller_pool_thread, T
 
 			bool wait_is_over = false;
 			if (unlikely(p_task == ThreadData::YIELDING)) {
-				if (p_caller_pool_thread->yield_is_over) {
-					p_caller_pool_thread->yield_is_over = false;
+				Task *yielding_task = p_caller_pool_thread->current_task;
+				if (yielding_task->yield_is_over) {
+					yielding_task->yield_is_over = false;
 					wait_is_over = true;
 				}
 			} else {
@@ -581,21 +581,7 @@ void WorkerThreadPool::_wait_collaboratively(ThreadData *p_caller_pool_thread, T
 		}
 
 		if (task_to_process) {
-			// `yield_is_over` belongs to the thread, so a nested task that yields would consume a wake-up meant for
-			// this waiter. Keep it aside during the nested run.
-			bool outer_yield_is_over;
-			{
-				MutexLock lock(task_mutex);
-				outer_yield_is_over = p_caller_pool_thread->yield_is_over;
-				p_caller_pool_thread->yield_is_over = false;
-			}
-
 			_process_task(task_to_process);
-
-			if (outer_yield_is_over) {
-				MutexLock lock(task_mutex);
-				p_caller_pool_thread->yield_is_over = true;
-			}
 		}
 	}
 }
@@ -668,16 +654,17 @@ void WorkerThreadPool::notify_yield_over(TaskID p_task_id) {
 		ERR_FAIL_MSG("Invalid Task ID.");
 	}
 	Task *task = *taskp;
-	if (task->pool_thread_index == -1) { // Completed or not started yet.
-		if (!task->completed) {
-			// This avoids a race condition where a task is created and yield-over called before it's processed.
-			task->pending_notify_yield_over = true;
-		}
+	if (task->completed) {
+		return;
+	}
+	// Kept on the task: if it has not started yet, its first yield() returns at once. If its thread is running another
+	// task nested in this one's wait, that task cannot take the wake-up, and this one sees it when the nested one ends.
+	task->yield_is_over = true;
+	if (task->pool_thread_index == -1) {
 		return;
 	}
 
 	ThreadData &td = threads[task->pool_thread_index];
-	td.yield_is_over = true;
 	td.signaled = true;
 	td.cond_var.notify_one();
 }
