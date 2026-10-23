@@ -241,9 +241,13 @@ enum {
 };
 
 enum {
-	RT_LIGHTS_MAX = 64,
-	RT_LIGHTS_FRUSTUM_BUDGET = 48,
-	RT_LIGHTS_INDIRECT_BUDGET = RT_LIGHTS_MAX - RT_LIGHTS_FRUSTUM_BUDGET,
+	// The lights the path tracer gets, the strongest first (gather_lights()); a hit weighs only those of its light grid
+	// cell (build_light_grid()), so their number costs little. Mirrored as RT_LIGHTS_MAX in raytracing_lights_inc.glsl.
+	RT_LIGHTS_MAX = 256,
+	// A light over more light grid cells than this is weighed at every hit instead (build_light_grid()).
+	RT_LIGHT_GRID_MAX_CELLS = 512,
+	RT_LIGHT_GRID_MAX_BUCKETS = 1 << 16,
+	RT_LIGHT_GRID_HEADER = 4,
 };
 
 enum {
@@ -611,6 +615,10 @@ struct RTViewportState {
 	uint32_t tlas_instance_buffer_capacity = 0;
 
 	RID light_buffer;
+	// The lights each cell can receive light from (build_light_grid()), uploaded when it changes.
+	RID light_grid_buffer;
+	uint32_t light_grid_buffer_capacity = 0;
+	LocalVector<uint32_t> uploaded_light_grid;
 	RID params_buffer;
 	// The decals (RT_DecalData) and their grid (gather_decals()), uploaded when they change.
 	RID decal_buffer;
@@ -874,6 +882,7 @@ class RenderRaytracing {
 	LocalVector<uint8_t> instance_masks; // RT_INSTANCE_MASK_* bits.
 	LocalVector<RT_DecalData> decal_data;
 	LocalVector<uint32_t> decal_grid;
+	LocalVector<uint32_t> light_grid;
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 	uint32_t front_layer_instance_count = 0;
 	uint32_t procedural_instance_masks = 0; // RT_INSTANCE_MASK_PROCEDURAL_* bits of this frame's instances.
@@ -1014,6 +1023,8 @@ public:
 	// A BaseMaterial3D's generated shader, traced by hit group 0 from its parameters (p_albedo: its "albedo").
 	static bool is_base_material(RID p_material, const Variant &p_albedo);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
+	// A hashed grid of the lights in world space for the choice of light at each hit; uploads it to p_state's buffer.
+	void build_light_grid(RTViewportState *p_state, const RT_LightData *p_lights, uint32_t p_count);
 	// The RD texture of the directional light projector gather_lights() found (binding 38), or invalid.
 	RID rt_directional_projector;
 	// The decals around the camera, in world space, and a hashed grid of them for the hit shaders; uploads them to

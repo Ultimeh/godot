@@ -47,6 +47,20 @@ layout(set = 0, binding = RT_LIGHT_BUFFER_BINDING, std430) readonly buffer Light
 	RTLightData rt_lights[];
 };
 
+// RenderRaytracing::build_light_grid(): [0] 1 / cell size (float bits), [1] buckets - 1, [2] G, the lights weighed at
+// every hit, [3] unused; [4, 4 + G) those lights; [4 + G, 4 + G + buckets] the first entry of each bucket in this buffer
+// (the last one ends the previous), then the entries: the lights whose range reaches one of the bucket's cells.
+// clang-format off
+layout(set = 0, binding = 42, std430) readonly buffer RTLightGrid {
+	uint rt_light_grid[];
+};
+// clang-format on
+
+// Same as _rt_decal_grid_hash() in render_raytracing.cpp, which the light grid shares.
+uint rt_light_grid_hash(ivec3 p_cell) {
+	return (uint(p_cell.x) * 73856093u) ^ (uint(p_cell.y) * 19349663u) ^ (uint(p_cell.z) * 83492791u);
+}
+
 // The projector of the directional light whose projector_enabled is set (white when none): it multiplies the light,
 // rgb * a, repeated beyond its size, as raster's directional_light_projector.
 layout(set = 0, binding = 38) uniform texture2D rt_directional_light_projector;
@@ -336,12 +350,11 @@ float lights_target_weight(RTLightData p_light, vec3 p_hit_pos, vec3 p_N, bool p
 
 vec3 lights_evaluate_light(RTLightData light, vec3 hit_pos, vec3 hit_pos_back, vec3 geometry_normal, vec3 N, vec3 V, MaterialProperties material, vec3 backlight, bool specular_disabled, inout uint rng_state, bool is_indirect_bounce);
 
-// Evaluate direct lighting using NEE: one light, picked among all of them in proportion to lights_target_weight()
-// (resampled importance sampling with every light as a candidate: Talbot et al. 2005, "Importance Resampling for Global
-// Illumination"; Bitterli et al. 2020, "Spatiotemporal reservoir resampling", section 3), and one shadow ray toward it.
-// The estimate f(y) * sum(w) / w(y) is unbiased: the weight is above 0 wherever the light's contribution can be
-// (measured: the mean matches every light summed, each with its shadow ray, within the noise).
-// Every invocation walks the lights in the same order: the loads are uniform across a wave. Without
+// Evaluate direct lighting using NEE: one light, picked among those that can light the point in proportion to
+// lights_target_weight() (resampled importance sampling with each of them as a candidate: Talbot et al. 2005, "Importance
+// Resampling for Global Illumination"; Bitterli et al. 2020, "Spatiotemporal reservoir resampling", section 3), and one
+// shadow ray toward it. The estimate f(y) * sum(w) / w(y) is unbiased: the weight is above 0 wherever the light's
+// contribution can be (measured: the mean matches every light summed, each with its shadow ray, within the noise). Without
 // rendering/pathtracing/light_sampling_ris (RT_PARAM_FLAG_LIGHT_SAMPLING_RIS), the light is picked uniformly among those
 // in range, as before: a strong light among many weak ones is then sampled now and then, and its light is noise (and
 // that choice came out 0.6 % darker than every light summed on a sunlit wall, a cause not looked into).
@@ -358,7 +371,6 @@ vec3 lights_evaluate_direct_lighting(
 		bool specular_disabled,
 		inout uint rng_state,
 		bool is_indirect_bounce,
-		bool is_camera_hit,
 		uint light_count,
 		uint layer_mask) {
 	bool has_backlight = any(greaterThan(backlight, vec3(0.0)));
@@ -369,26 +381,26 @@ vec3 lights_evaluate_direct_lighting(
 	uint selected_idx = 0u;
 	float light_select_pdf; // The probability the light was picked with.
 	if ((uint(get_rt_param(RT_PARAM_FLAGS)) & RT_PARAM_FLAG_LIGHT_SAMPLING_RIS) != 0u) {
-		// One reservoir (weighted reservoir sampling, Bitterli et al. 2020, algorithm 2; one random number per candidate).
-		// The surface the camera sees takes every light (at most RT_LIGHTS_MAX) as a candidate: there the noise shows.
-		// Later bounces take rendering/pathtracing/light_sampling_ris_bounce_candidates drawn uniformly (0: every light), a
-		// fixed cost whatever the number of lights: every light at every bounce cost 3 ms with 64 lights at 3 bounces
-		// (godot3d's Drowned Ossuary). With candidates drawn with probability 1 / light_count, each weighs w * light_count
-		// and the pick's probability is w * M / sum (resampled importance sampling with M candidates, Talbot et al. 2005).
-		const uint bounce_candidates = (uint(get_rt_param(RT_PARAM_FLAGS)) >> RT_PARAM_FLAG_RIS_CANDIDATES_SHIFT) & RT_PARAM_FLAG_RIS_CANDIDATES_MASK;
-		const bool every_light = is_camera_hit || bounce_candidates == 0u || light_count <= bounce_candidates;
-		const uint candidates = every_light ? light_count : bounce_candidates;
+		// One reservoir (weighted reservoir sampling, Bitterli et al. 2020, algorithm 2; one random number per candidate)
+		// over the lights that can light the point (RenderRaytracing::build_light_grid()): the global ones, then those of
+		// its cell's bucket. Any other light weighs 0 here, so the choice is the one over every light, at every bounce, for
+		// the cost of the few lights of a cell: every light at every bounce without the grid cost 3 ms more with 64 lights
+		// at 3 bounces (godot3d's Drowned Ossuary), with it 1 ms less than the uniform choice below.
+		const ivec3 cell = ivec3(floor(hit_pos * uintBitsToFloat(rt_light_grid[0])));
+		const uint global_count = rt_light_grid[2];
+		const uint bucket = 4u + global_count + (rt_light_grid_hash(cell) & rt_light_grid[1]);
+		const uint bucket_start = rt_light_grid[bucket];
+		const uint candidates = global_count + rt_light_grid[bucket + 1u] - bucket_start;
 		float weight_sum = 0.0;
 		float selected_weight = 0.0;
 		for (uint i = 0u; i < candidates; i++) {
-			uint idx = every_light ? i : min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
+			uint idx = i < global_count ? rt_light_grid[4u + i] : rt_light_grid[bucket_start + i - global_count];
 			float w = lights_target_weight(rt_lights[idx], hit_pos, N, has_backlight, is_indirect_bounce, layer_mask);
 			if (w <= 0.0) {
 				continue;
 			}
-			float wi = every_light ? w : w * float(light_count);
-			weight_sum += wi;
-			if (rand(rng_state) * weight_sum < wi) {
+			weight_sum += w;
+			if (rand(rng_state) * weight_sum < w) {
 				selected_idx = idx;
 				selected_weight = w;
 			}
@@ -396,7 +408,7 @@ vec3 lights_evaluate_direct_lighting(
 		if (selected_weight <= 0.0) {
 			return vec3(0.0);
 		}
-		light_select_pdf = selected_weight * (every_light ? 1.0 : float(candidates)) / weight_sum;
+		light_select_pdf = selected_weight / weight_sum;
 	} else {
 		// rendering/pathtracing/light_sampling_ris off (for comparison): k lights drawn uniformly, one of those in range
 		// kept uniformly, the count of lights in range estimated from the draws.

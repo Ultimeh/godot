@@ -233,6 +233,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
+	if (p_state->light_grid_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->light_grid_buffer);
+	}
 	if (p_state->sky_sampling_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->sky_sampling_buffer);
 	}
@@ -5557,6 +5560,151 @@ uint32_t RenderRaytracing::gather_decals(RTViewportState *p_state, const RenderD
 }
 
 // ---------------------------------------------------------------------------
+// Light grid
+// ---------------------------------------------------------------------------
+
+// The choice of light at a hit (lights_evaluate_direct_lighting(), raytracing_lights_inc.glsl) weighs every light that
+// can light the point and only those: a light lights nothing beyond its range, so a hit weighs the lights listed in its
+// cell's bucket and the global ones. A hashed grid as gather_decals()'s: every bucket lists the lights whose range sphere
+// touches one of its cells. The cells are half the median range, so a typical light spans 5x5x5 of them; directional
+// lights, lights without a range and lights over too many cells are global, weighed at every hit. A bucket can hold a
+// light of another cell sharing it, which weighs 0 there: the choice is the same as over every light.
+// [0] 1 / cell size (float bits), [1] buckets - 1, [2] G, the global lights, [3] unused; [4, 4 + G) those lights;
+// [4 + G, 4 + G + buckets] the first entry of each bucket in this buffer (the last one ends the previous), then the entries.
+void RenderRaytracing::build_light_grid(RTViewportState *p_state, const RT_LightData *p_lights, uint32_t p_count) {
+	light_grid.clear();
+
+	LocalVector<float> ranges;
+	for (uint32_t i = 0; i < p_count; i++) {
+		if (p_lights[i].type != RT_LIGHT_TYPE_DIRECTIONAL && p_lights[i].max_range_squared > 0.0f) {
+			ranges.push_back(Math::sqrt(p_lights[i].max_range_squared));
+		}
+	}
+	float cell_size = 1.0f;
+	if (!ranges.is_empty()) {
+		ranges.sort();
+		cell_size = MAX(ranges[ranges.size() / 2] * 0.5f, 0.01f);
+	}
+	const float inv_cell_size = 1.0f / cell_size;
+
+	struct CellRange {
+		int32_t from[3];
+		int32_t to[3];
+		bool global = false;
+	};
+	LocalVector<CellRange> cell_ranges;
+	cell_ranges.resize(p_count);
+	LocalVector<uint32_t> global_lights;
+	uint64_t entry_bound = 0;
+	for (uint32_t i = 0; i < p_count; i++) {
+		const RT_LightData &light = p_lights[i];
+		CellRange &range = cell_ranges[i];
+		if (light.type == RT_LIGHT_TYPE_DIRECTIONAL || light.max_range_squared <= 0.0f) {
+			range.global = true;
+			global_lights.push_back(i);
+			continue;
+		}
+		// The hit shader floors its position times inv_cell_size in float: the same here, with a margin for the difference
+		// between a hit point and the sphere.
+		const float radius = Math::sqrt(light.max_range_squared) + cell_size * 0.01f;
+		uint64_t cells = 1;
+		for (int a = 0; a < 3; a++) {
+			const double from = Math::floor(float(light.position[a] - radius) * inv_cell_size);
+			const double to = Math::floor(float(light.position[a] + radius) * inv_cell_size);
+			if (!(from >= double(INT32_MIN) && to <= double(INT32_MAX - 1)) || to - from + 1.0 > double(RT_LIGHT_GRID_MAX_CELLS)) {
+				range.global = true;
+				break;
+			}
+			range.from[a] = int32_t(from);
+			range.to[a] = int32_t(to);
+			cells *= uint64_t(range.to[a] - range.from[a] + 1);
+		}
+		if (range.global || cells > RT_LIGHT_GRID_MAX_CELLS) {
+			range.global = true;
+			global_lights.push_back(i);
+		} else {
+			entry_bound += cells;
+		}
+	}
+
+	const uint32_t bucket_count = CLAMP(Math::next_power_of_2(uint32_t(MAX<uint64_t>(entry_bound * 2, uint64_t(64)))), 64u, uint32_t(RT_LIGHT_GRID_MAX_BUCKETS));
+	const uint32_t bucket_mask = bucket_count - 1;
+	const uint32_t offsets_base = RT_LIGHT_GRID_HEADER + global_lights.size();
+	const uint32_t entries_base = offsets_base + bucket_count + 1;
+
+	LocalVector<uint32_t> last_light; // Two cells of a light can share a bucket: listed once.
+	last_light.resize(bucket_count);
+	LocalVector<uint32_t> bucket_entries;
+	bucket_entries.resize(bucket_count);
+	auto visit_buckets = [&](uint32_t p_light, bool p_fill) {
+		const CellRange &range = cell_ranges[p_light];
+		const Vector3 center(p_lights[p_light].position[0], p_lights[p_light].position[1], p_lights[p_light].position[2]);
+		const float radius = Math::sqrt(p_lights[p_light].max_range_squared) + cell_size * 0.01f;
+		for (int32_t z = range.from[2]; z <= range.to[2]; z++) {
+			for (int32_t y = range.from[1]; y <= range.to[1]; y++) {
+				for (int32_t x = range.from[0]; x <= range.to[0]; x++) {
+					// Only the cells the range sphere reaches: its distance to the cell's box.
+					const Vector3 cell_min = Vector3(x, y, z) * cell_size;
+					const Vector3 nearest = center.clamp(cell_min, cell_min + Vector3(cell_size, cell_size, cell_size));
+					if (nearest.distance_squared_to(center) > radius * radius) {
+						continue;
+					}
+					const uint32_t bucket = _rt_decal_grid_hash(x, y, z) & bucket_mask;
+					if (last_light[bucket] == p_light) {
+						continue;
+					}
+					last_light[bucket] = p_light;
+					if (p_fill) {
+						light_grid[bucket_entries[bucket]++] = p_light;
+					} else {
+						bucket_entries[bucket]++;
+					}
+				}
+			}
+		}
+	};
+
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		last_light[b] = UINT32_MAX;
+		bucket_entries[b] = 0;
+	}
+	for (uint32_t i = 0; i < p_count; i++) {
+		if (!cell_ranges[i].global) {
+			visit_buckets(i, false);
+		}
+	}
+
+	uint32_t entry_count = 0;
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		entry_count += bucket_entries[b];
+	}
+	light_grid.resize(entries_base + entry_count);
+	memcpy(&light_grid[0], &inv_cell_size, sizeof(float));
+	light_grid[1] = bucket_mask;
+	light_grid[2] = global_lights.size();
+	light_grid[3] = 0;
+	for (uint32_t i = 0; i < global_lights.size(); i++) {
+		light_grid[RT_LIGHT_GRID_HEADER + i] = global_lights[i];
+	}
+	uint32_t entry = entries_base;
+	for (uint32_t b = 0; b < bucket_count; b++) {
+		light_grid[offsets_base + b] = entry;
+		const uint32_t entries = bucket_entries[b];
+		bucket_entries[b] = entry; // Now the next entry to fill.
+		last_light[b] = UINT32_MAX;
+		entry += entries;
+	}
+	light_grid[offsets_base + bucket_count] = entry;
+	for (uint32_t i = 0; i < p_count; i++) {
+		if (!cell_ranges[i].global) {
+			visit_buckets(i, true);
+		}
+	}
+
+	_rt_upload_if_changed(p_state->light_grid_buffer, p_state->light_grid_buffer_capacity, p_state->uploaded_light_grid, light_grid, "RT Light Grid Buffer");
+}
+
+// ---------------------------------------------------------------------------
 // Sky sampling distribution
 // ---------------------------------------------------------------------------
 
@@ -5747,8 +5895,6 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		if (GLOBAL_GET_CACHED(bool, "rendering/pathtracing/light_sampling_ris")) {
 			rt_param_flags |= SceneShaderRaytracing::RT_PARAM_FLAG_LIGHT_SAMPLING_RIS;
 		}
-		const uint32_t bounce_candidates = CLAMP(GLOBAL_GET_CACHED(int, "rendering/pathtracing/light_sampling_ris_bounce_candidates"), 0, int(SceneShaderRaytracing::RT_PARAM_FLAG_RIS_CANDIDATES_MASK));
-		rt_param_flags |= bounce_candidates << SceneShaderRaytracing::RT_PARAM_FLAG_RIS_CANDIDATES_SHIFT;
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FLAGS] = float(rt_param_flags);
 		if (p_background_is_color) {
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_BACKGROUND_COLOR + 0] = p_background_color.r;
@@ -5772,9 +5918,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 		// --- Light gathering ---
 		uint32_t rt_light_count = 0;
-		RT_LightData rt_light_data[RT_LIGHTS_MAX] = {};
+		LocalVector<RT_LightData> rt_light_data;
+		rt_light_data.resize(RT_LIGHTS_MAX);
+		memset(rt_light_data.ptr(), 0, RT_LIGHTS_MAX * sizeof(RT_LightData));
 
-		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX);
+		rt_light_count = gather_lights(p_render_data, rt_light_data.ptr(), RT_LIGHTS_MAX);
+		build_light_grid(p_state, rt_light_data.ptr(), rt_light_count);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DECAL_COUNT] = float(gather_decals(p_state, p_render_data));
@@ -5786,7 +5935,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				p_state->light_buffer = RD::get_singleton()->storage_buffer_create(buf_size);
 				RD::get_singleton()->set_resource_name(p_state->light_buffer, "RT Light Buffer");
 			}
-			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, buf_size, rt_light_data);
+			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, buf_size, rt_light_data.ptr());
 		}
 
 		if (!p_state->params_buffer.is_valid()) {
@@ -5885,6 +6034,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		}
 		uniforms.push_back(u);
 	}
+
+	// Binding 42: Light grid (build_light_grid()).
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_STORAGE_BUFFER, 42, p_state->light_grid_buffer.is_valid() ? p_state->light_grid_buffer : RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer()));
 
 	// Binding 14: Global shader uniforms SSBO.
 	{
