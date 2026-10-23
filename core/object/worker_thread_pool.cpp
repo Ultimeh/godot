@@ -401,6 +401,11 @@ WorkerThreadPool::TaskID WorkerThreadPool::add_task_bind(const Callable &p_actio
 	return _add_task(p_action, nullptr, nullptr, nullptr, p_high_priority, p_description, false);
 }
 
+bool WorkerThreadPool::is_accepting_tasks() const {
+	MutexLock task_lock(task_mutex);
+	return threads.is_empty() || runlevel == RUNLEVEL_NORMAL;
+}
+
 bool WorkerThreadPool::is_task_completed(TaskID p_task_id) const {
 	MutexLock task_lock(task_mutex);
 	const Task *const *taskp = tasks.getptr(p_task_id);

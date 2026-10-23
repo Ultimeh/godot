@@ -3570,7 +3570,9 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 					// finish last if it took another slice after them, so N workers take the N slices.
 					const bool has_pinned_slices = parallel_claimable_slices.size() < parallel_slices.size();
 					const uint32_t worker_count = MIN(parallel_claimable_slices.size(), has_pinned_slices ? parallel_slice_count : parallel_slice_count - 1);
-					const bool use_workers = worker_count > 0;
+					// At shutdown (finalize_display() replays the last frames after exit_languages_threads()) a posted
+					// group would wait for WorkerThreadPool::finish() and this thread with it: it records every slice.
+					const bool use_workers = worker_count > 0 && WorkerThreadPool::get_singleton()->is_accepting_tasks();
 					if (parallel_stats) {
 						parallel_launch_usec = OS::get_singleton()->get_ticks_usec();
 					}

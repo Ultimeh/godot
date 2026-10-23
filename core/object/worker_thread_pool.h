@@ -266,6 +266,9 @@ public:
 	uint32_t get_group_processed_element_count(GroupID p_group) const;
 	bool is_group_task_completed(GroupID p_group) const;
 	void wait_for_group_task_completion(GroupID p_group);
+	// False from exit_languages_threads() on: a task posted then waits for finish(), which a caller waiting for it on
+	// the main thread never reaches. Code that can run during shutdown does its work on the calling thread instead.
+	bool is_accepting_tasks() const;
 
 	_FORCE_INLINE_ int get_thread_count() const {
 #ifdef THREADS_ENABLED
