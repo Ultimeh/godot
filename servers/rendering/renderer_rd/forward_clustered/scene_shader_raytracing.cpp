@@ -661,6 +661,75 @@ static String _texture_calls_with_gradients(const String &p_code) {
 	return result;
 }
 
+// textureQueryLod() needs implicit derivatives, which ray tracing stages do not have (it only exists in fragment shaders):
+// a material calling it failed to compile as a hit group (godot3d's tree impostors). Its calls on 2D, 2D array and 3D
+// samplers become rt_query_lod() (raytracing_custom_globals_inc.glsl), the level of detail computed as the GLSL
+// specification defines it (section 8.14.1, "Scale Factor and Level of Detail") from the screen derivatives the hit
+// shaders already reconstruct for texture(). Other samplers are left as they are.
+static String _texture_query_lod_calls(const String &p_code) {
+	static const String function = "textureQueryLod(";
+	String result;
+	int from = 0;
+	while (true) {
+		const int start = p_code.find(function, from);
+		if (start < 0) {
+			result += p_code.substr(from);
+			break;
+		}
+		const char32_t before = start > 0 ? p_code[start - 1] : U' ';
+		if (is_ascii_identifier_char(before)) {
+			result += p_code.substr(from, start + function.length() - from);
+			from = start + function.length();
+			continue;
+		}
+		// Split the arguments at the top level.
+		Vector<String> args;
+		int depth = 0;
+		int arg_begin = start + function.length();
+		int i = arg_begin;
+		for (; i < p_code.length(); i++) {
+			const char32_t c = p_code[i];
+			if (c == '(' || c == '[') {
+				depth++;
+			} else if (c == ')' || c == ']') {
+				if (depth == 0) {
+					break;
+				}
+				depth--;
+			} else if (c == ',' && depth == 0) {
+				args.push_back(p_code.substr(arg_begin, i - arg_begin).strip_edges());
+				arg_begin = i + 1;
+			}
+		}
+		if (i >= p_code.length()) {
+			result += p_code.substr(from);
+			break;
+		}
+		args.push_back(p_code.substr(arg_begin, i - arg_begin).strip_edges());
+
+		String size;
+		bool supported = args.size() == 2;
+		if (supported && (args[0].begins_with("sampler2D(") || args[0].begins_with("usampler2D(") || args[0].begins_with("isampler2D("))) {
+			size = "vec2(textureSize(" + args[0] + ", 0))";
+		} else if (supported && (args[0].begins_with("sampler2DArray(") || args[0].begins_with("usampler2DArray(") || args[0].begins_with("isampler2DArray("))) {
+			size = "vec2(textureSize(" + args[0] + ", 0).xy)";
+		} else if (supported && args[0].begins_with("sampler3D(")) {
+			size = "vec3(textureSize(" + args[0] + ", 0))";
+		} else {
+			supported = false;
+		}
+		result += p_code.substr(from, start - from);
+		if (!supported) {
+			result += p_code.substr(start, i + 1 - start);
+		} else {
+			const String coord = _texture_query_lod_calls(args[1]);
+			result += "rt_query_lod(" + size + ", dFdx(" + coord + "), dFdy(" + coord + "), textureQueryLevels(" + args[0] + "))";
+		}
+		from = i + 1;
+	}
+	return result;
+}
+
 void SceneShaderRaytracing::_strip_texture_globals(String &r_globals, const String &p_tex_name) {
 	const String decl_marker = " " + _uniform_identifier(p_tex_name) + ";";
 	int pos = r_globals.find(decl_marker);
@@ -891,9 +960,9 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 		}
 	}
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
-	r_entry.fragment_code = _texture_calls_with_gradients(_depth_buffer_reads(gen_code.code.has("fragment") ? gen_code.code["fragment"] : String()));
+	r_entry.fragment_code = _texture_query_lod_calls(_texture_calls_with_gradients(_depth_buffer_reads(gen_code.code.has("fragment") ? gen_code.code["fragment"] : String())));
 	// The functions vertex() calls too: their derivatives are 0 there, raster's vertex() reads mip 0 as well.
-	r_entry.fragment_globals = _texture_calls_with_gradients(_depth_buffer_reads(gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT]));
+	r_entry.fragment_globals = _texture_query_lod_calls(_texture_calls_with_gradients(_depth_buffer_reads(gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT])));
 	// Hit shaders cannot discard: a discarded hit is ignored by the any-hit shader, which every material that discards
 	// gets, and passed through by the closest hit (raytracing_custom_fragment_inc.glsl).
 	if (r_entry.fragment_code.contains("discard;") || r_entry.fragment_globals.contains("discard;")) {

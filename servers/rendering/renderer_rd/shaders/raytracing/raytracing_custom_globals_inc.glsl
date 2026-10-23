@@ -44,6 +44,24 @@ vec4 rt_value(vec4 p_value) {
 #define fwidth(m_value) (abs(dFdx(m_value)) + abs(dFdy(m_value)))
 #define fwidthCoarse(m_value) fwidth(m_value)
 #define fwidthFine(m_value) fwidth(m_value)
+
+// textureQueryLod() for the hit shaders (scene_shader_raytracing.cpp rewrites its calls): the GLSL specification's level of
+// detail (8.14.1) from the screen derivatives of the coordinates in texels. x: the mip that would be accessed (clamped to
+// the texture's levels), y: the computed level of detail. With no derivatives (outside fragment code) the level is mip 0's.
+vec2 rt_query_lod_from_rho2(float p_rho2, int p_levels) {
+	const float lambda = p_rho2 > 0.0 ? 0.5 * log2(p_rho2) : -128.0;
+	return vec2(clamp(lambda, 0.0, float(max(p_levels - 1, 0))), lambda);
+}
+vec2 rt_query_lod(vec2 p_size, vec2 p_ddx, vec2 p_ddy, int p_levels) {
+	const vec2 dx = p_ddx * p_size;
+	const vec2 dy = p_ddy * p_size;
+	return rt_query_lod_from_rho2(max(dot(dx, dx), dot(dy, dy)), p_levels);
+}
+vec2 rt_query_lod(vec3 p_size, vec3 p_ddx, vec3 p_ddy, int p_levels) {
+	const vec3 dx = p_ddx * p_size;
+	const vec3 dy = p_ddy * p_size;
+	return rt_query_lod_from_rho2(max(dot(dx, dx), dot(dy, dy)), p_levels);
+}
 #define SHADER_IS_SRGB false
 #define SHADER_SPACE_FAR 0.0
 
