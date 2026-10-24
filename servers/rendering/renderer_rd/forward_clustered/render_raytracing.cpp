@@ -1856,6 +1856,13 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	if (existing->micromap.is_valid() || existing->failed) {
 		return existing->failed ? nullptr : existing;
 	}
+	if (existing->bake_state != RTOmmEntry::BAKE_NONE) {
+		// Under way: this frame's share uses the surface and material as they are now.
+		if (existing->refreshed_frame != current_frame && _omm_fill_job(*existing, p_mesh_surface, p_mat_data, p_lod)) {
+			existing->refreshed_frame = current_frame;
+		}
+		return nullptr;
+	}
 	if (current_frame - existing->first_seen_frame < RT_OMM_STABLE_FRAMES) {
 		return nullptr;
 	}
@@ -1863,38 +1870,8 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	RTOmmEntry &entry = *existing;
 	entry.failed = true;
 
-	RID bake_shader;
-	const RID bake_pipeline = rt_shader->get_omm_bake_pipeline(slot, bake_shader);
-	if (!bake_pipeline.is_valid()) {
-		return nullptr;
-	}
-
-	// The surface at rest, as the mesh stores it: the micromap goes with its triangles, wherever they are moved.
-	RTSurfaceData rest;
-	RID vertex_buffer, attribute_buffer, index_buffer;
-	_fill_surface_geometry_data(p_mesh_surface, false, &rest, &vertex_buffer, &attribute_buffer, &index_buffer);
-	RT_GeometryData &geometry = rest.geometry;
-	if (p_lod > 0) {
-		// A LOD's triangles: its own indices into the same vertices, in the order the merged BLASes replicate them
-		// (_get_lod_view() keeps it), with the format of LOD 0's.
-		RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
-		index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, p_lod);
-		const uint32_t lod_index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, p_lod);
-		if (!index_buffer.is_valid() || lod_index_count == 0 || geometry.index_format == RT_INDEX_FORMAT_NONE) {
-			return nullptr;
-		}
-		geometry.primitive_count = lod_index_count / 3;
-	}
-	if (vertex_buffer.is_valid()) {
-		geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
-	}
-	if (attribute_buffer.is_valid()) {
-		geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
-	}
-	if (index_buffer.is_valid() && geometry.index_format != RT_INDEX_FORMAT_NONE) {
-		geometry.index_buffer_address = rd->buffer_get_device_address(index_buffer);
-	}
-	if (geometry.primitive_count == 0 || !vertex_buffer.is_valid()) {
+	entry.bake_pipeline = rt_shader->get_omm_bake_pipeline(slot, entry.bake_shader);
+	if (!entry.bake_pipeline.is_valid() || !_omm_fill_job(entry, p_mesh_surface, p_mat_data, p_lod)) {
 		return nullptr;
 	}
 
@@ -1902,7 +1879,7 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	// A surface of many triangles is subdivided less, to keep its micromap within RT_OMM_MAX_MICRO_TRIANGLES (16 MiB of
 	// states, one bake thread each); one too large even at level 1 goes without.
 	static constexpr uint64_t RT_OMM_MAX_MICRO_TRIANGLES = uint64_t(1) << 26;
-	const uint32_t triangle_count = geometry.primitive_count;
+	const uint32_t triangle_count = entry.job.triangle_count;
 	uint32_t level = max_level;
 	while (level > 1 && (uint64_t(triangle_count) << (level * 2)) > RT_OMM_MAX_MICRO_TRIANGLES) {
 		level--;
@@ -1918,36 +1895,74 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	const BitField<RD::BufferCreationBits> input_bits = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT;
 	entry.data_buffer = rd->storage_buffer_create(uint32_t(data_size), Span<uint8_t>(), 0, input_bits);
 	entry.desc_buffer = rd->storage_buffer_create(uint32_t(desc_size), Span<uint8_t>(), 0, input_bits);
-	ERR_FAIL_COND_V(!entry.data_buffer.is_valid() || !entry.desc_buffer.is_valid(), nullptr);
+	entry.cost_buffer = rd->storage_buffer_create(triangle_count * sizeof(uint32_t));
+	ERR_FAIL_COND_V(!entry.data_buffer.is_valid() || !entry.desc_buffer.is_valid() || !entry.cost_buffer.is_valid(), nullptr);
 	rd->set_resource_name(entry.data_buffer, "RT OMM data");
 	rd->set_resource_name(entry.desc_buffer, "RT OMM descriptions");
+	rd->set_resource_name(entry.cost_buffer, "RT OMM bake costs");
 
 	RD::OpacityMicromapUsage usage;
 	usage.count = triangle_count;
 	usage.subdivision_level = level;
 	usage.format = RD::OPACITY_MICROMAP_FORMAT_4_STATE;
-	entry.micromap = rd->opacity_micromap_create({ &usage, 1 }, entry.data_buffer, 0, entry.desc_buffer, 0);
-	ERR_FAIL_COND_V(!entry.micromap.is_valid(), nullptr);
-	rd->set_resource_name(entry.micromap, "RT OMM");
+	entry.pending_micromap = rd->opacity_micromap_create({ &usage, 1 }, entry.data_buffer, 0, entry.desc_buffer, 0);
+	ERR_FAIL_COND_V(!entry.pending_micromap.is_valid(), nullptr);
+	rd->set_resource_name(entry.pending_micromap, "RT OMM");
 	entry.level = level;
+	entry.data_size = uint32_t(data_size);
 
-	PendingOmmBake bake;
-	bake.shader = bake_shader;
-	bake.pipeline = bake_pipeline;
-	mat_ubo_pool_ensure_initialized();
-	bake.material_buffer = p_mat_data->uniform_buffer.is_valid() ? p_mat_data->uniform_buffer : mat_ubo_pool_buffer;
-	bake.data_buffer = entry.data_buffer;
-	bake.desc_buffer = entry.desc_buffer;
-	bake.micromap = entry.micromap;
-	bake.data_size = uint32_t(data_size);
-	bake.micro_triangles = triangle_count << (level * 2);
-	RT_OmmBakeJob &job = bake.job;
-	job.geometry = geometry;
-	job.material_address = p_mat_data->data.uniform_address;
-	job.triangle_count = triangle_count;
+	RT_OmmBakeJob &job = entry.job;
 	job.level = level;
 	job.data_offset = 0;
 	job.desc_offset = 0;
+	job.max_samples = RT_OMM_MAX_SAMPLES;
+
+	// Baked over the next frames (_omm_dispatch_bakes()); until then the surface is traced without the micromap.
+	entry.bake_state = RTOmmEntry::BAKE_ESTIMATE;
+	entry.bake_serial = ++omm_bake_serial;
+	entry.refreshed_frame = current_frame;
+	omm_bake_queue.push_back(key);
+	entry.failed = false;
+	return nullptr;
+}
+
+bool RenderRaytracing::_omm_fill_job(RTOmmEntry &r_entry, void *p_mesh_surface, const RTMaterialData *p_mat_data, uint32_t p_lod) {
+	RD *rd = RD::get_singleton();
+	// The surface at rest, as the mesh stores it: the micromap goes with its triangles, wherever they are moved.
+	RTSurfaceData rest;
+	RID vertex_buffer, attribute_buffer, index_buffer;
+	_fill_surface_geometry_data(p_mesh_surface, false, &rest, &vertex_buffer, &attribute_buffer, &index_buffer);
+	RT_GeometryData &geometry = rest.geometry;
+	if (p_lod > 0) {
+		// A LOD's triangles: its own indices into the same vertices, in the order the merged BLASes replicate them
+		// (_get_lod_view() keeps it), with the format of LOD 0's.
+		RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+		index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, p_lod);
+		const uint32_t lod_index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, p_lod);
+		if (!index_buffer.is_valid() || lod_index_count == 0 || geometry.index_format == RT_INDEX_FORMAT_NONE) {
+			return false;
+		}
+		geometry.primitive_count = lod_index_count / 3;
+	}
+	if (vertex_buffer.is_valid()) {
+		geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+	}
+	if (attribute_buffer.is_valid()) {
+		geometry.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+	}
+	if (index_buffer.is_valid() && geometry.index_format != RT_INDEX_FORMAT_NONE) {
+		geometry.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+	}
+	if (geometry.primitive_count == 0 || !vertex_buffer.is_valid()) {
+		return false;
+	}
+	// A bake under way keeps its triangles: the key holds the surface's counter, so they cannot change.
+	RT_OmmBakeJob &job = r_entry.job;
+	ERR_FAIL_COND_V(r_entry.bake_state != RTOmmEntry::BAKE_NONE && job.triangle_count != geometry.primitive_count, false);
+
+	job.geometry = geometry;
+	job.triangle_count = geometry.primitive_count;
+	job.material_address = p_mat_data->data.uniform_address;
 	job.albedo_texture_idx = p_mat_data->data.albedo_texture_idx;
 	job.albedo_alpha = p_mat_data->data.albedo_color[3];
 	job.uv1_scale[0] = p_mat_data->data.uv1_scale[0];
@@ -1955,11 +1970,9 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 	job.uv1_offset[0] = p_mat_data->data.uv1_offset[0];
 	job.uv1_offset[1] = p_mat_data->data.uv1_offset[1];
 	job.use_vertex_color = (p_mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR_ALBEDO) ? 1 : 0;
-	job.max_samples = 32;
-	pending_omm_bakes.push_back(bake);
-
-	entry.failed = false;
-	return &entry;
+	mat_ubo_pool_ensure_initialized();
+	r_entry.material_buffer = p_mat_data->uniform_buffer.is_valid() ? p_mat_data->uniform_buffer : mat_ubo_pool_buffer;
+	return true;
 }
 
 RID RenderRaytracing::_omm_static_blas(RTOmmEntry *p_entry, void *p_mesh_surface, LocalVector<RID> &r_dirty_blas_list) {
@@ -1973,73 +1986,200 @@ RID RenderRaytracing::_omm_static_blas(RTOmmEntry *p_entry, void *p_mesh_surface
 	return p_entry->surf_data.blas;
 }
 
+void RenderRaytracing::_omm_estimate_arrived_static(const Vector<uint8_t> &p_data, uint64_t p_serial) {
+	if (displace_guard_target) {
+		displace_guard_target->_omm_estimate_arrived(p_data, p_serial);
+	}
+}
+
+void RenderRaytracing::_omm_estimate_arrived(const Vector<uint8_t> &p_data, uint64_t p_serial) {
+	const RTOmmKey *key = omm_estimates_pending.getptr(p_serial);
+	if (!key) {
+		return;
+	}
+	// Gone, or started again, since: its estimate is of no use.
+	RTOmmEntry *entry = omm_entries.getptr(*key);
+	if (entry && entry->bake_serial == p_serial && entry->bake_state == RTOmmEntry::BAKE_ESTIMATING &&
+			p_data.size() >= int64_t(entry->job.triangle_count * sizeof(uint32_t))) {
+		entry->triangle_cost.resize(entry->job.triangle_count);
+		memcpy(entry->triangle_cost.ptr(), p_data.ptr(), entry->job.triangle_count * sizeof(uint32_t));
+		entry->next_micro = 0;
+		entry->remaining_cost = 0;
+		for (const uint32_t cost : entry->triangle_cost) {
+			entry->remaining_cost += uint64_t(cost) * RT_OMM_COST_UNIT;
+		}
+		entry->bake_state = RTOmmEntry::BAKE_RANGES;
+	}
+	omm_estimates_pending.erase(p_serial);
+}
+
 void RenderRaytracing::_omm_dispatch_bakes() {
-	if (pending_omm_bakes.is_empty()) {
+	if (omm_bake_queue.is_empty()) {
 		return;
 	}
 	RD *rd = RD::get_singleton();
+	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
+	// The bakes' share of a frame: RT_OMM_BAKE_BUDGET estimated evaluations, under 2 ms of GPU on an RTX 5070 (~1 ms on
+	// average; godot3d's Mir forest, PT-OMM-BAKE-BUDGET-FIXES.md). A bake costs ~4 evaluations per texel of the surface's
+	// UV area: one tiling a 1024² texture several times took 0.4 s in one frame. An entry advances only in a frame that
+	// asked for it (its inputs taken from the live surface); a frame's first share holds at least one micro-triangle, so
+	// every bake ends.
+	static constexpr uint64_t RT_OMM_BAKE_BUDGET = uint64_t(64) << 20;
+	// The estimate pass: vertex() at a triangle's corners and one evaluation, counted as this many evaluations.
+	static constexpr uint64_t RT_OMM_ESTIMATE_COST = 16;
+	uint64_t budget = RT_OMM_BAKE_BUDGET;
 
-	// The textures the materials registered are in the tables already.
-	const RID bindless_set = bindless_block->get_secondary_uniform_set(pending_omm_bakes[0].shader, 1);
-	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(pending_omm_bakes[0].shader, 2);
-	if (!bindless_set.is_valid() || !bindless_array_set.is_valid()) {
-		pending_omm_bakes.clear();
-		ERR_FAIL_MSG("RT: no bindless tables for the opacity micromap bakes.");
+	struct Work {
+		RTOmmKey key;
+		RTOmmEntry *entry;
+		uint32_t first; // Triangle (estimate) or micro-triangle (bake) of the first thread.
+		uint32_t count; // Threads.
+		bool estimate;
+		bool last;
+	};
+	// The bakes with the least work left first (estimates first: one evaluation per triangle), so that one costly surface
+	// does not hold back the many cheap ones: after a material change re-keys a forest's leaves, they all wait for their
+	// micromaps again, and are traced without them until then.
+	struct Queued {
+		uint64_t cost;
+		RTOmmKey key;
+		bool operator<(const Queued &p_other) const { return cost < p_other.cost; }
+	};
+	LocalVector<Queued> queued;
+	for (const RTOmmKey &key : omm_bake_queue) {
+		const RTOmmEntry *entry = omm_entries.getptr(key);
+		if (entry && entry->bake_state != RTOmmEntry::BAKE_NONE) { // Else evicted, failed or done.
+			queued.push_back({ entry->bake_state == RTOmmEntry::BAKE_RANGES ? entry->remaining_cost : 0, key });
+		}
+	}
+	queued.sort();
+
+	LocalVector<Work> work;
+	LocalVector<RTOmmKey> remaining;
+	for (const Queued &q : queued) {
+		const RTOmmKey &key = q.key;
+		RTOmmEntry *entry = omm_entries.getptr(key);
+		remaining.push_back(key);
+		if (entry->refreshed_frame != current_frame || (budget == 0 && !work.is_empty())) {
+			continue;
+		}
+		if (entry->bake_state == RTOmmEntry::BAKE_ESTIMATE) {
+			work.push_back({ key, entry, 0, entry->job.triangle_count, true, false });
+			budget -= MIN(budget, uint64_t(entry->job.triangle_count) * RT_OMM_ESTIMATE_COST);
+		} else if (entry->bake_state == RTOmmEntry::BAKE_RANGES) {
+			// Micro-triangles in a row, a triangle's estimate spread evenly over its own: a triangle too costly for one frame
+			// is split.
+			const uint32_t micro_count = 1u << (entry->level * 2);
+			const uint64_t total = uint64_t(entry->job.triangle_count) * micro_count;
+			const uint64_t first = entry->next_micro;
+			uint64_t end = first;
+			while (end < total) {
+				const uint64_t triangle_cost = uint64_t(entry->triangle_cost[end / micro_count]) * RT_OMM_COST_UNIT;
+				const uint64_t per_micro = MAX(uint64_t(1), triangle_cost / micro_count);
+				const uint64_t left_in_triangle = micro_count - end % micro_count;
+				uint64_t take = MIN(left_in_triangle, budget / per_micro);
+				if (take == 0) {
+					if (end != first || !work.is_empty()) {
+						break;
+					}
+					take = 1;
+				}
+				budget -= MIN(budget, take * per_micro);
+				entry->remaining_cost -= MIN(entry->remaining_cost, take * per_micro);
+				end += take;
+				if (take < left_in_triangle) {
+					break;
+				}
+			}
+			if (end > first) {
+				work.push_back({ key, entry, uint32_t(first), uint32_t(end - first), false, end == total });
+			}
+		}
+	}
+	omm_bake_queue = remaining;
+	if (work.is_empty()) {
+		return;
 	}
 
-	if (omm_job_capacity < pending_omm_bakes.size()) {
+	// The textures the materials registered are in the tables already.
+	const RID bindless_set = bindless_block->get_secondary_uniform_set(work[0].entry->bake_shader, 1);
+	const RID bindless_array_set = bindless_array_block->get_secondary_uniform_set(work[0].entry->bake_shader, 2);
+	ERR_FAIL_COND_MSG(!bindless_set.is_valid() || !bindless_array_set.is_valid(), "RT: no bindless tables for the opacity micromap bakes.");
+
+	if (omm_job_capacity < work.size()) {
 		if (omm_job_buffer.is_valid()) {
 			rd->free_rid(omm_job_buffer);
 		}
-		omm_job_capacity = Math::next_power_of_2(pending_omm_bakes.size());
+		omm_job_capacity = Math::next_power_of_2(work.size());
 		omm_job_buffer = rd->storage_buffer_create(omm_job_capacity * sizeof(RT_OmmBakeJob));
 		rd->set_resource_name(omm_job_buffer, "RT OMM bake jobs");
 	}
 	LocalVector<RT_OmmBakeJob> job_data;
-	job_data.resize(pending_omm_bakes.size());
-	for (uint32_t i = 0; i < pending_omm_bakes.size(); i++) {
-		job_data[i] = pending_omm_bakes[i].job;
-		// The bake ORs the states in.
-		rd->buffer_clear(pending_omm_bakes[i].data_buffer, 0, pending_omm_bakes[i].data_size);
+	job_data.resize(work.size());
+	for (uint32_t i = 0; i < work.size(); i++) {
+		job_data[i] = work[i].entry->job;
+		if (!work[i].estimate && work[i].first == 0) {
+			// The bake ORs the states in.
+			rd->buffer_clear(work[i].entry->data_buffer, 0, work[i].entry->data_size);
+		}
 	}
 	rd->buffer_update(omm_job_buffer, 0, job_data.size() * sizeof(RT_OmmBakeJob), job_data.ptr());
 
 	const LocalVector<RD::Uniform> frame_uniforms = _displace_frame_uniforms(omm_job_buffer);
 
+	RENDER_TIMESTAMP("RT Bake Opacity Micromaps");
 	rd->draw_command_begin_label("RT Bake Opacity Micromaps");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	RID bound_pipeline;
 	LocalVector<RID> job_sets;
-	for (uint32_t i = 0; i < pending_omm_bakes.size(); i++) {
-		const PendingOmmBake &bake = pending_omm_bakes[i];
-		if (bake.pipeline != bound_pipeline) {
-			rd->compute_list_bind_compute_pipeline(compute_list, bake.pipeline);
-			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(bake.shader, 0, frame_uniforms), 0);
+	for (uint32_t i = 0; i < work.size(); i++) {
+		const Work &w = work[i];
+		RTOmmEntry &entry = *w.entry;
+		if (entry.bake_pipeline != bound_pipeline) {
+			rd->compute_list_bind_compute_pipeline(compute_list, entry.bake_pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache_vec(entry.bake_shader, 0, frame_uniforms), 0);
 			rd->compute_list_bind_uniform_set(compute_list, bindless_set, 1);
 			rd->compute_list_bind_uniform_set(compute_list, bindless_array_set, 2);
-			bound_pipeline = bake.pipeline;
+			bound_pipeline = entry.bake_pipeline;
 		}
-		RD::Uniform data(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, bake.data_buffer);
-		RD::Uniform descs(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, bake.desc_buffer);
-		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, bake.material_buffer);
-		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ data, descs, material }, bake.shader, 3, /*p_linear_pool=*/true);
+		RD::Uniform data(RD::UNIFORM_TYPE_STORAGE_BUFFER, 0, entry.data_buffer);
+		RD::Uniform descs(RD::UNIFORM_TYPE_STORAGE_BUFFER, 1, entry.desc_buffer);
+		RD::Uniform material(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, entry.material_buffer);
+		RD::Uniform costs(RD::UNIFORM_TYPE_STORAGE_BUFFER, 3, entry.cost_buffer);
+		const RID job_set = rd->uniform_set_create(Vector<RD::Uniform>{ data, descs, material, costs }, entry.bake_shader, 3, /*p_linear_pool=*/true);
 		rd->compute_list_bind_uniform_set(compute_list, job_set, 3);
 		job_sets.push_back(job_set);
 
-		const uint32_t push_constant[4] = { i, 0, 0, 0 };
+		const uint32_t push_constant[4] = { i, 0, w.first, w.estimate ? 1u : 0u };
 		rd->compute_list_set_push_constant(compute_list, push_constant, sizeof(push_constant));
-		_rt_dispatch_linear(rd, compute_list, bake.micro_triangles);
+		_rt_dispatch_linear(rd, compute_list, w.count);
 	}
 	rd->compute_list_end();
 	for (const RID &job_set : job_sets) {
 		rd->free_rid(job_set);
 	}
-	// The micromaps, before the BLAS builds that read them.
-	for (const PendingOmmBake &bake : pending_omm_bakes) {
-		rd->opacity_micromap_build(bake.micromap);
+	for (const Work &w : work) {
+		RTOmmEntry &entry = *w.entry;
+		if (w.estimate) {
+			// Read when the GPU is done with the frame, without waiting for it.
+			entry.bake_state = RTOmmEntry::BAKE_ESTIMATING;
+			omm_estimates_pending.insert(entry.bake_serial, w.key);
+			rd->buffer_get_data_async(entry.cost_buffer, callable_mp_static(&RenderRaytracing::_omm_estimate_arrived_static).bind(entry.bake_serial), 0, entry.job.triangle_count * sizeof(uint32_t));
+			continue;
+		}
+		entry.next_micro = w.first + w.count;
+		if (w.last) {
+			// Its micromap, before the BLAS builds that read it: the next frames' callers get it.
+			rd->opacity_micromap_build(entry.pending_micromap);
+			entry.micromap = entry.pending_micromap;
+			entry.pending_micromap = RID();
+			entry.bake_state = RTOmmEntry::BAKE_NONE;
+			entry.triangle_cost.reset();
+			rd->free_rid(entry.cost_buffer);
+			entry.cost_buffer = RID();
+		}
 	}
 	rd->draw_command_end_label();
-	pending_omm_bakes.clear();
 }
 
 void RenderRaytracing::_omm_free_entry(RTOmmEntry &p_entry) {
@@ -2050,6 +2190,13 @@ void RenderRaytracing::_omm_free_entry(RTOmmEntry &p_entry) {
 	}
 	if (p_entry.micromap.is_valid() && rd->acceleration_structure_is_valid(p_entry.micromap)) {
 		rd->free_rid(p_entry.micromap);
+	}
+	// A bake under way: its micromap is not built yet; the queue and an estimate on its way back find the entry gone.
+	if (p_entry.pending_micromap.is_valid() && rd->acceleration_structure_is_valid(p_entry.pending_micromap)) {
+		rd->free_rid(p_entry.pending_micromap);
+	}
+	if (p_entry.cost_buffer.is_valid()) {
+		rd->free_rid(p_entry.cost_buffer);
 	}
 	if (p_entry.data_buffer.is_valid()) {
 		rd->free_rid(p_entry.data_buffer);
@@ -2086,7 +2233,8 @@ void RenderRaytracing::_omm_evict(bool p_all) {
 		}
 	}
 	if (p_all) {
-		pending_omm_bakes.clear();
+		omm_bake_queue.clear();
+		omm_estimates_pending.clear();
 		if (omm_job_buffer.is_valid()) {
 			RD::get_singleton()->free_rid(omm_job_buffer);
 			omm_job_buffer = RID();

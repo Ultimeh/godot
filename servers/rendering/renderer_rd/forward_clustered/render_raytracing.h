@@ -350,6 +350,13 @@ struct alignas(16) RT_OmmBakeJob {
 };
 static_assert(sizeof(RT_OmmBakeJob) == 240, "RT_OmmBakeJob must be 240 bytes for std430");
 
+// Opacity micromap bakes (raytracing_omm_bake.glsl). Every texel under a micro-triangle is examined, as NVIDIA's OMM SDK
+// bakes; a micro-triangle is left unknown only when proven mixed, or when its footprint exceeds RT_OMM_MAX_SAMPLES per
+// edge, a bound on one thread's work (~0.5 M evaluations), not on the classification.
+static constexpr uint32_t RT_OMM_MAX_SAMPLES = 1024;
+// The estimate pass counts the bake's evaluations in units of RT_OMM_COST_UNIT (raytracing_omm_bake.glsl's copy).
+static constexpr uint32_t RT_OMM_COST_UNIT = 1024;
+
 // A mesh surface's cut-out baked with a material (raytracing_omm_bake.glsl): for its static BLAS built again with it, for
 // the BLASes of its deformed copies (skinned, displaced), and for the merged MultiMesh BLASes of a LOD (its triangles).
 struct RTOmmKey {
@@ -396,7 +403,7 @@ struct RTSurfaceData {
 };
 
 struct RTOmmEntry {
-	RID micromap;
+	RID micromap; // Set once the bake is done and the micromap built: until then the surface is traced without it.
 	RID data_buffer; // The micro-triangles' states.
 	RID desc_buffer; // The triangles' descriptions.
 	uint32_t level = 0; // Subdivision level of its entries, one per triangle.
@@ -405,6 +412,30 @@ struct RTOmmEntry {
 	uint32_t last_used_frame = 0;
 	bool failed = false;
 	bool superseded = false; // Its surface or material changed since: no key will ask for it again.
+
+	// The bake, spread over frames within a GPU budget (_omm_dispatch_bakes()): its cost estimated per triangle, then the
+	// micro-triangles baked by ranges, the micromap built after the last one.
+	enum BakeState : uint8_t {
+		BAKE_NONE, // Not started, or done.
+		BAKE_ESTIMATE, // The estimate pass is to be dispatched.
+		BAKE_ESTIMATING, // Its result is on its way back (buffer_get_data_async()).
+		BAKE_RANGES, // Micro-triangles from next_micro on (all the triangles' in a row) are to be baked.
+	};
+	BakeState bake_state = BAKE_NONE;
+	RID pending_micromap; // The micromap being baked, the entry's once built.
+	RID cost_buffer; // Per triangle, the estimated evaluations of its bake (RT_OMM_COST_UNIT each).
+	LocalVector<uint32_t> triangle_cost;
+	uint64_t remaining_cost = 0; // Estimated evaluations left: the queue serves the least first.
+	uint32_t next_micro = 0;
+	uint64_t bake_serial = 0; // Matches the estimate on its way back.
+	// The bake's inputs, taken again from the live surface and material every frame a caller asks for the entry
+	// (refreshed_frame): only then is a range baked, so no buffer address is older than the frame.
+	RT_OmmBakeJob job = {};
+	RID bake_shader;
+	RID bake_pipeline;
+	RID material_buffer;
+	uint32_t data_size = 0;
+	uint32_t refreshed_frame = UINT32_MAX;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -948,27 +979,25 @@ class RenderRaytracing {
 	HashMap<RTOmmKey, RTOmmEntry, RTOmmKey> omm_entries;
 	// The current key of each {mesh, surface, material, LOD} (the key with its counters at 0): a new one supersedes it.
 	HashMap<RTOmmKey, RTOmmKey, RTOmmKey> omm_current_keys;
-	struct PendingOmmBake {
-		RID shader;
-		RID pipeline;
-		RID material_buffer;
-		RID data_buffer;
-		RID desc_buffer;
-		RID micromap;
-		uint32_t data_size = 0;
-		uint32_t micro_triangles = 0; // Threads.
-		RT_OmmBakeJob job = {};
-	};
-	LocalVector<PendingOmmBake> pending_omm_bakes;
+	// The entries whose bake is under way, oldest first (_omm_dispatch_bakes()).
+	LocalVector<RTOmmKey> omm_bake_queue;
+	// The estimates on their way back: serial -> key.
+	HashMap<uint64_t, RTOmmKey> omm_estimates_pending;
+	uint64_t omm_bake_serial = 0;
 	RID omm_job_buffer;
 	uint32_t omm_job_capacity = 0;
 	uint32_t omm_sweep_frame = 0;
-	// The surface's cut-out baked with the material into a micromap, when the material allows it and the surface lasted
-	// (the bake queued this frame if new), or null. With p_lod, the triangles of that LOD.
+	// The surface's cut-out baked with the material into a micromap, when the material allows it, the surface lasted and
+	// its bake is done, or null (the bake started or carried on for this frame). With p_lod, the triangles of that LOD.
 	RTOmmEntry *_omm_entry(void *p_mesh_surface, RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, RID p_material, uint16_t p_material_counter, const RTMaterialData *p_mat_data, bool p_multimesh, uint32_t p_lod = 0);
+	// Takes the bake's inputs from the live surface and material (false: the surface cannot be baked).
+	bool _omm_fill_job(RTOmmEntry &r_entry, void *p_mesh_surface, const RTMaterialData *p_mat_data, uint32_t p_lod);
+	static void _omm_estimate_arrived_static(const Vector<uint8_t> &p_data, uint64_t p_serial);
+	void _omm_estimate_arrived(const Vector<uint8_t> &p_data, uint64_t p_serial);
 	// The surface's static BLAS built again with the entry's micromap (built this frame if new), or invalid.
 	RID _omm_static_blas(RTOmmEntry *p_entry, void *p_mesh_surface, LocalVector<RID> &r_dirty_blas_list);
-	// Records the bakes and the micromap builds _omm_blas() queued, before the BLAS builds.
+	// Records this frame's share of the queued bakes (estimates, then ranges of micro-triangles within the GPU budget) and
+	// the micromaps of the bakes done, before the BLAS builds.
 	void _omm_dispatch_bakes();
 	void _omm_free_entry(RTOmmEntry &p_entry);
 	// Frees the entries no frame used for a while (all of them with p_all).

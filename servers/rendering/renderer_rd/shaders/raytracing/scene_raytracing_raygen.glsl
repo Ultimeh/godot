@@ -845,15 +845,10 @@ void main() {
 	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	MaterialData mat = materials[geometry_idx];
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	// The mip level the closest hit and raster read, so the cut-out does not change from one pixel's ray to the next.
-	vec3 bary_ddx, bary_ddy;
-	hit_barycentric_derivatives(geom, i0, i1, i2, bary, bary_ddx, bary_ddy);
-	vec2 uv0 = fetch_uv(geom, i0, i0, i0, vec3(1.0, 0.0, 0.0));
-	vec2 uv1 = fetch_uv(geom, i1, i1, i1, vec3(1.0, 0.0, 0.0));
-	vec2 uv2 = fetch_uv(geom, i2, i2, i2, vec3(1.0, 0.0, 0.0));
-	vec2 uv_ddx = (uv0 * bary_ddx.x + uv1 * bary_ddx.y + uv2 * bary_ddx.z) * mat.uv1_scale;
-	vec2 uv_ddy = (uv0 * bary_ddy.x + uv1 * bary_ddy.y + uv2 * bary_ddy.z) * mat.uv1_scale;
-	float alpha = textureGrad(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, uv_ddx, uv_ddy).a;
+	// The base level, as the opacity micromap is baked (raytracing_omm_bake.glsl): zero gradients take level 0 whatever
+	// the sampler's mip bias. A mip following the ray's footprint would disagree with the micromap's known states at a
+	// distance (NVIDIA OMM SDK integration guide: "Pick a texture mip and always use that version").
+	float alpha = textureGrad(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, vec2(0.0), vec2(0.0)).a;
 	alpha *= mat.albedo_color.a;
 	if ((mat.flags & MAT_FLAG_VERTEX_COLOR_ALBEDO) != 0u) {
 		alpha *= fetch_color(geom, i0, i1, i2, bary).a;

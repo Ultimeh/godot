@@ -148,8 +148,16 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 	}
 	rt_hit_bary = rt_bary;
 	rt_set_fragment_inputs(rt_bary);
+#ifdef RT_STAGE_ANY_HIT
+	// The alpha test reads the textures' base level, as the opacity micromap is baked (raytracing_omm_bake.glsl): no
+	// screen derivatives, so dFdx() is 0 and the material's texture() calls (textureGrad()) take level 0 whatever the
+	// sampler's mip bias. A mip following the ray's footprint would disagree with the micromap's known states at a
+	// distance (NVIDIA OMM SDK integration guide: "Pick a texture mip and always use that version").
+	rt_derivatives_ready = false;
+#else
 	hit_barycentric_derivatives(rt_geom, rt_i0, rt_i1, rt_i2, rt_bary, rt_hit_bary_ddx, rt_hit_bary_ddy);
 	rt_derivatives_ready = true;
+#endif
 } else {
 	// Procedural geometry has no vertices: vertex() runs once at the hit, without screen derivatives.
 	/* RT_CUSTOM_VERTEX_CALL */

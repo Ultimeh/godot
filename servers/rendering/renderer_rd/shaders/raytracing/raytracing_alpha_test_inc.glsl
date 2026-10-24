@@ -16,7 +16,9 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 
 	MaterialData mat = materials[geometry_idx];
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	// The base level, as the any-hit shaders and the opacity micromap bake test it: zero gradients take level 0 whatever
+	// the sampler's mip bias (texture() took a mip from the shaded pixel's derivatives in a fragment shader).
+	float alpha = textureGrad(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, vec2(0.0), vec2(0.0)).a;
 	alpha *= mat.albedo_color.a;
 	if ((mat.flags & MAT_FLAG_VERTEX_COLOR_ALBEDO) != 0u) {
 		alpha *= fetch_color(geom, i0, i1, i2, bary).a;

@@ -14,8 +14,8 @@
 // custom variant runs the material's vertex() at the corners and its fragment code; the standard one, hit group 0's
 // alpha) at points spaced at most half a texel apart in every texture the decision samples. All of them pass: opaque;
 // none: transparent; otherwise, or when one sits on the threshold (RT_OMM_ALPHA_TIE), unknown, and the any-hit shader
-// decides as before. The decision is taken at mip 0, as
-// up close; a distant ray reading a coarser mip may differ along the edges of the cut-out.
+// decides as before. The decision is taken at the textures' base level, which the any-hit shaders test at any distance
+// too (NVIDIA OMM SDK integration guide: "Pick a texture mip and always use that version").
 //
 // Output: the entries' 2-bit states in micro-triangle order (the space-filling curve of VK_EXT_opacity_micromap and
 // D3D12's opacity micromaps), LSB first, and per triangle its 8-byte description (byte offset, level, format).
@@ -84,10 +84,20 @@ layout(set = 3, binding = 2, std430) restrict readonly buffer MaterialDependency
 }
 material_dependency;
 
+// The estimate pass's output: per triangle, the samples its bake takes, in units of RT_OMM_COST_UNIT.
+layout(set = 3, binding = 3, std430) restrict writeonly buffer OmmCost {
+	uint v[];
+}
+omm_cost;
+
+// render_raytracing.h's RT_OMM_COST_UNIT.
+#define RT_OMM_COST_UNIT 1024u
+
 layout(push_constant, std430) uniform Params {
 	uint job_index;
 	uint never; // Always 0: keeps every binding statically used, so all slots share the set layouts.
-	uint pad[2];
+	uint first; // The dispatch's first triangle (estimate) or micro-triangle (bake).
+	uint estimate; // 1: one thread per triangle estimates its bake's samples (omm_cost); 0: one per micro-triangle bakes.
 }
 params;
 
@@ -324,17 +334,39 @@ void main() {
 	const uint micro_count = 1u << (job.level * 2u);
 	// _rt_dispatch_linear(): the groups beyond the device's X limit go on Y.
 	const uint thread = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
-	const uint triangle = thread / micro_count;
-	const uint micro = thread % micro_count;
+	// The estimate's threads are triangles from params.first on; the bake's, micro-triangles (all the triangles' in a row).
+	const uint item = params.first + thread;
+	const uint triangle = params.estimate != 0u ? item : item / micro_count;
+	const uint micro = item % micro_count;
 
 	if (params.never != 0u) {
 		float value = global_shader_uniforms.data[0].x + scene_data_block.data.time;
 		value += texelFetch(sampler2D(bindless_textures[nonuniformEXT(triangle)], SAMPLER_NEAREST_CLAMP), ivec2(0), 0).r;
 		value += texelFetch(sampler2DArray(bindless_texture_arrays[nonuniformEXT(triangle)], SAMPLER_NEAREST_CLAMP), ivec3(0), 0).r;
 		omm_data.v[0] = material_dependency.v[0] + floatBitsToUint(value);
+		omm_cost.v[0] = floatBitsToUint(value);
 	}
 
 	if (triangle >= job.triangle_count) {
+		return;
+	}
+
+	const uint n = 1u << job.level;
+	if (params.estimate != 0u) {
+		// The samples the bake below takes for this triangle, from the footprint of a micro-triangle's edges at its centre
+		// (the same measure, over the whole triangle's edges divided by 2^level): its micro-triangles beyond max_samples
+		// stay unknown after one evaluation.
+		rt_omm_geom = job.geom;
+		get_triangle_indices_ex(rt_omm_geom, triangle, rt_omm_i0, rt_omm_i1, rt_omm_i2);
+		rt_omm_prepare_triangle(job);
+		rt_omm_measuring = true;
+		rt_omm_footprint = 0.0;
+		rt_omm_sample(vec3(1.0 / 3.0), vec3(-1.0, 1.0, 0.0) / float(n), vec3(-1.0, 0.0, 1.0) / float(n));
+		rt_omm_measuring = false;
+		const uint steps = max(1u, uint(ceil(rt_omm_footprint * 2.0)));
+		const uint64_t samples = steps <= job.max_samples ? uint64_t(steps + 1u) * uint64_t(steps + 2u) / 2u + 1u : 1u;
+		const uint64_t units = (samples * uint64_t(micro_count) + uint64_t(RT_OMM_COST_UNIT - 1u)) / uint64_t(RT_OMM_COST_UNIT);
+		omm_cost.v[triangle] = uint(min(units, uint64_t(0xFFFFFFFFu)));
 		return;
 	}
 
@@ -350,7 +382,6 @@ void main() {
 	rt_omm_prepare_triangle(job);
 
 	// The micro-triangle, enumerated row by row: row v holds 2^level - v upright micro-triangles and one inverted fewer.
-	const uint n = 1u << job.level;
 	uint row = 0u;
 	uint first = 0u;
 	while (row < n && micro >= first + 2u * (n - row) - 1u) {
@@ -380,7 +411,7 @@ void main() {
 	const vec3 b2 = vec3(1.0 - c2.x - c2.y, c2.x, c2.y);
 
 	// The texel footprint of the micro-triangle's edges, from the textures the decision samples: half a texel between
-	// evaluations. Beyond max_samples, the micro-triangle stays unknown.
+	// evaluations. Beyond max_samples (a bound on one thread's work), the micro-triangle stays unknown.
 	rt_omm_measuring = true;
 	rt_omm_footprint = 0.0;
 	rt_omm_sample((b0 + b1 + b2) / 3.0, b1 - b0, b2 - b0);
@@ -391,14 +422,12 @@ void main() {
 	if (steps <= job.max_samples) {
 		const vec3 step_dx = (b1 - b0) / float(steps);
 		const vec3 step_dy = (b2 - b0) / float(steps);
-		// Mip 0: a footprint far below a texel.
-		const vec3 tiny_dx = step_dx * 1e-3;
-		const vec3 tiny_dy = step_dy * 1e-3;
 		bool any_opaque = false;
 		bool any_transparent = false;
 		for (uint j = 0u; j <= steps && !(any_opaque && any_transparent); j++) {
 			for (uint i = 0u; i + j <= steps; i++) {
-				const uint sample_state = rt_omm_sample(b0 + step_dx * float(i) + step_dy * float(j), tiny_dx, tiny_dy);
+				// Level 0, as the any-hit shaders test it: zero gradients, whatever the sampler's mip bias.
+				const uint sample_state = rt_omm_sample(b0 + step_dx * float(i) + step_dy * float(j), vec3(0.0), vec3(0.0));
 				any_opaque = any_opaque || sample_state != RT_OMM_SAMPLE_TRANSPARENT;
 				any_transparent = any_transparent || sample_state != RT_OMM_SAMPLE_OPAQUE;
 				if (any_opaque && any_transparent) {
