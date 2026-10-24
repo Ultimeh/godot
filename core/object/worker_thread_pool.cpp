@@ -59,6 +59,7 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 	int pool_thread_index = thread_ids[Thread::get_caller_id()];
 	ThreadData &curr_thread = threads[pool_thread_index];
 	Task *prev_task = nullptr; // In case this is recursively called.
+	bool prev_has_pump_task = false;
 
 	bool safe_for_nodes_backup = is_current_thread_safe_for_nodes();
 	CallQueue *call_queue_backup = MessageQueue::get_singleton() != MessageQueue::get_main_singleton() ? MessageQueue::get_singleton() : nullptr;
@@ -77,8 +78,9 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 		task_mutex.lock();
 		p_task->pool_thread_index = pool_thread_index;
 		prev_task = curr_thread.current_task;
+		prev_has_pump_task = curr_thread.has_pump_task;
 		curr_thread.current_task = p_task;
-		curr_thread.has_pump_task = p_task->is_pump_task;
+		curr_thread.has_pump_task = prev_has_pump_task || p_task->is_pump_task;
 		task_mutex.unlock();
 	}
 #endif
@@ -162,8 +164,7 @@ void WorkerThreadPool::_process_task(Task *p_task) {
 #ifdef THREADS_ENABLED
 	{
 		curr_thread.current_task = prev_task;
-		// Back to the task this one was nested in: a pump task running its wait must still refuse other pump tasks.
-		curr_thread.has_pump_task = prev_task && prev_task->is_pump_task;
+		curr_thread.has_pump_task = prev_has_pump_task;
 		if (low_priority) {
 			low_priority_threads_used--;
 
@@ -299,8 +300,8 @@ void WorkerThreadPool::_notify_threads(const ThreadData *p_current_thread_data, 
 			continue;
 		}
 		if (th.current_task) {
-			// Good thread for promoting low-prio?
-			if (to_promote && th.awaited_task && th.current_task->low_priority) {
+			// Good thread for promoting low-prio? Not one running a pump task: it takes no queued task.
+			if (to_promote && th.awaited_task && th.current_task->low_priority && !th.has_pump_task) {
 				if (likely(&th != p_current_thread_data)) {
 					th.cond_var.notify_one();
 				}
@@ -328,7 +329,7 @@ void WorkerThreadPool::_notify_threads(const ThreadData *p_current_thread_data, 
 		if (th.signaled) {
 			continue;
 		}
-		if (th.awaited_task) {
+		if (th.awaited_task && !th.has_pump_task) {
 			if (likely(&th != p_current_thread_data)) {
 				th.cond_var.notify_one();
 			}
@@ -552,9 +553,31 @@ void WorkerThreadPool::_wait_collaboratively(ThreadData *p_caller_pool_thread, T
 				}
 			}
 
-			if (p_caller_pool_thread->pool->task_queue.first()) {
+			if (p_caller_pool_thread->has_pump_task) {
+				// A pump task serves a queue whose clients block on it (CommandQueueMT::push_and_sync()), so its thread
+				// takes no other queued task: one waiting for such a client deadlocks (ResourceLoader waits for the main
+				// thread, which waits in RenderingServer::sync()), and any other leaves the queue unserved while it runs.
+				// It only runs the task it awaits, if no other thread took it yet. _notify_threads() never picks it.
+				if (p_task != ThreadData::YIELDING && !p_task->is_pump_task && p_task->task_elem.in_list()) {
+					bool queued_normal = false;
+					for (SelfList<Task> *E = task_queue.first(); E; E = E->next()) {
+						if (E == &p_task->task_elem) {
+							queued_normal = true;
+							break;
+						}
+					}
+					if (queued_normal) {
+						task_queue.remove(&p_task->task_elem);
+					} else {
+						// Still in the low priority queue: promote it to this thread, as _try_promote_low_priority_task() does.
+						low_priority_task_queue.remove(&p_task->task_elem);
+						low_priority_threads_used++;
+					}
+					task_to_process = p_task;
+				}
+			} else if (p_caller_pool_thread->pool->task_queue.first()) {
 				task_to_process = task_queue.first()->self();
-				if ((p_task == ThreadData::YIELDING || p_caller_pool_thread->has_pump_task == true) && task_to_process->is_pump_task) {
+				if (p_task == ThreadData::YIELDING && task_to_process->is_pump_task) {
 					task_to_process = nullptr;
 					_notify_threads(p_caller_pool_thread, 1, 0);
 				} else {

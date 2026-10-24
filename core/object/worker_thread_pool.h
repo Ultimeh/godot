@@ -119,7 +119,7 @@ private:
 		bool signaled : 1;
 		bool pre_exited_languages : 1;
 		bool exited_languages : 1;
-		bool has_pump_task : 1; // Threads can only have one pump task.
+		bool has_pump_task : 1; // A pump task runs on this thread (one at most), under any nested task: it takes no other queued task.
 		Task *current_task = nullptr;
 		Task *awaited_task = nullptr; // Null if not awaiting the condition variable, or special value (YIELDING).
 		ConditionVariable cond_var;
