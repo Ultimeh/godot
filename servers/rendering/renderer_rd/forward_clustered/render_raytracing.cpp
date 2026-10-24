@@ -1547,7 +1547,7 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 			bool evaluate = reshaped || entry->displaced_guard_rebuild || refit_switched;
 			if (!evaluate && (entry->displaced_deferred || entry->displaced_material_counter != material_counter || entry->displaced_instance_uniforms_hash != instance_uniforms_hash || cse->uses_vertex_time || (cse->vertex_reads_camera && camera_moved))) {
 				// What vertex() keeps moving (TIME, the camera, a parameter set every frame: Terrain3D's geomorphing, an
-				// instance uniform) is evaluated, and its BLAS rebuilt, every frame near the camera and every N frames beyond,
+				// instance uniform) is evaluated, and its BLAS refit, every frame near the camera and every N frames beyond,
 				// N growing with the distance. The surfaces take turns, and the motion between two updates is reported on the
 				// update frame.
 				uint32_t period = 1;
@@ -1572,13 +1572,15 @@ void RenderRaytracing::_displace_surfaces(const RenderDataRD *p_render_data) {
 				evaluate = true;
 				reshaped = true;
 			}
-			// What can turn triangles on or off builds the BLAS again: a new surface or buffer, another material or a
-			// parameter change, the instance moved (Terrain3D's clipmap: the only time its holes move), another micromap.
-			// Otherwise (TIME, the camera, instance uniforms) it is refit, and every DISPLACED_REBUILD_PERIOD refits built
-			// again, as the BVH of a refit keeps the topology of its build. The refit keeps the triangles' state
-			// (raytracing_displace.glsl). rendering/pathtracing/displaced_refit off builds again every time.
+			// What can turn triangles on or off builds the BLAS again: a new surface or buffer, another hit group, the
+			// instance moved (Terrain3D's clipmap: the only time its holes move), another micromap. Otherwise (TIME, the
+			// camera, a material parameter or an instance uniform set every frame: Terrain3D's _camera_pos) it is refit,
+			// and every DISPLACED_REBUILD_PERIOD refits built again, as the BVH of a refit keeps the topology of its build.
+			// The refit keeps the triangles' state (raytracing_displace.glsl); a vertex turning on or off sets the guard,
+			// which builds the BLAS again a frame later (DXR and Vulkan: an update cannot change a primitive's active
+			// state). rendering/pathtracing/displaced_refit off builds again every time.
 			const bool rebuild = !displaced_refit || refit_switched || reshaped || entry->displaced_guard_rebuild || entry->displaced_refits >= DISPLACED_REBUILD_PERIOD ||
-					entry->displaced_material_counter != material_counter || !entry->ptr || !rd->acceleration_structure_is_valid(entry->ptr->blas) || !entry->blas_built_once ||
+					!entry->ptr || !rd->acceleration_structure_is_valid(entry->ptr->blas) || !entry->blas_built_once ||
 					!entry->owned_vb_full.is_valid() || entry->cached_vertex_count != vertex_count || entry->omm_micromap != entry->built_omm_micromap;
 			entry->displaced_frame = current_frame;
 			entry->displaced_rebuild = evaluate && rebuild;
