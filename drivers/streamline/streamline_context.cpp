@@ -41,6 +41,8 @@
 #ifdef STREAMLINE_ENABLED
 #ifdef _WIN32
 #include <windows.h>
+
+#include <dxgi1_2.h>
 #endif
 
 #if defined(__clang__)
@@ -150,11 +152,17 @@ static void _enumerate_support(StreamlineContext *self, const sl::AdapterInfo &a
 }
 
 // The features Godot uses Streamline for. PCL only carries Reflex's latency markers, and NIS only sharpens DLSS's
-// output. Returns eOk if one is supported, otherwise DLSS's result, which says why (ProgrammingGuide.md, 2.4).
-static sl::Result _used_feature_support(StreamlineContext *self, const sl::AdapterInfo &p_adapter_info) {
+// output. Reflex counts on an NVIDIA GPU only: slIsFeatureSupported(kFeatureReflex) succeeds on every vendor (Intel Arc
+// B580: eOk), but Reflex Low Latency and its frame rate limiter are "NVDA only" and other vendors only get PC Latency
+// Stats (ProgrammingGuideReflex.md, overview table), which Godot has no use for.
+// Returns eOk if one is supported, otherwise DLSS's result, which says why (ProgrammingGuide.md, 2.4).
+static sl::Result _used_feature_support(StreamlineContext *self, const sl::AdapterInfo &p_adapter_info, bool p_nvidia) {
 	const sl::Feature features[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureDLSS_RR, sl::kFeatureReflex };
 	sl::Result dlss_result = sl::Result::eErrorFeatureMissing;
 	for (const sl::Feature feature : features) {
+		if (feature == sl::kFeatureReflex && !p_nvidia) {
+			continue;
+		}
 		const sl::Result result = self->slIsFeatureSupported(feature, p_adapter_info);
 		if (result == sl::Result::eOk) {
 			return result;
@@ -166,7 +174,45 @@ static sl::Result _used_feature_support(StreamlineContext *self, const sl::Adapt
 	return dlss_result;
 }
 
-bool StreamlineContext::select_adapter(const sl::AdapterInfo &p_adapter_info, bool p_d3d12, const String &p_adapter_name) {
+#ifdef _WIN32
+// Whether a GPU of this system can use a feature Godot uses Streamline for, checked per DXGI adapter as in
+// ProgrammingGuide.md, 2.4 (an adapter-less slIsFeatureSupported() succeeds for Reflex on any system).
+static sl::Result _system_feature_support(StreamlineContext *self) {
+	typedef HRESULT(WINAPI * PFN_CREATE_DXGI_FACTORY1)(REFIID, void **);
+	HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+	PFN_CREATE_DXGI_FACTORY1 create_factory = dxgi ? (PFN_CREATE_DXGI_FACTORY1)(void *)GetProcAddress(dxgi, "CreateDXGIFactory1") : nullptr;
+	IDXGIFactory1 *factory = nullptr;
+	if (create_factory == nullptr || FAILED(create_factory(__uuidof(IDXGIFactory1), (void **)&factory))) {
+		if (dxgi) {
+			FreeLibrary(dxgi);
+		}
+		return sl::Result::eOk; // Cannot tell: the main device's adapter decides.
+	}
+	sl::Result result = sl::Result::eErrorNoSupportedAdapterFound;
+	IDXGIAdapter1 *adapter = nullptr;
+	for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+		DXGI_ADAPTER_DESC1 desc = {};
+		if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+			sl::AdapterInfo adapter_info;
+			adapter_info.deviceLUID = (uint8_t *)&desc.AdapterLuid;
+			adapter_info.deviceLUIDSizeInBytes = sizeof(LUID);
+			const sl::Result adapter_result = _used_feature_support(self, adapter_info, desc.VendorId == StreamlineContext::NVIDIA_VENDOR_ID);
+			if (adapter_result == sl::Result::eOk || result == sl::Result::eErrorNoSupportedAdapterFound) {
+				result = adapter_result;
+			}
+		}
+		adapter->Release();
+		if (result == sl::Result::eOk) {
+			break;
+		}
+	}
+	factory->Release();
+	FreeLibrary(dxgi);
+	return result;
+}
+#endif
+
+bool StreamlineContext::select_adapter(const sl::AdapterInfo &p_adapter_info, bool p_nvidia, bool p_d3d12, const String &p_adapter_name) {
 	streamline_capabilities = StreamlineCapabilities();
 	if (slIsFeatureSupported == nullptr) {
 		return false; // Not loaded, or shut down already.
@@ -176,7 +222,7 @@ bool StreamlineContext::select_adapter(const sl::AdapterInfo &p_adapter_info, bo
 		print_line(vformat("Streamline: initialized for %s, but the device is created with %s: Streamline is not used.", is_d3d12 ? "Direct3D 12" : "Vulkan", p_d3d12 ? "Direct3D 12" : "Vulkan"));
 		return false;
 	}
-	const sl::Result result = _used_feature_support(this, p_adapter_info);
+	const sl::Result result = _used_feature_support(this, p_adapter_info, p_nvidia);
 	if (result != sl::Result::eOk) {
 		print_line(vformat("Streamline: DLSS, DLSS-G, DLSS-RR and Reflex are not supported on %s (%s): Streamline is not used.", p_adapter_name, result_to_string(result)));
 		return false;
@@ -593,16 +639,17 @@ void StreamlineContext::initialize(bool d3d12) {
 		return;
 	}
 
-	// Without an adapter, slIsFeatureSupported() tells whether a feature can run on this system at all (ProgrammingGuide.md,
-	// 2.4). If none Godot uses can, Streamline is shut down before any DXGI, D3D12 or Vulkan call goes through its proxies.
-	// Otherwise the main device's adapter decides (select_adapter()).
+	// If no GPU of this system can use a feature Godot uses, Streamline is shut down before any DXGI, D3D12 or Vulkan call
+	// goes through its proxies. Otherwise the main device's adapter decides (select_adapter()).
+#ifdef _WIN32
 	if (StreamlineContext::get().slIsFeatureSupported != nullptr) {
-		const sl::Result support = _used_feature_support(&StreamlineContext::get(), sl::AdapterInfo());
+		const sl::Result support = _system_feature_support(&StreamlineContext::get());
 		if (support != sl::Result::eOk) {
 			print_line(vformat("Streamline: DLSS, DLSS-G, DLSS-RR and Reflex are not supported on this system (%s): Streamline is not used.", StreamlineContext::result_to_string(support)));
 			StreamlineContext::get().shutdown();
 		}
 	}
+#endif
 }
 
 #endif

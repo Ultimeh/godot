@@ -2001,12 +2001,12 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	// Others, such as the integrated GPU of a hybrid laptop chosen with --gpu-index, are created through the loader.
 	if (main_device && Streamline::get_singleton()) {
 		if (Streamline::get_singleton()->is_active(false)) {
-			if (!Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.name)) {
+			if (!Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.vendor, context_device.name)) {
 				context_driver->shutdown_streamline();
 			}
 		} else if (Streamline::get_singleton()->is_active(true)) {
 			// Initialized for Direct3D 12, which failed: the device is created with Vulkan instead.
-			Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.name);
+			Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.vendor, context_device.name);
 			Streamline::get_singleton()->shutdown();
 		}
 	}

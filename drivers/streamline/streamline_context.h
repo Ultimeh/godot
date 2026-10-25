@@ -142,8 +142,10 @@ public:
 	bool is_active(bool p_d3d12) const { return slInit != nullptr && is_d3d12 == p_d3d12; }
 	// Main device only, before it is created: enumerates the features supported on its adapter and returns whether
 	// Streamline is used for it, that is DLSS, DLSS-G, DLSS-RR or Reflex is supported there (ProgrammingGuide.md, 2.4).
-	// When it returns false the caller drops Streamline's proxies, then calls shutdown().
-	bool select_adapter(const sl::AdapterInfo &p_adapter_info, bool p_d3d12, const String &p_adapter_name);
+	// Reflex only counts on an NVIDIA GPU (p_nvidia). When it returns false the caller drops Streamline's proxies, then
+	// calls shutdown().
+	bool select_adapter(const sl::AdapterInfo &p_adapter_info, bool p_nvidia, bool p_d3d12, const String &p_adapter_name);
+	static constexpr uint32_t NVIDIA_VENDOR_ID = 0x10DE;
 	// slShutdown(), and every Streamline function forgotten: nothing reaches Streamline afterwards and no feature is
 	// reported available. Also when the main device is destroyed.
 	void shutdown();

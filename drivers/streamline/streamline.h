@@ -61,8 +61,8 @@ public:
 	// Main device only, right before it is created: whether Streamline supports its GPU, which also enumerates the
 	// features available there. When it returns false the driver creates its device without Streamline's proxies,
 	// dropping those already in use, then calls shutdown(). Streamline works with one device (ProgrammingGuide.md, 2.5).
-	bool select_adapter_vulkan(void *p_physical_device, const String &p_adapter_name);
-	bool select_adapter_d3d12(const void *p_adapter_luid, uint32_t p_luid_size, const String &p_adapter_name);
+	bool select_adapter_vulkan(void *p_physical_device, uint32_t p_vendor_id, const String &p_adapter_name);
+	bool select_adapter_d3d12(const void *p_adapter_luid, uint32_t p_luid_size, uint32_t p_vendor_id, const String &p_adapter_name);
 	// slShutdown(); afterwards nothing reaches Streamline and every capability is false.
 	void shutdown();
 

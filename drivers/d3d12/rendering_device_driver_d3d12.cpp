@@ -7949,7 +7949,7 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 	// Intel devices, or the integrated GPU of a hybrid laptop chosen with --gpu-index, are created plainly, through a
 	// plain DXGI factory.
 	if (main_device && Streamline::get_singleton()->is_active(true) &&
-			!Streamline::get_singleton()->select_adapter_d3d12(&adapter_desc.AdapterLuid, sizeof(LUID), context_device.name)) {
+			!Streamline::get_singleton()->select_adapter_d3d12(&adapter_desc.AdapterLuid, sizeof(LUID), adapter_desc.VendorId, context_device.name)) {
 		adapter.Reset();
 		Error err = context_driver->shutdown_streamline();
 		ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
@@ -7959,7 +7959,7 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 	} else if (main_device && Streamline::get_singleton()->is_active(false)) {
 		// Initialized for Vulkan, which failed: the device is created with Direct3D 12 instead.
-		Streamline::get_singleton()->select_adapter_d3d12(&adapter_desc.AdapterLuid, sizeof(LUID), context_device.name);
+		Streamline::get_singleton()->select_adapter_d3d12(&adapter_desc.AdapterLuid, sizeof(LUID), adapter_desc.VendorId, context_device.name);
 		Streamline::get_singleton()->shutdown();
 	}
 

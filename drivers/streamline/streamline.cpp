@@ -374,24 +374,24 @@ bool Streamline::is_active(bool p_d3d12) const {
 #endif
 }
 
-bool Streamline::select_adapter_vulkan(void *p_physical_device, const String &p_adapter_name) {
+bool Streamline::select_adapter_vulkan(void *p_physical_device, uint32_t p_vendor_id, const String &p_adapter_name) {
 #ifdef STREAMLINE_ENABLED
 	_THREAD_SAFE_METHOD_
 	sl::AdapterInfo adapter_info;
 	adapter_info.vkPhysicalDevice = p_physical_device;
-	return StreamlineContext::get().select_adapter(adapter_info, false, p_adapter_name);
+	return StreamlineContext::get().select_adapter(adapter_info, p_vendor_id == StreamlineContext::NVIDIA_VENDOR_ID, false, p_adapter_name);
 #else
 	return false;
 #endif
 }
 
-bool Streamline::select_adapter_d3d12(const void *p_adapter_luid, uint32_t p_luid_size, const String &p_adapter_name) {
+bool Streamline::select_adapter_d3d12(const void *p_adapter_luid, uint32_t p_luid_size, uint32_t p_vendor_id, const String &p_adapter_name) {
 #ifdef STREAMLINE_ENABLED
 	_THREAD_SAFE_METHOD_
 	sl::AdapterInfo adapter_info;
 	adapter_info.deviceLUID = (uint8_t *)p_adapter_luid;
 	adapter_info.deviceLUIDSizeInBytes = p_luid_size;
-	return StreamlineContext::get().select_adapter(adapter_info, true, p_adapter_name);
+	return StreamlineContext::get().select_adapter(adapter_info, p_vendor_id == StreamlineContext::NVIDIA_VENDOR_ID, true, p_adapter_name);
 #else
 	return false;
 #endif
