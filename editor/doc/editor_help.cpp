@@ -3075,7 +3075,7 @@ void EditorHelp::_load_doc_thread(void *p_udata) {
 		callable_mp_static(&EditorHelp::_gen_extensions_docs).call_deferred();
 	} else {
 		// We have to go back to the main thread to start from scratch, bypassing any possibly existing cache.
-		callable_mp_static(&EditorHelp::generate_doc).call_deferred(false, use_script_cache);
+		callable_mp_static(&EditorHelp::_regenerate_doc_without_cache).call_deferred(use_script_cache);
 	}
 
 	OS::get_singleton()->benchmark_end_measure("EditorHelp", vformat("Generate Documentation (Run %d)", doc_generation_count));
@@ -3114,7 +3114,20 @@ void EditorHelp::_gen_doc_thread(void *p_udata) {
 	OS::get_singleton()->benchmark_end_measure("EditorHelp", vformat("Generate Documentation (Run %d)", doc_generation_count));
 }
 
+// The documentation threads defer these calls to the main thread. When the editor quits first (`--import`
+// quits after one frame), they run after cleanup_doc(), from the flush in Main::cleanup(): do nothing then.
+
+void EditorHelp::_regenerate_doc_without_cache(bool p_use_script_cache) {
+	if (doc) {
+		generate_doc(false, p_use_script_cache);
+	}
+}
+
 void EditorHelp::_gen_extensions_docs() {
+	if (!doc) {
+		return;
+	}
+
 	doc->generate((DocTools::GENERATE_FLAG_SKIP_BASIC_TYPES | DocTools::GENERATE_FLAG_EXTENSION_CLASSES_ONLY));
 
 	// Append extra doc data, as it gets overridden by the generation step.
@@ -3127,6 +3140,10 @@ static void _load_script_doc_cache(bool p_changes) {
 }
 
 void EditorHelp::load_script_doc_cache() {
+	if (!doc) {
+		return;
+	}
+
 	if (!ProjectSettings::get_singleton()->is_project_loaded()) {
 		print_verbose("Skipping loading script doc cache since no project is open.");
 		return;
@@ -3201,6 +3218,10 @@ static void _regenerate_script_doc_cache(bool p_changes) {
 }
 
 void EditorHelp::regenerate_script_doc_cache() {
+	if (!doc) {
+		return;
+	}
+
 	if (EditorFileSystem::get_singleton()->is_scanning()) {
 		// Wait until EditorFileSystem scanning is complete to use updated filesystem structure.
 		EditorFileSystem::get_singleton()->connect(SNAME("sources_changed"), callable_mp_static(_regenerate_script_doc_cache), CONNECT_ONE_SHOT);

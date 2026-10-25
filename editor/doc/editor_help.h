@@ -203,6 +203,7 @@ class EditorHelp : public VBoxContainer {
 	static void _load_doc_thread(void *p_udata);
 	static void _gen_doc_thread(void *p_udata);
 	static void _gen_extensions_docs();
+	static void _regenerate_doc_without_cache(bool p_use_script_cache);
 	static void _process_postponed_docs();
 	static void _load_script_doc_cache_thread(void *p_udata);
 	static void _regen_script_doc_thread(void *p_udata);
