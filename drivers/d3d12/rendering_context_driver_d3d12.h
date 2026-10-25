@@ -47,6 +47,7 @@
 class RenderingContextDriverD3D12 : public RenderingContextDriver {
 	Microsoft::WRL::ComPtr<ID3D12DeviceFactory> device_factory;
 	Microsoft::WRL::ComPtr<IDXGIFactory2> dxgi_factory;
+	bool dxgi_factory_streamline = false; // dxgi_factory is Streamline's proxy.
 	TightLocalVector<Device> driver_devices;
 	bool tearing_supported = false;
 	bool debug_layer_enabled = false;
@@ -120,6 +121,9 @@ public:
 	IDXGIAdapter1 *create_adapter(uint32_t p_adapter_index) const;
 	ID3D12DeviceFactory *device_factory_get() const;
 	IDXGIFactory2 *dxgi_factory_get();
+	// The main device is created without Streamline (RenderingDeviceDriverD3D12::initialize()): Streamline's proxy
+	// factory is released, Streamline shut down, and a plain factory created. Adapters must be enumerated again.
+	Error shutdown_streamline();
 	bool get_tearing_supported() const;
 	bool use_validation_layers() const;
 

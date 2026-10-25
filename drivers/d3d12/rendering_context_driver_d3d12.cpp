@@ -182,7 +182,8 @@ Error RenderingContextDriverD3D12::_create_dxgi_factory() {
 	PFN_DXGI_CREATE_DXGI_FACTORY2 dxgi_CreateDXGIFactory2 = (PFN_DXGI_CREATE_DXGI_FACTORY2)(void *)GetProcAddress(lib_dxgi, "CreateDXGIFactory2");
 	ERR_FAIL_NULL_V(dxgi_CreateDXGIFactory2, ERR_CANT_CREATE);
 
-	if (Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_CreateDXGIFactory2)) {
+	dxgi_factory_streamline = Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_CreateDXGIFactory2) != nullptr;
+	if (dxgi_factory_streamline) {
 		dxgi_CreateDXGIFactory2 = (PFN_DXGI_CREATE_DXGI_FACTORY2)Streamline::get_singleton()->get_internal_parameter(STREAMLINE_INTERNAL_PARAMETER_FUNC_CreateDXGIFactory2);
 	}
 
@@ -437,6 +438,16 @@ IDXGIFactory2 *RenderingContextDriverD3D12::dxgi_factory_get() {
 		_create_dxgi_factory();
 	}
 	return dxgi_factory.Get();
+}
+
+Error RenderingContextDriverD3D12::shutdown_streamline() {
+	// Streamline's proxies are released before Streamline itself.
+	const bool recreate_factory = dxgi_factory_streamline;
+	if (recreate_factory) {
+		dxgi_factory.Reset();
+	}
+	Streamline::get_singleton()->shutdown();
+	return recreate_factory ? _create_dxgi_factory() : OK;
 }
 
 bool RenderingContextDriverD3D12::get_tearing_supported() const {

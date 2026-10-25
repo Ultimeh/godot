@@ -138,7 +138,7 @@ void StreamlineContext::load_functions_post_init() {
 	}
 }
 
-static void _enumerate_support(StreamlineContext *self, sl::AdapterInfo &adapterInfo, StreamlineCapabilities &outSupport) {
+static void _enumerate_support(StreamlineContext *self, const sl::AdapterInfo &adapterInfo, StreamlineCapabilities &outSupport) {
 	if (self->slIsFeatureSupported) {
 		outSupport.dlss_available = self->slIsFeatureSupported(sl::kFeatureDLSS, adapterInfo) == sl::Result::eOk;
 		outSupport.dlss_g_available = self->slIsFeatureSupported(sl::kFeatureDLSS_G, adapterInfo) == sl::Result::eOk;
@@ -149,27 +149,90 @@ static void _enumerate_support(StreamlineContext *self, sl::AdapterInfo &adapter
 	}
 }
 
-#if STREAMLINE_ENABLED_VULKAN
-StreamlineCapabilities StreamlineContext::enumerate_support_vulkan(void *vk_physical_device) {
-	VkPhysicalDevice device = (VkPhysicalDevice)vk_physical_device;
-	StreamlineCapabilities support;
-	sl::AdapterInfo adapterInfo;
-	adapterInfo.vkPhysicalDevice = device;
-	_enumerate_support(this, adapterInfo, support);
-	return support;
+// The features Godot uses Streamline for. PCL only carries Reflex's latency markers, and NIS only sharpens DLSS's
+// output. Returns eOk if one is supported, otherwise DLSS's result, which says why (ProgrammingGuide.md, 2.4).
+static sl::Result _used_feature_support(StreamlineContext *self, const sl::AdapterInfo &p_adapter_info) {
+	const sl::Feature features[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureDLSS_RR, sl::kFeatureReflex };
+	sl::Result dlss_result = sl::Result::eErrorFeatureMissing;
+	for (const sl::Feature feature : features) {
+		const sl::Result result = self->slIsFeatureSupported(feature, p_adapter_info);
+		if (result == sl::Result::eOk) {
+			return result;
+		}
+		if (feature == sl::kFeatureDLSS) {
+			dlss_result = result;
+		}
+	}
+	return dlss_result;
 }
-#endif
+
+bool StreamlineContext::select_adapter(const sl::AdapterInfo &p_adapter_info, bool p_d3d12, const String &p_adapter_name) {
+	streamline_capabilities = StreamlineCapabilities();
+	if (slIsFeatureSupported == nullptr) {
+		return false; // Not loaded, or shut down already.
+	}
+	if (is_d3d12 != p_d3d12) {
+		// The rendering driver fell back to the other API after slInit().
+		print_line(vformat("Streamline: initialized for %s, but the device is created with %s: Streamline is not used.", is_d3d12 ? "Direct3D 12" : "Vulkan", p_d3d12 ? "Direct3D 12" : "Vulkan"));
+		return false;
+	}
+	const sl::Result result = _used_feature_support(this, p_adapter_info);
+	if (result != sl::Result::eOk) {
+		print_line(vformat("Streamline: DLSS, DLSS-G, DLSS-RR and Reflex are not supported on %s (%s): Streamline is not used.", p_adapter_name, result_to_string(result)));
+		return false;
+	}
+	_enumerate_support(this, p_adapter_info, streamline_capabilities);
+	return true;
+}
+
+void StreamlineContext::shutdown() {
+	if (slShutdown) {
+		slShutdown();
+	}
+	is_shut_down = true;
+
+	slInit = nullptr;
+	slShutdown = nullptr;
+	slIsFeatureSupported = nullptr;
+	slGetFeatureFunction = nullptr;
+	slGetNewFrameToken = nullptr;
+	slAllocateResources = nullptr;
+	slFreeResources = nullptr;
+	slEvaluateFeature = nullptr;
+	slSetTag = nullptr;
+	slSetConstants = nullptr;
+	slSetFeatureLoaded = nullptr;
+	slSetD3DDevice = nullptr;
+	slReflexGetState = nullptr;
+	slReflexSetOptions = nullptr;
+	slReflexSleep = nullptr;
+	slPCLSetMarker = nullptr;
+	slPCLSetOptions = nullptr;
+	slDLSSGetOptimalSettings = nullptr;
+	slDLSSGetState = nullptr;
+	slDLSSSetOptions = nullptr;
+	slDLSSDGetOptimalSettings = nullptr;
+	slDLSSDGetState = nullptr;
+	slDLSSDSetOptions = nullptr;
+	slDLSSGGetState = nullptr;
+	slDLSSGSetOptions = nullptr;
+	slNISSetOptions = nullptr;
+	func_D3D12GetInterface = nullptr;
+	func_D3D12CreateDevice = nullptr;
+	func_slUpgradeInterface = nullptr;
+	func_DXGIGetDebugInterface1 = nullptr;
+	func_CreateDXGIFactory = nullptr;
+	func_CreateDXGIFactory1 = nullptr;
+	func_CreateDXGIFactory2 = nullptr;
+
+	streamline_capabilities = StreamlineCapabilities();
+	dlssg_loaded = false;
+	reflex_loaded = false;
+	last_token = nullptr;
+	render_token = nullptr;
+}
 
 #if STREAMLINE_ENABLED_D3D12
-StreamlineCapabilities StreamlineContext::enumerate_support_d3d12(void *d3d_adapter_luid) {
-	StreamlineCapabilities support;
-	sl::AdapterInfo adapterInfo;
-	adapterInfo.deviceLUID = (uint8_t *)d3d_adapter_luid;
-	adapterInfo.deviceLUIDSizeInBytes = sizeof(LUID);
-	_enumerate_support(this, adapterInfo, support);
-	return support;
-}
-
 void StreamlineContext::init_device_d3d12(void *d3d12_device) {
 	if (this->slSetD3DDevice) {
 		sl::Result result = this->slSetD3DDevice(d3d12_device);
@@ -470,7 +533,7 @@ void StreamlineContext::initialize(bool d3d12) {
 		StreamlineContext::get().is_game = false;
 	}
 
-	if (StreamlineContext::get().slInit != nullptr) {
+	if (StreamlineContext::get().slInit != nullptr || StreamlineContext::get().is_shut_down) {
 		return; // already initialized.
 	}
 
@@ -524,7 +587,22 @@ void StreamlineContext::initialize(bool d3d12) {
 		pref.showConsole = false;
 	}
 	sl::Result result = StreamlineContext::get().slInit(pref, sl::kSDKVersion);
-	ERR_FAIL_COND_MSG(result != sl::Result::eOk, StreamlineContext::result_to_string(result));
+	if (result != sl::Result::eOk) {
+		ERR_PRINT(vformat("Streamline: slInit() failed (%s): Streamline is not used.", StreamlineContext::result_to_string(result)));
+		StreamlineContext::get().shutdown();
+		return;
+	}
+
+	// Without an adapter, slIsFeatureSupported() tells whether a feature can run on this system at all (ProgrammingGuide.md,
+	// 2.4). If none Godot uses can, Streamline is shut down before any DXGI, D3D12 or Vulkan call goes through its proxies.
+	// Otherwise the main device's adapter decides (select_adapter()).
+	if (StreamlineContext::get().slIsFeatureSupported != nullptr) {
+		const sl::Result support = _used_feature_support(&StreamlineContext::get(), sl::AdapterInfo());
+		if (support != sl::Result::eOk) {
+			print_line(vformat("Streamline: DLSS, DLSS-G, DLSS-RR and Reflex are not supported on this system (%s): Streamline is not used.", StreamlineContext::result_to_string(support)));
+			StreamlineContext::get().shutdown();
+		}
+	}
 }
 
 #endif

@@ -191,10 +191,7 @@ void Streamline::emit_marker(StreamlineMarkerType marker) {
 			sl_context.dlssg_disable();
 			return;
 		case StreamlineMarkerType::STREAMLINE_MARKER_BEFORE_DEVICE_DESTROY:
-			if (sl_context.slShutdown) {
-				sl_context.slShutdown();
-				sl_context.slShutdown = nullptr;
-			}
+			sl_context.shutdown();
 			return;
 		default:
 			break;
@@ -369,20 +366,48 @@ bool Streamline::get_capability(StreamlineCapabilityType p_capability_type) {
 #endif
 	return false;
 }
+bool Streamline::is_active(bool p_d3d12) const {
+#ifdef STREAMLINE_ENABLED
+	return StreamlineContext::get().is_active(p_d3d12);
+#else
+	return false;
+#endif
+}
+
+bool Streamline::select_adapter_vulkan(void *p_physical_device, const String &p_adapter_name) {
+#ifdef STREAMLINE_ENABLED
+	_THREAD_SAFE_METHOD_
+	sl::AdapterInfo adapter_info;
+	adapter_info.vkPhysicalDevice = p_physical_device;
+	return StreamlineContext::get().select_adapter(adapter_info, false, p_adapter_name);
+#else
+	return false;
+#endif
+}
+
+bool Streamline::select_adapter_d3d12(const void *p_adapter_luid, uint32_t p_luid_size, const String &p_adapter_name) {
+#ifdef STREAMLINE_ENABLED
+	_THREAD_SAFE_METHOD_
+	sl::AdapterInfo adapter_info;
+	adapter_info.deviceLUID = (uint8_t *)p_adapter_luid;
+	adapter_info.deviceLUIDSizeInBytes = p_luid_size;
+	return StreamlineContext::get().select_adapter(adapter_info, true, p_adapter_name);
+#else
+	return false;
+#endif
+}
+
+void Streamline::shutdown() {
+#ifdef STREAMLINE_ENABLED
+	_THREAD_SAFE_METHOD_
+	StreamlineContext::get().shutdown();
+#endif
+}
+
 void Streamline::set_internal_parameter(const char *key, void *value) {
 #ifdef STREAMLINE_ENABLED
 	_THREAD_SAFE_METHOD_
-#if STREAMLINE_ENABLED_VULKAN
-	if (strcmp(key, "vulkan_physical_device") == 0) {
-		void *phys_device = (void *)value;
-		StreamlineContext::get().streamline_capabilities = StreamlineContext::get().enumerate_support_vulkan(phys_device);
-	}
-#endif
 #if STREAMLINE_ENABLED_D3D12
-	if (strcmp(key, "d3d12_adapter_luid") == 0) {
-		void *adapter_luid = (void *)value;
-		StreamlineContext::get().streamline_capabilities = StreamlineContext::get().enumerate_support_d3d12(adapter_luid);
-	}
 	if (strcmp(key, "d3d12_device") == 0) {
 		void *d3d_device = (void *)value;
 		StreamlineContext::get().init_device_d3d12(d3d_device);

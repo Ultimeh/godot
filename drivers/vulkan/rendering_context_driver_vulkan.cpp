@@ -40,6 +40,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/version.h"
+#include "drivers/streamline/streamline.h"
 #include "drivers/vulkan/rendering_device_driver_vulkan.h"
 #include "drivers/vulkan/vulkan_hooks.h"
 
@@ -770,6 +771,50 @@ Error RenderingContextDriverVulkan::_initialize_instance() {
 	volkLoadInstance(instance);
 #endif
 
+	_load_instance_functions();
+
+	// Debug utils and report.
+	if (has_debug_utils_extension) {
+		if (!functions.debug_util_functions_available()) {
+			ERR_FAIL_V_MSG(ERR_CANT_CREATE, "GetProcAddr: Failed to init VK_EXT_debug_utils\nGetProcAddr: Failure");
+		}
+
+		VkResult res = functions.CreateDebugUtilsMessengerEXT(instance, &debug_messenger_create_info, get_allocation_callbacks(VK_OBJECT_TYPE_DEBUG_UTILS_MESSENGER_EXT), &debug_messenger);
+		switch (res) {
+			case VK_SUCCESS:
+				break;
+			case VK_ERROR_OUT_OF_HOST_MEMORY:
+				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugUtilsMessengerEXT: out of host memory\nCreateDebugUtilsMessengerEXT Failure");
+				break;
+			default:
+				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugUtilsMessengerEXT: unknown failure\nCreateDebugUtilsMessengerEXT Failure");
+				break;
+		}
+	} else if (has_debug_report_extension) {
+		if (!functions.debug_report_functions_available()) {
+			ERR_FAIL_V_MSG(ERR_CANT_CREATE, "GetProcAddr: Failed to init VK_EXT_debug_report\nGetProcAddr: Failure");
+		}
+
+		VkResult res = functions.CreateDebugReportCallbackEXT(instance, &debug_report_callback_create_info, get_allocation_callbacks(VK_OBJECT_TYPE_DEBUG_REPORT_CALLBACK_EXT), &debug_report);
+		switch (res) {
+			case VK_SUCCESS:
+				break;
+			case VK_ERROR_OUT_OF_HOST_MEMORY:
+				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugReportCallbackEXT: out of host memory\nCreateDebugReportCallbackEXT Failure");
+				break;
+			default:
+				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugReportCallbackEXT: unknown failure\nCreateDebugReportCallbackEXT Failure");
+				break;
+		}
+	}
+
+	return OK;
+}
+
+void RenderingContextDriverVulkan::_load_instance_functions() {
+	const bool has_debug_utils_extension = enabled_instance_extension_names.has(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+	const bool has_debug_report_extension = enabled_instance_extension_names.has(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+
 	// Physical device.
 	if (enabled_instance_extension_names.has(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
 		functions.GetPhysicalDeviceFeatures2 = PFN_vkGetPhysicalDeviceFeatures2(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
@@ -807,45 +852,27 @@ Error RenderingContextDriverVulkan::_initialize_instance() {
 		functions.CmdBeginDebugUtilsLabelEXT = (PFN_vkCmdBeginDebugUtilsLabelEXT)vkGetInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT");
 		functions.CmdEndDebugUtilsLabelEXT = (PFN_vkCmdEndDebugUtilsLabelEXT)vkGetInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT");
 		functions.SetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT)vkGetInstanceProcAddr(instance, "vkSetDebugUtilsObjectNameEXT");
-
-		if (!functions.debug_util_functions_available()) {
-			ERR_FAIL_V_MSG(ERR_CANT_CREATE, "GetProcAddr: Failed to init VK_EXT_debug_utils\nGetProcAddr: Failure");
-		}
-
-		VkResult res = functions.CreateDebugUtilsMessengerEXT(instance, &debug_messenger_create_info, get_allocation_callbacks(VK_OBJECT_TYPE_DEBUG_UTILS_MESSENGER_EXT), &debug_messenger);
-		switch (res) {
-			case VK_SUCCESS:
-				break;
-			case VK_ERROR_OUT_OF_HOST_MEMORY:
-				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugUtilsMessengerEXT: out of host memory\nCreateDebugUtilsMessengerEXT Failure");
-				break;
-			default:
-				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugUtilsMessengerEXT: unknown failure\nCreateDebugUtilsMessengerEXT Failure");
-				break;
-		}
 	} else if (has_debug_report_extension) {
 		functions.CreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugReportCallbackEXT");
 		functions.DebugReportMessageEXT = (PFN_vkDebugReportMessageEXT)vkGetInstanceProcAddr(instance, "vkDebugReportMessageEXT");
 		functions.DestroyDebugReportCallbackEXT = (PFN_vkDestroyDebugReportCallbackEXT)vkGetInstanceProcAddr(instance, "vkDestroyDebugReportCallbackEXT");
-
-		if (!functions.debug_report_functions_available()) {
-			ERR_FAIL_V_MSG(ERR_CANT_CREATE, "GetProcAddr: Failed to init VK_EXT_debug_report\nGetProcAddr: Failure");
-		}
-
-		VkResult res = functions.CreateDebugReportCallbackEXT(instance, &debug_report_callback_create_info, get_allocation_callbacks(VK_OBJECT_TYPE_DEBUG_REPORT_CALLBACK_EXT), &debug_report);
-		switch (res) {
-			case VK_SUCCESS:
-				break;
-			case VK_ERROR_OUT_OF_HOST_MEMORY:
-				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugReportCallbackEXT: out of host memory\nCreateDebugReportCallbackEXT Failure");
-				break;
-			default:
-				ERR_FAIL_V_MSG(ERR_CANT_CREATE, "CreateDebugReportCallbackEXT: unknown failure\nCreateDebugReportCallbackEXT Failure");
-				break;
-		}
 	}
+}
 
-	return OK;
+void RenderingContextDriverVulkan::shutdown_streamline() {
+#if defined(USE_VOLK) && defined(STREAMLINE_ENABLED) && defined(_WIN32)
+	if (loader_get_instance_proc_addr != nullptr) {
+		// The instance was created through the interposer, which hands it the loader's own instance: from now on every
+		// call goes to the loader directly. The interposer wraps device calls with the dispatch table of the device its
+		// vkCreateDevice created, which would be none.
+		volkInitializeCustom(loader_get_instance_proc_addr);
+		volkLoadInstance(instance);
+		_load_instance_functions();
+		functions.CreateDeviceWithoutStreamline = nullptr;
+		loader_get_instance_proc_addr = nullptr;
+	}
+#endif
+	Streamline::get_singleton()->shutdown();
 }
 
 Error RenderingContextDriverVulkan::_initialize_devices() {
@@ -925,8 +952,12 @@ Error RenderingContextDriverVulkan::initialize() {
 	Error err;
 
 #if defined(USE_VOLK) && defined(STREAMLINE_ENABLED) && defined(_WIN32)
-	HMODULE module;
-	module = LoadLibraryA("sl.interposer.dll");
+	// The interposer only while Streamline may be used: not when it was shut down because no GPU of this system
+	// supports a feature Godot uses (StreamlineContext::initialize()), nor when it was initialized for Direct3D 12.
+	HMODULE module = nullptr;
+	if (Streamline::get_singleton() && Streamline::get_singleton()->is_active(false)) {
+		module = LoadLibraryA("sl.interposer.dll");
+	}
 	if (module != nullptr) {
 		// note: function pointer is cast through void function pointer to silence cast-function-type warning on gcc8
 		PFN_vkGetInstanceProcAddr vk_getInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)())GetProcAddress(module, "vkGetInstanceProcAddr");

@@ -7945,8 +7945,22 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 	HRESULT res = adapter->GetDesc(&adapter_desc);
 	ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
 
-	if (main_device) {
-		Streamline::get_singleton()->set_internal_parameter("d3d12_adapter_luid", (void *)&adapter_desc.AdapterLuid);
+	// Streamline's D3D12CreateDevice / slUpgradeInterface only for a GPU it supports (ProgrammingGuide.md, 2.4): AMD and
+	// Intel devices, or the integrated GPU of a hybrid laptop chosen with --gpu-index, are created plainly, through a
+	// plain DXGI factory.
+	if (main_device && Streamline::get_singleton()->is_active(true) &&
+			!Streamline::get_singleton()->select_adapter_d3d12(&adapter_desc.AdapterLuid, sizeof(LUID), context_device.name)) {
+		adapter.Reset();
+		Error err = context_driver->shutdown_streamline();
+		ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
+		adapter.Attach(context_driver->create_adapter(p_device_index));
+		ERR_FAIL_NULL_V(adapter, ERR_CANT_CREATE);
+		res = adapter->GetDesc(&adapter_desc);
+		ERR_FAIL_COND_V(!SUCCEEDED(res), ERR_CANT_CREATE);
+	} else if (main_device && Streamline::get_singleton()->is_active(false)) {
+		// Initialized for Vulkan, which failed: the device is created with Direct3D 12 instead.
+		Streamline::get_singleton()->select_adapter_d3d12(&adapter_desc.AdapterLuid, sizeof(LUID), context_device.name);
+		Streamline::get_singleton()->shutdown();
 	}
 
 	// Set the pipeline cache ID based on the adapter information.

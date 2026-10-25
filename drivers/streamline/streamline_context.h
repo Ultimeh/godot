@@ -31,6 +31,7 @@
 #pragma once
 
 #ifdef STREAMLINE_ENABLED
+#include "core/string/ustring.h"
 #include "drivers/streamline/streamline_data.h"
 #include "drivers/streamline/streamline_headers.h"
 
@@ -137,6 +138,16 @@ public:
 
 	static void initialize(bool d3d12);
 
+	// Whether Streamline is initialized for this API and not shut down.
+	bool is_active(bool p_d3d12) const { return slInit != nullptr && is_d3d12 == p_d3d12; }
+	// Main device only, before it is created: enumerates the features supported on its adapter and returns whether
+	// Streamline is used for it, that is DLSS, DLSS-G, DLSS-RR or Reflex is supported there (ProgrammingGuide.md, 2.4).
+	// When it returns false the caller drops Streamline's proxies, then calls shutdown().
+	bool select_adapter(const sl::AdapterInfo &p_adapter_info, bool p_d3d12, const String &p_adapter_name);
+	// slShutdown(), and every Streamline function forgotten: nothing reaches Streamline afterwards and no feature is
+	// reported available. Also when the main device is destroyed.
+	void shutdown();
+
 	static StreamlineContext &get();
 
 	sl::FrameToken *last_token = nullptr;
@@ -172,12 +183,11 @@ public:
 	bool reflex_loaded = true; // Reflex and PCL together.
 	bool is_d3d12 = false;
 
-#if STREAMLINE_ENABLED_VULKAN
-	StreamlineCapabilities enumerate_support_vulkan(void *vk_physical_device);
-#endif
+	// shutdown() was called: initialize() does nothing again.
+	bool is_shut_down = false;
+
 #if STREAMLINE_ENABLED_D3D12
 	void init_device_d3d12(void *d3d_device);
-	StreamlineCapabilities enumerate_support_d3d12(void *d3d_adapter_luid);
 #endif
 
 	StreamlineCapabilities streamline_capabilities;

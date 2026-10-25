@@ -1996,8 +1996,19 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	ERR_FAIL_COND_V_MSG(err != OK, err, "Couldn't initialize Vulkan device capabilities. This may be caused by an incompatible or outdated graphics driver.");
 
 #ifdef STREAMLINE_ENABLED
+	// The interposer's vkCreateDevice adds the extensions Streamline's features need, which only NVIDIA drivers have
+	// (AMD: VK_ERROR_EXTENSION_NOT_PRESENT): it is only used for a GPU Streamline supports (ProgrammingGuide.md, 2.4).
+	// Others, such as the integrated GPU of a hybrid laptop chosen with --gpu-index, are created through the loader.
 	if (main_device && Streamline::get_singleton()) {
-		Streamline::get_singleton()->set_internal_parameter("vulkan_physical_device", (void *)physical_device);
+		if (Streamline::get_singleton()->is_active(false)) {
+			if (!Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.name)) {
+				context_driver->shutdown_streamline();
+			}
+		} else if (Streamline::get_singleton()->is_active(true)) {
+			// Initialized for Direct3D 12, which failed: the device is created with Vulkan instead.
+			Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.name);
+			Streamline::get_singleton()->shutdown();
+		}
 	}
 #endif
 
@@ -2043,7 +2054,7 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 #endif
 
 #if defined(STREAMLINE_ENABLED)
-	if (main_device && Streamline::get_singleton()) {
+	if (main_device && Streamline::get_singleton() && Streamline::get_singleton()->is_active(false)) {
 		_initialize_latency_sleep();
 		Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_AFTER_DEVICE_CREATION);
 	}

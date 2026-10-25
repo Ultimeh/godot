@@ -55,6 +55,17 @@ public:
 	void set_parameter(StreamlineParameterType p_parameter_type, const Variant &p_value);
 	bool get_capability(StreamlineCapabilityType p_capability_type);
 
+	// Whether Streamline is initialized for Vulkan or D3D12 and not shut down. Before the main device is created, it
+	// means Streamline's proxies (D3D12 factory and device, Vulkan interposer) are to be used.
+	bool is_active(bool p_d3d12) const;
+	// Main device only, right before it is created: whether Streamline supports its GPU, which also enumerates the
+	// features available there. When it returns false the driver creates its device without Streamline's proxies,
+	// dropping those already in use, then calls shutdown(). Streamline works with one device (ProgrammingGuide.md, 2.5).
+	bool select_adapter_vulkan(void *p_physical_device, const String &p_adapter_name);
+	bool select_adapter_d3d12(const void *p_adapter_luid, uint32_t p_luid_size, const String &p_adapter_name);
+	// slShutdown(); afterwards nothing reaches Streamline and every capability is false.
+	void shutdown();
+
 	void set_internal_parameter(const char *p_key, void *p_value);
 	void *get_internal_parameter(StreamlineInternalParameterType p_internal_parameter_type);
 
