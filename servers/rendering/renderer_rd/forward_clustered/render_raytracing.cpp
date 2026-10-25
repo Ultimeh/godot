@@ -1834,10 +1834,10 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 		// the previous key can never be asked for again. Kept until the TTL, every change held one more micromap and its
 		// BLAS (+13 MB per tree surface, a minute of shader swaps under path tracing: +1.6 GB). It goes at the next sweep,
 		// once nothing traced in the current frame uses it.
-		RTOmmKey slot = key;
-		slot.surface_counter = 0;
-		slot.material_counter = 0;
-		RTOmmKey *previous = omm_current_keys.getptr(slot);
+		RTOmmKey slot_key = key;
+		slot_key.surface_counter = 0;
+		slot_key.material_counter = 0;
+		RTOmmKey *previous = omm_current_keys.getptr(slot_key);
 		if (previous) {
 			RTOmmEntry *stale = omm_entries.getptr(*previous);
 			if (stale) {
@@ -1845,7 +1845,7 @@ RTOmmEntry *RenderRaytracing::_omm_entry(void *p_mesh_surface, RID p_mesh, uint3
 			}
 			*previous = key;
 		} else {
-			omm_current_keys.insert(slot, key);
+			omm_current_keys.insert(slot_key, key);
 		}
 		RTOmmEntry &waiting = omm_entries.insert(key, RTOmmEntry())->value;
 		waiting.first_seen_frame = current_frame;
