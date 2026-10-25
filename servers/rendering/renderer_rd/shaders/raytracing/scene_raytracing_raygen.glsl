@@ -13,13 +13,26 @@
 
 #pragma shader_stage(raygen)
 #extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#ifdef RT_OPACITY_MICROMAPS
+#extension GL_EXT_opacity_micromap : require
+#endif
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #ifdef USE_SER
 #extension GL_EXT_shader_invocation_reorder : enable
 #endif
 
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
+#define RT_NO_HIT_BUILTINS 1
+// clang-format off
+#include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_hit_inc.glsl"
+// clang-format on
 
 // The path tracer's output, RB_TEX_RAYTRACING: its format, or the writes are undefined on Vulkan (D3D12 converts them).
 layout(set = 0, binding = 0, rgba16f) uniform image2D image;
@@ -28,6 +41,56 @@ layout(set = 0, binding = 29, rgba16f) uniform image2D front_layer_image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
+
+layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+
+#include "raytracing_samplers_inc.glsl"
+
+// clang-format off
+layout(set = 0, binding = 3, std430) readonly buffer GeometryBuffer {
+	GeometryData geometries[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
+	MaterialData materials[];
+};
+// clang-format on
+
+#include "raytracing_lights_inc.glsl"
+
+#ifdef USE_RADIANCE_OCTMAP_ARRAY
+
+layout(set = 0, binding = 7) uniform texture2DArray radiance_octmap;
+layout(set = 0, binding = 8) uniform sampler radiance_sampler;
+
+// Array-backed octahedral radiance: roughness selects the prefiltered array
+// layer (with a blend between adjacent layers). Ray/hit stages have no
+// screen-space derivatives, so the intra-layer mip is fixed at 0.0; roughness is
+// represented entirely by the layer selection.
+vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
+	float layer;
+	float blend = modf(clamp(p_roughness, 0.0, 1.0) * MAX_ROUGHNESS_LOD, layer);
+	vec3 a = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(p_oct_uv, layer), 0.0).rgb;
+	vec3 b = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(p_oct_uv, layer + 1.0), 0.0).rgb;
+	return mix(a, b, blend);
+}
+
+#else
+
+layout(set = 0, binding = 7) uniform texture2D radiance_octmap;
+layout(set = 0, binding = 8) uniform sampler radiance_sampler;
+
+// Single-texture octahedral radiance: roughness maps to the mip LOD.
+vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
+	return textureLod(sampler2D(radiance_octmap, radiance_sampler), p_oct_uv, clamp(p_roughness, 0.0, 1.0) * MAX_ROUGHNESS_LOD).rgb;
+}
+
+#endif // USE_RADIANCE_OCTMAP_ARRAY
+
+// clang-format off
+#include "raytracing_environment_inc.glsl"
+#include "raytracing_shade_inc.glsl"
+// clang-format on
 
 void main() {
 	uvec2 pixel = gl_LaunchIDEXT.xy;
@@ -68,36 +131,14 @@ void main() {
 		vec3 ray_dir = direction.xyz;
 
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
-			path_pack(payload, ps);
-
-#ifdef USE_SER
-			hitObjectEXT hitObject;
-			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-
-			// Reorder with a coherence hint that has 8 bits
-			uint hint = 0;
-			if (hitObjectIsHitEXT(hitObject)) {
-				// TODO: This hint barely does anything. There is a lot of untapped potential here.
-				hint = hitObjectGetInstanceIdEXT(hitObject);
+			float hit_t;
+			const bool goes_on = trace_path_ray(ps, ray_origin, ray_dir, hit_t);
+			if (sample_idx == 0u && bounce == 0u && goes_on) {
+				opaque_t = hit_t;
 			}
-			reorderThreadEXT(hitObject, hint, 8);
-
-			hitObjectExecuteShaderEXT(hitObject, 0);
-#else
-			traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-#endif
-
-			ps = path_unpack(payload);
-			if (sample_idx == 0u && bounce == 0u && !is_path_terminated(ps.packed_bounces_flags)) {
-				opaque_t = ps.hit_t;
-			}
-			if (is_path_terminated(ps.packed_bounces_flags)) {
+			if (!goes_on) {
 				break;
 			}
-			// Reconstruct the next ray origin from the current ray + hit distance, apply bias
-			vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-			ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
-			ray_dir = ps.next_ray_dir;
 		}
 
 		total_radiance += ps.radiance;
@@ -117,27 +158,26 @@ void main() {
 	float rr_depth = imageLoad(rt_depth_image, ivec2(pixel)).r;
 #endif
 	if (get_rt_param(RT_PARAM_FRONT_LAYER_COUNT) > 0.0) {
-		PathState fs;
-		fs.radiance = vec3(0.0);
-		fs.throughput = vec3(1.0);
-		fs.packed_bounces_flags = set_front_layer_ray(0u);
-		fs.rng_state = init_rng(pixel, frame_index, samples_per_pixel);
-		fs.hit_t = opaque_t; // Read by the hit shaders as DEPTH_TEXTURE (rt_depth_buffer_value()).
-		fs.offset_normal = vec3(0.0, 0.0, 1.0);
-		fs.next_ray_dir = vec3(0.0, 0.0, 1.0);
-		path_pack(payload, fs);
+		uint front_rng_state = init_rng(pixel, frame_index, samples_per_pixel);
+		payload.packed_bounces_flags = set_front_layer_ray(0u);
+		payload.hit_t = opaque_t; // Read by the hit shaders as DEPTH_TEXTURE (rt_depth_buffer_value()).
 		traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_FRONT_LAYER, 0, 0, 0, origin.xyz, 0.001, direction.xyz, max(opaque_t, 0.001), 0);
-		fs = path_unpack(payload);
+		const HitRecord fr = hit_unpack(payload);
 
-		if (!is_path_terminated(fs.packed_bounces_flags)) {
-			float view_depth = fs.hit_t * dot(direction.xyz, -normalize(inv_view[2].xyz));
+		if (!is_path_terminated(payload.packed_bounces_flags) && (fr.flags & (HIT_FLAG_PASS_THROUGH | HIT_FLAG_DEBUG)) == 0u) {
+			float view_depth = fr.hit_t * dot(direction.xyz, -normalize(inv_view[2].xyz));
+			const vec3 front_dir = front_layer_reflection_dir(fr, direction.xyz, front_rng_state);
 #ifdef DLSS_RR_ENABLED
-			// What the closest hit returned for the guides (raytracing_closest_hit_common_inc.glsl, front layer branch).
-			const float front_reflectance = clamp(fs.radiance.x, 0.0, 1.0);
-			const float front_roughness = fs.radiance.y;
-			const vec3 front_diffuse_albedo = fs.throughput;
-			const vec3 front_normal = fs.offset_normal;
-			const vec3 front_position = origin.xyz + direction.xyz * fs.hit_t;
+			// Ray Reconstruction's albedo and roughness guides blend toward this surface where its reflection dominates
+			// (DLSS-RR Integration Guide, 3.4.1): its specular albedo (with the geometry normal, so the waves of a normal map
+			// do not make the guides noisy) and roughness, and its diffuse albedo.
+			const float front_NdotV = max(dot(fr.geometry_normal, -direction.xyz), 0.0001);
+			const vec3 front_specular_albedo = DLSSRR_computeSpecularAlbedo(fr.albedo, fr.metalness, specular_to_f0(fr.specular), fr.roughness, front_NdotV);
+			const float front_reflectance = clamp(dot(front_specular_albedo, vec3(1.0 / 3.0)), 0.0, 1.0);
+			const float front_roughness = fr.roughness;
+			const vec3 front_diffuse_albedo = DLSSRR_computeDiffuseAlbedo(fr.albedo, fr.metalness);
+			const vec3 front_normal = fr.geometry_normal;
+			const vec3 front_position = origin.xyz + direction.xyz * fr.hit_t;
 #endif
 
 			PathState rs;
@@ -146,9 +186,9 @@ void main() {
 			// As deep as a camera path; not sample zero: no primary writes. Along the transparent surface's specular lobe:
 			// a miss takes the reflected light, as the raster transparent pass reflects.
 			rs.packed_bounces_flags = set_specular_lobe(pack_bounces(0u, 0u), true);
-			rs.rng_state = fs.rng_state;
-			vec3 ray_origin = offset_ray_origin(origin.xyz + direction.xyz * fs.hit_t, fs.offset_normal);
-			vec3 ray_dir = fs.next_ray_dir;
+			rs.rng_state = front_rng_state;
+			vec3 ray_origin = offset_ray_origin(origin.xyz + direction.xyz * fr.hit_t, fr.geometry_normal);
+			vec3 ray_dir = front_dir;
 			// The reflected point's direct light and one indirect bounce, as Lumen's front layer reflections: a full path
 			// for every pixel of a window close to the camera doubled the cost of the trace.
 			uint front_layer_bounces = min(max_bounces, 1u);
@@ -157,26 +197,14 @@ void main() {
 				if (bounce == front_layer_bounces) {
 					rs.packed_bounces_flags = set_unextended(rs.packed_bounces_flags);
 				}
-				path_pack(payload, rs);
-#ifdef USE_SER
-				// Reflections off a window diverge as much as camera bounces: regrouped by what they hit, as above.
-				hitObjectEXT hitObject;
-				hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-				reorderThreadEXT(hitObject, hitObjectIsHitEXT(hitObject) ? hitObjectGetInstanceIdEXT(hitObject) : 0u, 8);
-				hitObjectExecuteShaderEXT(hitObject, 0);
-#else
-				traceRayEXT(tlas, RT_RAY_FLAGS, RT_MASK_CAMERA, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-#endif
-				rs = path_unpack(payload);
-				if (is_path_terminated(rs.packed_bounces_flags)) {
+				// Reflections off a window diverge as much as camera bounces: regrouped by what they hit (with SER), as above.
+				float hit_t;
+				if (!trace_path_ray(rs, ray_origin, ray_dir, hit_t)) {
 					break;
 				}
 				if (bounce == 0u) {
-					front_reflection_t = rs.hit_t;
+					front_reflection_t = hit_t;
 				}
-				vec3 hit_pos = ray_origin + ray_dir * rs.hit_t;
-				ray_origin = offset_ray_origin(hit_pos, rs.offset_normal);
-				ray_dir = rs.next_ray_dir;
 			}
 			front_layer = vec4(rs.radiance, view_depth);
 
@@ -271,31 +299,17 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #include "raytracing_environment_inc.glsl"
 
 void main() {
-	PathState ps = path_unpack(payload);
+	PathState ps;
+	ps.packed_bounces_flags = payload.packed_bounces_flags;
 
+	// Miss always ends the path; a shadow ray that misses means the light is visible (no occluder).
+	payload.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+	payload_write_light(payload, vec3(0.0), 0u);
 #if !defined(USE_SER)
-	// Shadow rays that miss mean the light is visible (no occluder).
 	if (is_shadow_ray(ps.packed_bounces_flags)) {
-		ps.radiance = vec3(1.0);
-		path_pack(payload, ps);
 		return;
 	}
 #endif
-
-	// Miss always ends the path.
-	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-
-#ifdef RT_DEBUG_ENABLED
-	{
-		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
-		// Specular hit distance: the first-bounce closest_hit pre-seeds the
-		// "no hit" color into radiance, so a missed reflection just keeps it.
-		if (VIS_MODE == 13 && get_total_bounces(ps.packed_bounces_flags) > 0u) {
-			path_pack(payload, ps);
-			return;
-		}
-	}
-#endif // RT_DEBUG_ENABLED
 
 	// Primary ray miss: write depth, velocity, and DLSS RR defaults (sample 0 only).
 	{
@@ -351,22 +365,19 @@ void main() {
 	}
 #endif
 
+	// The light this ray brings; the raygen weighs it by the path's throughput.
+	vec3 light = sky_color * mis_weight;
+	uint light_flags = 0u;
 #ifdef RT_DEBUG_ENABLED
 	{
 		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
-		if (VIS_MODE == 20) {
-			ps.radiance = vec3(1.0);
-		} else if (VIS_MODE == 0) {
-			ps.radiance += ps.throughput * sky_color * mis_weight;
-		} else {
-			ps.radiance = sky_color;
+		if (VIS_MODE != 0) {
+			light = VIS_MODE == 20 ? vec3(1.0) : sky_color;
+			light_flags = HIT_FLAG_DEBUG;
 		}
 	}
-#else
-	ps.radiance += ps.throughput * sky_color * mis_weight;
 #endif // RT_DEBUG_ENABLED
-
-	path_pack(payload, ps);
+	payload_write_light(payload, light, light_flags);
 }
 
 #[closest_hit]
@@ -474,6 +485,9 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 // CUSTOM SHADER GLOBALS (injected by ShaderCompiler for HG1+)
 // ============================================================================
 #ifdef RT_CUSTOM_HIT_GROUP
+// vertex()'s outputs interpolated at the hit and at its neighboring pixels in x and y (raytracing_custom_globals_inc.glsl).
+#define RT_INTERPOLATE_AT_POINTS
+#define RT_INTERP_POINTS 3
 #include "raytracing_custom_globals_inc.glsl"
 #endif
 
@@ -503,14 +517,11 @@ void main() {
 	bool rt_front_face = h.is_front_face;
 
 	// A point vertex() removed (NaN position) lets the ray pass through, as raster draws nothing there.
-#define RT_CUSTOM_REMOVED_POINT                             \
-	{                                                       \
-		PathState removed_ps = path_unpack(payload);        \
-		removed_ps.hit_t = gl_HitTEXT;                      \
-		removed_ps.offset_normal = gl_WorldRayDirectionEXT; \
-		removed_ps.next_ray_dir = gl_WorldRayDirectionEXT;  \
-		path_pack(payload, removed_ps);                     \
-		return;                                             \
+#define RT_CUSTOM_REMOVED_POINT                          \
+	{                                                    \
+		payload.hit_t = gl_HitTEXT;                      \
+		payload_write_light(payload, vec3(0.0), HIT_FLAG_PASS_THROUGH); \
+		return;                                          \
 	}
 #include "raytracing_custom_fragment_inc.glsl"
 
@@ -559,7 +570,7 @@ void main() {
 #ifdef RT_DEBUG_ENABLED
 	{
 		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
-		if (VIS_MODE != 0) {
+		if (VIS_MODE != 0 && VIS_MODE != 1 && VIS_MODE != 13) { // 1 and 13: the material, for the raygen's reflection views.
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			vec3 orm = vec3(1.0, m.roughness, m.metalness);
@@ -569,7 +580,7 @@ void main() {
 		}
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m);
+	hit_pack(h, m);
 #else
 	// HG0: StandardMaterial3D evaluation.
 	MaterialData mat = materials[h.geometry_idx];
@@ -705,7 +716,7 @@ void main() {
 #ifdef RT_DEBUG_ENABLED
 	{
 		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
-		if (VIS_MODE != 0) {
+		if (VIS_MODE != 0 && VIS_MODE != 1 && VIS_MODE != 13) { // 1 and 13: the material, for the raygen's reflection views.
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, tangent_space_normal,
@@ -714,7 +725,7 @@ void main() {
 		}
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m);
+	hit_pack(h, m);
 #endif
 }
 
@@ -776,6 +787,9 @@ layout(set = 0, binding = 32, std430) readonly buffer MotionTransforms {
 // CUSTOM SHADER GLOBALS (injected for per-HG any-hit)
 // ============================================================================
 #ifdef RT_CUSTOM_HIT_GROUP
+// vertex()'s outputs interpolated at the hit only: the alpha test has no screen derivatives.
+#define RT_INTERPOLATE_AT_POINTS
+#define RT_INTERP_POINTS 1
 #include "raytracing_custom_globals_inc.glsl"
 #endif
 

@@ -33,65 +33,198 @@
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
 // ============================================================================
-// PATHTRACING PAYLOAD (32 bytes, fp16/unorm-packed)
+// PATHTRACING PAYLOAD: the hit's material (48 bytes, fp16/unorm-packed; 40 with PT_PAYLOAD_COMPACT)
 // ============================================================================
-// Radiance (r) and throughput (T) interleaved as fp16 into 3 uints:
-//   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
-// The next-bounce origin is not stored: raygen reconstructs it from the
-// current ray and hit_t as `offset_ray_origin(ray_origin + ray_dir * hit_t,
-// offset_normal)`. The offset normal and next direction are stored as
-// 16-bit unorm octahedral pairs (effective angular error <~0.001 deg,
-// below the 8-bit normal quantization baked into offset_ray_origin).
-// Use PathState + path_pack/path_unpack for fp32 working copies.
+// The closest hit evaluates the material and returns it here (hit_pack()); the raygen shades the hit and keeps the path's
+// state (raytracing_shade_inc.glsl). NVIDIA, "Best Practices for Using NVIDIA RTX Ray Tracing (Updated)", Hit shading:
+// "Consider moving common code outside of hit and miss shaders", and "Minimize live state across ray-trace calls": no hit
+// shader traces a ray. In: packed_bounces_flags (the path's flags, read by the primary writes and the front layer) and
+// hit_t (a front layer ray: the opaque surface's distance behind). Normals are 16-bit unorm octahedral pairs.
+
+// PT_PAYLOAD_COMPACT: 40 bytes, no term below 10 bits: albedo fp16 and normals 16-bit octahedral as in the 48-byte layout,
+// roughness / metalness / specular / AO / AO light affect 10-12-bit unorm (finer than the 8-bit textures they come from),
+// emissive and backlight in the shared exponent format RGB9E5 (9-bit mantissas, the range of fp16), at most 2^22 geometries.
+// Measured on 2026-10-25: no gain over 48 bytes in the forest (PT-SHADE-IN-RAYGEN-STUDY.md, 2d). Off.
+//#define PT_PAYLOAD_COMPACT
+
+#define HIT_FLAG_UNSHADED (1u << 28u)
+#define HIT_FLAG_SPECULAR_DISABLED (1u << 29u)
+#define HIT_FLAG_PASS_THROUGH (1u << 30u) // vertex() removed the point: the ray goes on from the hit, the path unchanged.
+#define HIT_FLAG_DEBUG (1u << 31u) // A debug view: emissive is the pixel's color.
+#define HIT_FLAGS_MASK 0xF0000000u
+
+#ifdef PT_PAYLOAD_COMPACT
 
 struct PathPayload {
-	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][environment MIS:16][diffuse:4][total:4]
-	uint rng_state; //  4 bytes - RNG state for PCG
-	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
-	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
-	uint oct_next_dir; //  4 bytes - packUnorm2x16(vec3_to_oct(next direction))
+	uint packed_bounces_flags; // [flags:8][environment MIS:16][diffuse:4][total:4]; a miss sets PATH_TERMINATED_FLAG.
+	float hit_t;
+	uint oct_geometry_normal; // World space, flipped for back-face hits.
+	uint oct_normal; // The material's shading normal, world space.
+	uint albedo_rg; // fp16 pair.
+	uint albedo_b_ao_light_affect_flags; // fp16 albedo b, 12-bit AO light affect, HIT_FLAG_* in bits 28-31.
+	uint roughness_metalness_specular; // unorm 10 / 11 / 11 bits.
+	uint emissive; // RGB9E5. A miss: the light it brings, by the multiple importance sampling weight.
+	uint backlight; // RGB9E5.
+	uint geometry_idx_ao; // Bits 0-21: the geometry index; 22-31: AO (unorm10).
 };
 
-/// Unpacked fp32 working copy of the payload.
+#define HIT_GEOMETRY_IDX_MASK 0x003FFFFFu
+
+uint pack_unorm_bits(float p_value, uint p_bits) {
+	return uint(round(clamp(p_value, 0.0, 1.0) * float((1u << p_bits) - 1u)));
+}
+
+float unpack_unorm_bits(uint p_value, uint p_bits) {
+	return float(p_value & ((1u << p_bits) - 1u)) / float((1u << p_bits) - 1u);
+}
+
+// The shared exponent format of GL_EXT_texture_shared_exponent (N = 9, B = 15), as the extension's specification encodes it.
+uint pack_rgb9e5(vec3 p_c) {
+	const vec3 c = clamp(p_c, vec3(0.0), vec3(65408.0));
+	const float max_c = max(max(c.r, c.g), max(c.b, 1e-30));
+	int exp_shared = max(-16, int(floor(log2(max_c)))) + 1 + 15;
+	if (floor(max_c / exp2(float(exp_shared - 15 - 9)) + 0.5) >= 512.0) {
+		exp_shared++;
+	}
+	const uvec3 m = uvec3(min(floor(c / exp2(float(exp_shared - 15 - 9)) + 0.5), vec3(511.0)));
+	return m.r | (m.g << 9u) | (m.b << 18u) | (uint(exp_shared) << 27u);
+}
+
+vec3 unpack_rgb9e5(uint p_v) {
+	return vec3(uvec3(p_v & 0x1FFu, (p_v >> 9u) & 0x1FFu, (p_v >> 18u) & 0x1FFu)) * exp2(float(int(p_v >> 27u) - 15 - 9));
+}
+
+#else
+
+struct PathPayload {
+	uint packed_bounces_flags; // [flags:8][environment MIS:16][diffuse:4][total:4]; a miss sets PATH_TERMINATED_FLAG.
+	float hit_t;
+	uint oct_geometry_normal; // World space, flipped for back-face hits.
+	uint oct_normal; // The material's shading normal, world space.
+	uint albedo_rg; // fp16 pairs from here.
+	uint albedo_b_roughness;
+	uint emissive_rg; // A miss: the light it brings, by the multiple importance sampling weight.
+	uint emissive_b_backlight_r;
+	uint backlight_gb;
+	uint metalness_specular; // unorm16 pairs.
+	uint ao_ao_light_affect;
+	uint geometry_idx_flags; // Bits 0-27: the geometry index; 28-31: HIT_FLAG_*.
+};
+
+#define HIT_GEOMETRY_IDX_MASK 0x0FFFFFFFu
+
+#endif
+
+/// The payload unpacked, in the raygen.
+struct HitRecord {
+	float hit_t;
+	vec3 geometry_normal;
+	vec3 normal;
+	vec3 albedo;
+	float roughness;
+	float metalness;
+	float specular;
+	vec3 emissive;
+	vec3 backlight;
+	float ao;
+	float ao_light_affect;
+	uint geometry_idx;
+	uint flags;
+};
+
+/// fp16 with the range clamped, as the radiance always was.
+uint pack_half2_clamped(vec2 p_value) {
+	return packHalf2x16(clamp(p_value, vec2(-65504.0), vec2(65504.0)));
+}
+
+/// What the closest hit returns (hit_t aside).
+void payload_write_material(inout PathPayload p, vec3 p_geometry_normal, vec3 p_normal, vec3 p_albedo, float p_roughness, float p_metalness, float p_specular, vec3 p_emissive, vec3 p_backlight, float p_ao, float p_ao_light_affect, uint p_geometry_idx, uint p_flags) {
+#ifdef PT_PAYLOAD_COMPACT
+	p.oct_geometry_normal = packUnorm2x16(vec3_to_oct(p_geometry_normal));
+	p.oct_normal = packUnorm2x16(vec3_to_oct(p_normal));
+	p.albedo_rg = pack_half2_clamped(p_albedo.rg);
+	p.albedo_b_ao_light_affect_flags = (pack_half2_clamped(vec2(p_albedo.b, 0.0)) & 0xFFFFu) | (pack_unorm_bits(p_ao_light_affect, 12u) << 16u) | p_flags;
+	p.roughness_metalness_specular = pack_unorm_bits(p_roughness, 10u) | (pack_unorm_bits(p_metalness, 11u) << 10u) | (pack_unorm_bits(p_specular, 11u) << 21u);
+	p.emissive = pack_rgb9e5(p_emissive);
+	p.backlight = pack_rgb9e5(p_backlight);
+	p.geometry_idx_ao = (p_geometry_idx & HIT_GEOMETRY_IDX_MASK) | (pack_unorm_bits(p_ao, 10u) << 22u);
+#else
+	p.oct_geometry_normal = packUnorm2x16(vec3_to_oct(p_geometry_normal));
+	p.oct_normal = packUnorm2x16(vec3_to_oct(p_normal));
+	p.albedo_rg = pack_half2_clamped(p_albedo.rg);
+	p.albedo_b_roughness = pack_half2_clamped(vec2(p_albedo.b, p_roughness));
+	p.emissive_rg = pack_half2_clamped(p_emissive.rg);
+	p.emissive_b_backlight_r = pack_half2_clamped(vec2(p_emissive.b, p_backlight.r));
+	p.backlight_gb = pack_half2_clamped(p_backlight.gb);
+	p.metalness_specular = packUnorm2x16(vec2(p_metalness, p_specular));
+	p.ao_ao_light_affect = packUnorm2x16(vec2(p_ao, p_ao_light_affect));
+	p.geometry_idx_flags = (p_geometry_idx & HIT_GEOMETRY_IDX_MASK) | p_flags;
+#endif
+}
+
+/// A miss or a debug view: only the light (the color) and the flags.
+void payload_write_light(inout PathPayload p, vec3 p_light, uint p_flags) {
+#ifdef PT_PAYLOAD_COMPACT
+	p.emissive = pack_rgb9e5(p_light);
+	p.albedo_b_ao_light_affect_flags = p_flags;
+#else
+	p.emissive_rg = pack_half2_clamped(p_light.rg);
+	p.emissive_b_backlight_r = pack_half2_clamped(vec2(p_light.b, 0.0));
+	p.geometry_idx_flags = p_flags;
+#endif
+}
+
+HitRecord hit_unpack(PathPayload p) {
+	HitRecord r;
+	r.hit_t = p.hit_t;
+#ifdef PT_PAYLOAD_COMPACT
+	r.geometry_normal = oct_to_vec3(unpackUnorm2x16(p.oct_geometry_normal) * 2.0 - 1.0);
+	r.normal = oct_to_vec3(unpackUnorm2x16(p.oct_normal) * 2.0 - 1.0);
+	r.albedo = vec3(unpackHalf2x16(p.albedo_rg), unpackHalf2x16(p.albedo_b_ao_light_affect_flags & 0xFFFFu).x);
+	r.ao_light_affect = unpack_unorm_bits(p.albedo_b_ao_light_affect_flags >> 16u, 12u);
+	r.roughness = unpack_unorm_bits(p.roughness_metalness_specular, 10u);
+	r.metalness = unpack_unorm_bits(p.roughness_metalness_specular >> 10u, 11u);
+	r.specular = unpack_unorm_bits(p.roughness_metalness_specular >> 21u, 11u);
+	r.emissive = unpack_rgb9e5(p.emissive);
+	r.backlight = unpack_rgb9e5(p.backlight);
+	r.ao = unpack_unorm_bits(p.geometry_idx_ao >> 22u, 10u);
+	r.geometry_idx = p.geometry_idx_ao & HIT_GEOMETRY_IDX_MASK;
+	r.flags = p.albedo_b_ao_light_affect_flags & HIT_FLAGS_MASK;
+#else
+	r.geometry_normal = oct_to_vec3(unpackUnorm2x16(p.oct_geometry_normal) * 2.0 - 1.0);
+	r.normal = oct_to_vec3(unpackUnorm2x16(p.oct_normal) * 2.0 - 1.0);
+	const vec2 rg = unpackHalf2x16(p.albedo_rg);
+	const vec2 b_roughness = unpackHalf2x16(p.albedo_b_roughness);
+	r.albedo = vec3(rg, b_roughness.x);
+	r.roughness = b_roughness.y;
+	const vec2 e_rg = unpackHalf2x16(p.emissive_rg);
+	const vec2 e_b_bl_r = unpackHalf2x16(p.emissive_b_backlight_r);
+	r.emissive = vec3(e_rg, e_b_bl_r.x);
+	r.backlight = vec3(e_b_bl_r.y, unpackHalf2x16(p.backlight_gb));
+	const vec2 ms = unpackUnorm2x16(p.metalness_specular);
+	r.metalness = ms.x;
+	r.specular = ms.y;
+	const vec2 ao = unpackUnorm2x16(p.ao_ao_light_affect);
+	r.ao = ao.x;
+	r.ao_light_affect = ao.y;
+	r.geometry_idx = p.geometry_idx_flags & HIT_GEOMETRY_IDX_MASK;
+	r.flags = p.geometry_idx_flags & HIT_FLAGS_MASK;
+#endif
+	return r;
+}
+
+/// Converts specular parameter [0..1] to dielectric F0.
+float specular_to_f0(float specular) {
+	return 0.16 * specular * specular;
+}
+
+/// The raygen's path state (fp32).
 struct PathState {
 	vec3 radiance;
 	vec3 throughput;
 	uint packed_bounces_flags;
 	uint rng_state;
-	float hit_t;
-	vec3 offset_normal;
-	vec3 next_ray_dir;
 };
-
-PathState path_unpack(PathPayload p) {
-	PathState s;
-	vec2 rg = unpackHalf2x16(p.packed_rt[0]);
-	vec2 bR = unpackHalf2x16(p.packed_rt[1]);
-	vec2 GB = unpackHalf2x16(p.packed_rt[2]);
-	s.radiance = max(vec3(rg.x, rg.y, bR.x), vec3(0.0));
-	s.throughput = max(vec3(bR.y, GB.x, GB.y), vec3(0.0));
-	s.packed_bounces_flags = p.packed_bounces_flags;
-	s.rng_state = p.rng_state;
-	s.hit_t = p.hit_t;
-	s.offset_normal = oct_to_vec3(unpackUnorm2x16(p.oct_offset_nrm) * 2.0 - 1.0);
-	s.next_ray_dir = oct_to_vec3(unpackUnorm2x16(p.oct_next_dir) * 2.0 - 1.0);
-	return s;
-}
-
-void path_pack(inout PathPayload p, PathState s) {
-	const float FP16_MAX = 65504.0;
-	vec3 r = clamp(s.radiance, vec3(0.0), vec3(FP16_MAX));
-	vec3 t = clamp(s.throughput, vec3(0.0), vec3(FP16_MAX));
-	p.packed_rt[0] = packHalf2x16(vec2(r.r, r.g));
-	p.packed_rt[1] = packHalf2x16(vec2(r.b, t.r));
-	p.packed_rt[2] = packHalf2x16(vec2(t.g, t.b));
-	p.packed_bounces_flags = s.packed_bounces_flags;
-	p.rng_state = s.rng_state;
-	p.hit_t = s.hit_t;
-	p.oct_offset_nrm = packUnorm2x16(vec3_to_oct(s.offset_normal));
-	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
-}
 
 // Bounce count helpers (bits 0-3: total, bits 4-7: diffuse). A path ends at RT_MAX_BOUNCES (8) and MAX_DIFFUSE_BOUNCES.
 uint get_total_bounces(uint packed) {

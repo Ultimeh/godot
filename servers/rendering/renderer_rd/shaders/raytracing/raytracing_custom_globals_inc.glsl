@@ -113,7 +113,19 @@ vec3 eye_offset = vec3(0.0); // One view.
 float alpha_antialiasing_edge = 0.0;
 vec2 alpha_texture_coordinate = vec2(0.0);
 
-// What vertex() wrote at the triangle's three vertices, and the hit's barycentrics with their screen derivatives.
+#ifdef RT_INTERPOLATE_AT_POINTS
+// The hit groups: what vertex() wrote, interpolated at the hit (0) and at the neighboring pixels' barycentrics in x (1) and
+// y (2), summed corner by corner as each vertex() returns (raytracing_custom_fragment_inc.glsl). Keeping the three corners
+// until the loop ended held every output of two corners live through the last vertex(): the hit groups' register peak.
+vec3 rt_point_vertex[RT_INTERP_POINTS];
+vec3 rt_point_normal[RT_INTERP_POINTS];
+vec3 rt_point_tangent[RT_INTERP_POINTS];
+vec3 rt_point_binormal[RT_INTERP_POINTS];
+vec2 rt_point_uv[RT_INTERP_POINTS];
+vec2 rt_point_uv2[RT_INTERP_POINTS];
+vec4 rt_point_color[RT_INTERP_POINTS];
+#else
+// What vertex() wrote at the triangle's three vertices.
 vec3 rt_corner_vertex[3];
 vec3 rt_corner_normal[3];
 vec3 rt_corner_tangent[3];
@@ -121,6 +133,8 @@ vec3 rt_corner_binormal[3];
 vec2 rt_corner_uv[3];
 vec2 rt_corner_uv2[3];
 vec4 rt_corner_color[3];
+#endif
+// The hit's barycentrics with their screen derivatives.
 vec3 rt_hit_bary = vec3(1.0, 0.0, 0.0);
 vec3 rt_hit_bary_ddx = vec3(0.0);
 vec3 rt_hit_bary_ddy = vec3(0.0);
@@ -147,16 +161,8 @@ float rt_depth_buffer_value() {
 
 /* RT_CUSTOM_VARYING_STORAGE */
 
-// The fragment inputs at barycentrics p_bary: vertex()'s outputs interpolated, then in view space as raster has them.
-void rt_set_fragment_inputs(vec3 p_bary) {
-	vertex = rt_corner_vertex[0] * p_bary.x + rt_corner_vertex[1] * p_bary.y + rt_corner_vertex[2] * p_bary.z;
-	normal = rt_corner_normal[0] * p_bary.x + rt_corner_normal[1] * p_bary.y + rt_corner_normal[2] * p_bary.z;
-	tangent = rt_corner_tangent[0] * p_bary.x + rt_corner_tangent[1] * p_bary.y + rt_corner_tangent[2] * p_bary.z;
-	binormal = rt_corner_binormal[0] * p_bary.x + rt_corner_binormal[1] * p_bary.y + rt_corner_binormal[2] * p_bary.z;
-	uv_interp = rt_corner_uv[0] * p_bary.x + rt_corner_uv[1] * p_bary.y + rt_corner_uv[2] * p_bary.z;
-	uv2_interp = rt_corner_uv2[0] * p_bary.x + rt_corner_uv2[1] * p_bary.y + rt_corner_uv2[2] * p_bary.z;
-	color_interp = rt_corner_color[0] * p_bary.x + rt_corner_color[1] * p_bary.y + rt_corner_color[2] * p_bary.z;
-	/* RT_CUSTOM_VARYING_BLEND */
+// The interpolated vertex() outputs in view space, as raster gives them to fragment().
+void rt_fragment_inputs_to_view() {
 #if defined(SKIP_TRANSFORM_USED)
 	// vertex() already wrote view-space values.
 #elif defined(VERTEX_WORLD_COORDS_USED)
@@ -179,6 +185,34 @@ void rt_set_fragment_inputs(vec3 p_bary) {
 #endif
 }
 
+#ifdef RT_INTERPOLATE_AT_POINTS
+// The fragment inputs at point p_point (0: the hit, 1 and 2: its neighboring pixels in x and y).
+void rt_set_fragment_inputs(int p_point) {
+	vertex = rt_point_vertex[p_point];
+	normal = rt_point_normal[p_point];
+	tangent = rt_point_tangent[p_point];
+	binormal = rt_point_binormal[p_point];
+	uv_interp = rt_point_uv[p_point];
+	uv2_interp = rt_point_uv2[p_point];
+	color_interp = rt_point_color[p_point];
+	/* RT_CUSTOM_VARYING_SELECT */
+	rt_fragment_inputs_to_view();
+}
+#else
+// The fragment inputs at barycentrics p_bary: vertex()'s outputs interpolated.
+void rt_set_fragment_inputs(vec3 p_bary) {
+	vertex = rt_corner_vertex[0] * p_bary.x + rt_corner_vertex[1] * p_bary.y + rt_corner_vertex[2] * p_bary.z;
+	normal = rt_corner_normal[0] * p_bary.x + rt_corner_normal[1] * p_bary.y + rt_corner_normal[2] * p_bary.z;
+	tangent = rt_corner_tangent[0] * p_bary.x + rt_corner_tangent[1] * p_bary.y + rt_corner_tangent[2] * p_bary.z;
+	binormal = rt_corner_binormal[0] * p_bary.x + rt_corner_binormal[1] * p_bary.y + rt_corner_binormal[2] * p_bary.z;
+	uv_interp = rt_corner_uv[0] * p_bary.x + rt_corner_uv[1] * p_bary.y + rt_corner_uv[2] * p_bary.z;
+	uv2_interp = rt_corner_uv2[0] * p_bary.x + rt_corner_uv2[1] * p_bary.y + rt_corner_uv2[2] * p_bary.z;
+	color_interp = rt_corner_color[0] * p_bary.x + rt_corner_color[1] * p_bary.y + rt_corner_color[2] * p_bary.z;
+	/* RT_CUSTOM_VARYING_BLEND */
+	rt_fragment_inputs_to_view();
+}
+#endif
+
 vec3 rt_saved_vertex;
 vec3 rt_saved_normal;
 vec3 rt_saved_tangent;
@@ -199,7 +233,13 @@ int rt_push_neighbor(int p_axis) {
 	rt_saved_uv2 = uv2_interp;
 	rt_saved_color = color_interp;
 	/* RT_CUSTOM_VARYING_PUSH */
+#ifdef RT_INTERPOLATE_AT_POINTS
+#if RT_INTERP_POINTS > 1
+	rt_set_fragment_inputs(1 + p_axis);
+#endif
+#else
 	rt_set_fragment_inputs(rt_hit_bary + (p_axis == 0 ? rt_hit_bary_ddx : rt_hit_bary_ddy));
+#endif
 	return 0;
 }
 

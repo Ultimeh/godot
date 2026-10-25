@@ -253,64 +253,6 @@ void write_primary_hit_velocity(vec3 hit_pos) {
 }
 
 // ============================================================================
-// ENVIRONMENT FOG (per ray segment)
-// ============================================================================
-
-vec3 fog_get_directional_color(uint index) {
-	return rt_lights[index].emission;
-}
-
-vec3 fog_get_directional_direction(uint index) {
-	vec3 world_dir = -normalize(rt_lights[index].position);
-	mat3 view_rot = transpose(mat3(
-			scene_data_block.data.view_matrix[0].xyz,
-			scene_data_block.data.view_matrix[1].xyz,
-			scene_data_block.data.view_matrix[2].xyz));
-	return view_rot * world_dir;
-}
-
-#define FOG_HAS_RADIANCE
-
-vec3 fog_sample_radiance(vec3 vertex, float mip_level) {
-	vec3 cube_view = scene_data_block.data.radiance_inverse_xform * vertex;
-	vec2 border = vec2(scene_data_block.data.radiance_border_size,
-			1.0 - scene_data_block.data.radiance_border_size * 2.0);
-	vec2 cube_uv = vec3_to_oct_with_border(cube_view, border);
-	// mip_level is a normalized roughness (0..1); radiance_octmap_sample maps it
-	// onto the prefiltered roughness array layers.
-	return radiance_octmap_sample(cube_uv, mip_level);
-}
-
-#include "../fog_inc.glsl"
-
-/// Apply environment fog for the ray segment that was just traversed.
-/// Attenuates throughput and adds in-scattered fog color.
-void apply_segment_fog(float segment_dist, inout vec3 radiance, inout vec3 throughput) {
-	if (!RT_FOG_ENABLED()) {
-		return;
-	}
-
-	// Build a view-space vertex along the ray direction at the hit distance.
-	// fog_process needs view-space position for distance and height calculations.
-	mat4 view_mat = transpose(mat4(
-			scene_data_block.data.view_matrix[0],
-			scene_data_block.data.view_matrix[1],
-			scene_data_block.data.view_matrix[2],
-			vec4(0.0, 0.0, 0.0, 1.0)));
-	vec3 world_hit = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * segment_dist;
-	vec3 vertex = (view_mat * vec4(world_hit, 1.0)).xyz;
-
-	vec4 fog = fog_process(scene_data_block.data, vertex);
-	radiance += throughput * fog.rgb * fog.a;
-	throughput *= (1.0 - fog.a);
-}
-
-/// Converts specular parameter [0..1] to dielectric F0.
-float specular_to_f0(float specular) {
-	return 0.16 * specular * specular;
-}
-
-// ============================================================================
 // DEBUG VISUALIZATION
 // ============================================================================
 
@@ -331,20 +273,13 @@ void debug_visualize(
 		vec3 emissive,
 		vec3 V,
 		float NdotV) {
-	PathState ps = path_unpack(payload);
+	// The views that trace a second ray (1, 13) are the raygen's (debug_reflection_view()). The random sequence is the
+	// one the raygen starts sample 0 with, which the primary hit's shading used.
+	PathState ps;
+	ps.radiance = vec3(0.0);
+	ps.rng_state = init_rng(gl_LaunchIDEXT.xy, uint(get_rt_param(RT_PARAM_FRAME_INDEX)), 0u);
 
-	if (vis_mode == 1) {
-		if (get_total_bounces(ps.packed_bounces_flags) == 0u) {
-			ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
-			ps.hit_t = gl_HitTEXT;
-			ps.offset_normal = geometry_normal;
-			ps.next_ray_dir = reflect(gl_WorldRayDirectionEXT, geometry_normal);
-			path_pack(payload, ps);
-			return;
-		} else {
-			ps.radiance = geometry_normal * 0.5 + 0.5;
-		}
-	} else if (vis_mode == 2) {
+	if (vis_mode == 2) {
 		ps.radiance = geometry_normal * 0.5 + 0.5;
 	} else if (vis_mode == 3) {
 		ps.radiance = final_normal * 0.5 + 0.5;
@@ -366,32 +301,6 @@ void debug_visualize(
 		ps.radiance = DLSSRR_computeSpecularAlbedo(albedo, metalness, specular_to_f0(specular), roughness, NdotV);
 	} else if (vis_mode == 12) {
 		ps.radiance = (final_normal * 0.5 + 0.5) * (1.0 - roughness * 0.5);
-	} else if (vis_mode == 13) {
-		if (get_total_bounces(ps.packed_bounces_flags) == 0u) {
-			if (roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
-				ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
-				ps.radiance = vec3(0.1, 0.1, 0.4);
-				ps.hit_t = gl_HitTEXT;
-				ps.offset_normal = final_normal;
-				ps.next_ray_dir = reflect(gl_WorldRayDirectionEXT, final_normal);
-				path_pack(payload, ps);
-				return;
-			} else {
-				ps.radiance = vec3(0.1, 0.1, 0.4);
-			}
-		} else {
-			float spec_hit_t = gl_HitTEXT;
-			float v = clamp(log(spec_hit_t + 1.0) / log(1000.0), 0.0, 1.0);
-			vec3 color;
-			if (v < 0.33) {
-				color = mix(vec3(0.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), v * 3.0);
-			} else if (v < 0.66) {
-				color = mix(vec3(1.0, 0.0, 0.0), vec3(1.0, 1.0, 0.0), (v - 0.33) * 3.0);
-			} else {
-				color = mix(vec3(1.0, 1.0, 0.0), vec3(1.0, 1.0, 1.0), (v - 0.66) * 3.0);
-			}
-			ps.radiance = color;
-		}
 	} else if (vis_mode == 14) {
 		ps.radiance = vec3(metalness);
 	} else if (vis_mode == 15) {
@@ -476,268 +385,19 @@ void debug_visualize(
 		}
 	}
 
-	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-	path_pack(payload, ps);
+	payload.hit_t = gl_HitTEXT;
+	payload_write_light(payload, ps.radiance, HIT_FLAG_DEBUG);
 }
 #endif // RT_DEBUG_ENABLED
 
 // ============================================================================
-// SHADE AND BOUNCE
+// THE HIT'S MATERIAL, FOR THE RAYGEN
 // ============================================================================
 
-/// Production shading: emissive + NEE direct lighting + BRDF importance sampling + next bounce.
-/// Also handles DLSS-RR G-buffer output on primary ray.
-void shade_and_bounce(HitData h, MaterialResult m) {
-	PathState ps = path_unpack(payload);
-
-	vec3 V = -gl_WorldRayDirectionEXT;
-
-	// Clamp shading normal toward geometry at grazing view angles to keep BRDF above the geometry hemisphere.
-	vec3 N = clampShadingNormal(m.normal, h.geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
-	float NdotV = max(dot(N, V), 0.0001);
-
-	// A front layer ray (raygen): a direction in this transparent surface's specular lobe, for its reflection. The raster
-	// transparent pass shades the surface.
-	if (is_front_layer_ray(ps.packed_bounces_flags)) {
-		MaterialProperties front_mat;
-		front_mat.baseColor = m.albedo;
-		front_mat.metalness = m.metalness;
-		front_mat.roughness = m.roughness;
-		front_mat.dielectricF0 = specular_to_f0(m.specular);
-		front_mat.emissive = vec3(0.0);
-		front_mat.transmissivness = 0.0;
-		front_mat.opacity = 1.0;
-		// The material's normal as raster reflects on it: clamping it toward the faceted geometry at grazing angles
-		// would reflect the triangles of a displaced surface (waves) instead of its smooth normal.
-		vec3 front_dir;
-		vec3 front_weight;
-		if (!evalIndirectCombinedBRDF(rand2(ps.rng_state), m.normal, m.normal, V, front_mat, SPECULAR_TYPE, front_dir, front_weight, vec4(0.0))) {
-			front_dir = reflect(-V, m.normal);
-		}
-		// Below the surface, the ray would cross it: mirror it back above.
-		front_dir -= 2.0 * min(dot(front_dir, h.geometry_normal), 0.0) * h.geometry_normal;
-		ps.hit_t = gl_HitTEXT;
-		ps.offset_normal = h.geometry_normal;
-		ps.next_ray_dir = front_dir;
-#ifdef DLSS_RR_ENABLED
-		// For the raygen, which blends Ray Reconstruction's albedo and roughness guides toward this surface where its
-		// reflection dominates (DLSS-RR Integration Guide, 3.4.1): its specular albedo (with the geometry normal, so the
-		// waves of a normal map do not make the guides noisy) and roughness in the radiance, its diffuse albedo in the
-		// throughput. Neither is read again for this ray.
-		const float front_NdotV = max(dot(h.geometry_normal, V), 0.0001);
-		const vec3 front_specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, front_mat.dielectricF0, m.roughness, front_NdotV);
-		ps.radiance = vec3(dot(front_specular_albedo, vec3(1.0 / 3.0)), m.roughness, 0.0);
-		ps.throughput = DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness);
-#endif
-		path_pack(payload, ps);
-		return;
-	}
-
-	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
-	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
-
-	// Environment fog for this ray segment (before surface contribution).
-	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
-
-	// Emissive contribution; raster's unshaded output is the albedo alone. An unshaded surface is seen, in reflections too,
-	// but lights nothing, as in raster: its albedo after a diffuse bounce made small unshaded shapes (candle flames) into
-	// lights only rare paths reach, noise the denoiser turned into a shimmer.
-	ps.radiance += ps.throughput * (m.unshaded ? (diffuse_bounces == 0u ? m.albedo : vec3(0.0)) : m.emissive);
-	if (m.unshaded) {
-		m.metalness = 0.0;
-		m.roughness = 1.0;
-	}
-
-	// Bounce limit check.
-	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
-		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-		path_pack(payload, ps);
-		return;
-	}
-
-	// BRDF material setup.
-	MaterialProperties brdf_mat;
-	brdf_mat.baseColor = m.albedo;
-	brdf_mat.metalness = m.metalness;
-	brdf_mat.roughness = m.roughness;
-	brdf_mat.dielectricF0 = specular_to_f0(m.specular);
-	brdf_mat.emissive = m.emissive;
-	brdf_mat.transmissivness = 0.0;
-	brdf_mat.opacity = 1.0;
-
-	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
-	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
-
-	// =================================================================
-	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
-	// =================================================================
-#ifdef DLSS_RR_ENABLED
-	if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
-		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
-
-		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness));
-		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
-
-		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
-		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.04), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
-
-		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
-
-		// Specular hit distance via inline ray query (only for smooth surfaces).
-		float spec_hit_dist = -1.0;
-		if (m.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
-			vec3 spec_dir = reflect(-V, N);
-			vec3 spec_origin = offset_ray_origin(h.hit_pos, spec_dir);
-
-			rayQueryEXT spec_rq;
-			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-					RT_MASK_CAMERA, spec_origin, 0.001, spec_dir, 10000.0);
-			while (rayQueryProceedEXT(spec_rq)) {
-				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-					if (ray_query_alpha_test(
-								rayQueryGetIntersectionInstanceCustomIndexEXT(spec_rq, false),
-								rayQueryGetIntersectionPrimitiveIndexEXT(spec_rq, false),
-								rayQueryGetIntersectionBarycentricsEXT(spec_rq, false))) {
-						rayQueryConfirmIntersectionEXT(spec_rq);
-					}
-				}
-			}
-			float spec_t_max = 10000.0;
-			if (rayQueryGetIntersectionTypeEXT(spec_rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-				spec_hit_dist = rayQueryGetIntersectionTEXT(spec_rq, true);
-				spec_t_max = spec_hit_dist;
-			}
-#ifdef USE_SER
-			// The query skipped procedural geometry, whose hit only its hit group's intersection shader finds (see
-			// lights_trace_shadow_ray()). A hit object runs it, and gives the distance without a closest hit shader.
-			// Without SER, procedural geometry is missing from this guide.
-			if ((uint(get_rt_param(RT_PARAM_PROCEDURAL_MASKS)) & RT_MASK_PROCEDURAL_CAMERA) != 0u) {
-				hitObjectEXT spec_hit_object;
-				hitObjectTraceRayEXT(spec_hit_object, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-						RT_MASK_PROCEDURAL_CAMERA, 0, 0, 0, spec_origin, 0.001, spec_dir, spec_t_max, 0);
-				if (hitObjectIsHitEXT(spec_hit_object)) {
-					spec_hit_dist = hitObjectGetRayTMaxEXT(spec_hit_object);
-				}
-			}
-#endif
-		}
-		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
-	}
-#endif
-
-	if (m.unshaded) {
-		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-		path_pack(payload, ps);
-		return;
-	}
-
-	// =================================================================
-	// NEE: Next Event Estimation (direct light sampling)
-	// =================================================================
-	path_pack(payload, ps);
-
-	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	if (rt_light_count > 0u) {
-		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
-		vec3 hit_pos_back = offset_ray_origin(h.hit_pos, -h.geometry_normal);
-		bool is_indirect = (diffuse_bounces > 0u);
-		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, hit_pos_back, h.geometry_normal, N, V, brdf_mat, m.backlight, m.specular_disabled, ps.rng_state, is_indirect, rt_light_count, geometries[h.geometry_idx].layer_mask);
-		ps.radiance += ps.throughput * direct_light * mix(1.0, m.ao, m.ao_light_affect);
-	}
-
-	// =================================================================
-	// BRDF importance sampling for next bounce
-	// =================================================================
-	float specularLum = luminance(specularF0);
-	float diffuseLum = luminance(diffuseReflectance);
-	// The chance of sampling the specular lobe, as picked below.
-	const float specular_probability = diffuseLum < 0.0001 ? 1.0 : (specularLum < 0.0001 ? 0.0 : clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99));
-
-	// =================================================================
-	// NEE of the Environment: one direction from the sky's distribution, combined with the BRDF sampling below by
-	// multiple importance sampling (raytracing_environment_inc.glsl)
-	// =================================================================
-	RTEnvSampling env_sampling = rt_env_sampling_setup(specular_probability, m.roughness, !is_unextended(ps.packed_bounces_flags), dot(N, V));
-	if (env_sampling.diffuse || env_sampling.specular) {
-		vec3 env_light = rt_environment_nee(env_sampling, offset_ray_origin(h.hit_pos, h.geometry_normal), h.geometry_normal, N, V, brdf_mat, m.ao, ps.rng_state);
-		ps.radiance += ps.throughput * env_light;
-	}
-
-	int brdfType;
-	if (diffuseLum < 0.0001) {
-		brdfType = SPECULAR_TYPE;
-	} else if (specularLum < 0.0001) {
-		brdfType = DIFFUSE_TYPE;
-	} else {
-		float brdfProbability = specular_probability;
-		if (rand(ps.rng_state) < brdfProbability) {
-			brdfType = SPECULAR_TYPE;
-			ps.throughput /= brdfProbability;
-		} else {
-			brdfType = DIFFUSE_TYPE;
-			ps.throughput /= (1.0 - brdfProbability);
-		}
-	}
-
-	vec2 u = rand2(ps.rng_state);
-	vec3 next_dir;
-	vec3 brdf_weight;
-	bool recovered = false;
-	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
-		// Two failure modes:
-		//   1) Sample weight is zero (no contribution). Terminate.
-		//   2) Sampled direction is below the geometry plane. Recover by
-		//      mirroring across the geometry plane (see brdf_inc.glsl). The
-		//      mirror is gated by RT_BELOW_HEMISPHERE_RECOVERY_ENABLED; when
-		//      disabled, recovery returns false and we terminate the path.
-		vec3 recovered_dir;
-		if (luminance(brdf_weight) == 0.0 ||
-				!recoverBelowHemisphereSample(next_dir, h.geometry_normal, recovered_dir)) {
-			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-			path_pack(payload, ps);
-			return;
-		}
-		next_dir = recovered_dir;
-		recovered = true;
-	}
-
-	ps.throughput *= brdf_weight;
-	if (brdfType == DIFFUSE_TYPE) {
-		ps.throughput *= m.ao; // As raster's AO on the ambient (indirect diffuse) light.
-	}
-
-	// Russian roulette, as pbrt-v4's PathIntegrator::Li: from the path's second vertex on, a path whose throughput has
-	// fallen below 1 goes on with a probability equal to its largest component and is divided by it; the others end here.
-	// Unbiased: what the surviving paths bring is scaled by one over the probability they had to survive. The paths that
-	// would bring little are the ones that end. rendering/pathtracing/russian_roulette.
-	if (total_bounces >= 1u && (uint(get_rt_param(RT_PARAM_FLAGS)) & RT_PARAM_FLAG_RUSSIAN_ROULETTE) != 0u) {
-		const float survival = max(ps.throughput.r, max(ps.throughput.g, ps.throughput.b));
-		if (survival < 1.0) {
-			if (rand(ps.rng_state) >= survival) {
-				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-				path_pack(payload, ps);
-				return;
-			}
-			ps.throughput /= survival;
-		}
-	}
-
-	if (brdfType == DIFFUSE_TYPE) {
-		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
-	} else {
-		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
-	}
-	// If the next ray leaves the scene, it takes the Environment's light by this lobe: as raster's ambient_light for the
-	// diffuse lobe and indirect_specular_light for the specular one (scene_forward_clustered.glsl).
-	ps.packed_bounces_flags = set_specular_lobe(ps.packed_bounces_flags, brdfType == SPECULAR_TYPE);
-	// The share of that light next event estimation of the sky took for this direction, which the miss leaves to it.
-	ps.packed_bounces_flags = set_env_mis_share(ps.packed_bounces_flags, rt_env_bounce_share(env_sampling, brdfType == SPECULAR_TYPE, N, V, next_dir, recovered));
-
-	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
-	// the raygen loop continues with the reconstructed origin and next_ray_dir.
-	ps.hit_t = gl_HitTEXT;
-	ps.offset_normal = h.geometry_normal;
-	ps.next_ray_dir = next_dir;
-	path_pack(payload, ps);
+/// The material evaluated at the hit, which the raygen shades (raytracing_shade_inc.glsl).
+void hit_pack(HitData h, MaterialResult m) {
+	payload.hit_t = gl_HitTEXT;
+	payload_write_material(payload, h.geometry_normal, m.normal, m.albedo, m.roughness, m.metalness, m.specular, m.emissive, m.backlight, m.ao, m.ao_light_affect,
+			h.geometry_idx, (m.unshaded ? HIT_FLAG_UNSHADED : 0u) | (m.specular_disabled ? HIT_FLAG_SPECULAR_DISABLED : 0u));
 }
+

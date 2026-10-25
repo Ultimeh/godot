@@ -207,33 +207,16 @@ bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dis
 
 	return !(hitObjectIsHitEXT(hitObject));
 #else
-	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
-	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
-	// Save full payload, set up shadow ray, then restore after trace.
-	PathPayload saved_payload = payload;
-
-	PathState shadow_ps;
-	shadow_ps.radiance = vec3(0.0);
-	shadow_ps.throughput = vec3(0.0);
-	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
-	shadow_ps.rng_state = 0u;
-	shadow_ps.hit_t = 0.0;
-	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
-	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
-	path_pack(payload, shadow_ps);
+	// The miss shader ends a shadow ray (visible); an opaque hit calls no miss, and the flag stays clear. Only the raygen
+	// traces, and it reads the payload of a path ray before shading its hit.
+	payload.packed_bounces_flags = set_shadow_ray(0u);
 
 	traceRayEXT(tlas,
 			RT_SHADOW_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
 			p_mask, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
-	// Unpack to check visibility (miss shader packs radiance = 1.0).
-	shadow_ps = path_unpack(payload);
-	bool visible = shadow_ps.radiance.x > 0.5;
-
-	payload = saved_payload;
-
-	return visible;
+	return is_path_terminated(payload.packed_bounces_flags);
 #endif
 }
 

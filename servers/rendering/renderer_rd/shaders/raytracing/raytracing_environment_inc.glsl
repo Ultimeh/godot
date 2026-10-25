@@ -1,6 +1,6 @@
-// The light the Environment gives the rays that leave the scene, and its next event estimation in the closest hit.
+// The light the Environment gives the rays that leave the scene, and its next event estimation in the raygen.
 // Requires raytracing_inc.glsl, scene_data_inc.glsl, brdf_inc.glsl, raytracing_common_inc.glsl and radiance_octmap_sample();
-// the closest hit also tlas (binding 1) and payload (location 0).
+// the raygen also tlas (binding 1) and payload (location 0).
 
 #include "raytracing_sky_sampling_inc.glsl"
 
@@ -54,7 +54,7 @@ vec3 rt_environment_light(vec3 p_sky_dir, bool p_specular_lobe) {
 	return rt_environment_fog(color, sky_uv);
 }
 
-#ifdef RT_STAGE_CLOSEST_HIT
+#ifdef RT_STAGE_RAYGEN
 
 // ============================================================================
 // NEXT EVENT ESTIMATION OF THE ENVIRONMENT
@@ -194,21 +194,10 @@ bool rt_environment_visible(vec3 p_origin, vec3 p_direction) {
 	hitObjectTraceRayEXT(hit_object, tlas, flags, RT_MASK_CAMERA, 0, 0, 0, p_origin, 0.001, p_direction, 10000.0, 0);
 	return !hitObjectIsHitEXT(hit_object);
 #else
-	// As lights_trace_shadow_ray_pipeline(): the miss shader returns 1 for a shadow ray.
-	PathPayload saved_payload = payload;
-	PathState shadow_ps;
-	shadow_ps.radiance = vec3(0.0);
-	shadow_ps.throughput = vec3(0.0);
-	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
-	shadow_ps.rng_state = 0u;
-	shadow_ps.hit_t = 0.0;
-	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
-	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
-	path_pack(payload, shadow_ps);
+	// As lights_trace_shadow_ray_pipeline(): the miss shader ends a shadow ray.
+	payload.packed_bounces_flags = set_shadow_ray(0u);
 	traceRayEXT(tlas, flags, RT_MASK_CAMERA, 0, 0, 0, p_origin, 0.001, p_direction, 10000.0, 0);
-	const bool visible = path_unpack(payload).radiance.x > 0.5;
-	payload = saved_payload;
-	return visible;
+	return is_path_terminated(payload.packed_bounces_flags);
 #endif
 }
 
@@ -273,4 +262,4 @@ vec3 rt_environment_nee(RTEnvSampling p_env, vec3 p_origin, vec3 p_geometry_norm
 	return value / sky_pdf;
 }
 
-#endif // RT_STAGE_CLOSEST_HIT
+#endif // RT_STAGE_RAYGEN

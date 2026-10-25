@@ -84,6 +84,17 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 	// As raster does, run vertex() at the triangle's vertices (on their rest data for displaced geometry, whose BLAS
 	// holds vertex()'s output already) and interpolate what it writes: run once at the hit, a texelFetch() in vertex()
 	// would snap to one texel. The vertex values also give the screen derivatives.
+	// Each output is summed at the barycentrics it is read at as soon as its vertex() returns, in the order the
+	// interpolation c0 * b.x + c1 * b.y + c2 * b.z evaluates, so the result is the same to the bit while only the sums,
+	// not every corner, stay live through the next vertex() (NVIDIA, Ray Tracing Best Practices: live state and register
+	// usage limit occupancy).
+#ifdef RT_STAGE_ANY_HIT
+	vec3 rt_point_bary[RT_INTERP_POINTS] = vec3[RT_INTERP_POINTS](rt_bary);
+#else
+	hit_barycentric_derivatives(rt_geom, rt_i0, rt_i1, rt_i2, rt_bary, rt_hit_bary_ddx, rt_hit_bary_ddy);
+	vec3 rt_point_bary[RT_INTERP_POINTS] = vec3[RT_INTERP_POINTS](rt_bary, rt_bary + rt_hit_bary_ddx, rt_bary + rt_hit_bary_ddy);
+#endif
+	bool rt_removed = false;
 	uint rt_corner_index[3] = uint[3](rt_i0, rt_i1, rt_i2);
 #ifdef ENABLE_INSTANCE_CUSTOM
 	instance_custom = fetch_instance_custom(rt_geom, rt_i0);
@@ -134,20 +145,36 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 
 		/* RT_CUSTOM_VERTEX_CALL */
 
-		rt_corner_vertex[rt_corner] = vertex;
-		rt_corner_normal[rt_corner] = normal;
-		rt_corner_tangent[rt_corner] = tangent;
-		rt_corner_binormal[rt_corner] = binormal;
-		rt_corner_uv[rt_corner] = uv_interp;
-		rt_corner_uv2[rt_corner] = uv2_interp;
-		rt_corner_color[rt_corner] = color_interp;
-		/* RT_CUSTOM_VARYING_SAVE */
+		rt_removed = rt_removed || any(isnan(vertex));
+		for (int rt_point = 0; rt_point < RT_INTERP_POINTS; rt_point++) {
+			const float rt_w = rt_point_bary[rt_point][rt_corner];
+			if (rt_corner == 0) {
+				rt_point_vertex[rt_point] = vertex * rt_w;
+				rt_point_normal[rt_point] = normal * rt_w;
+				rt_point_tangent[rt_point] = tangent * rt_w;
+				rt_point_binormal[rt_point] = binormal * rt_w;
+				rt_point_uv[rt_point] = uv_interp * rt_w;
+				rt_point_uv2[rt_point] = uv2_interp * rt_w;
+				rt_point_color[rt_point] = color_interp * rt_w;
+				/* RT_CUSTOM_VARYING_ACCUMULATE_FIRST */
+			} else {
+				rt_point_vertex[rt_point] = rt_point_vertex[rt_point] + vertex * rt_w;
+				rt_point_normal[rt_point] = rt_point_normal[rt_point] + normal * rt_w;
+				rt_point_tangent[rt_point] = rt_point_tangent[rt_point] + tangent * rt_w;
+				rt_point_binormal[rt_point] = rt_point_binormal[rt_point] + binormal * rt_w;
+				rt_point_uv[rt_point] = rt_point_uv[rt_point] + uv_interp * rt_w;
+				rt_point_uv2[rt_point] = rt_point_uv2[rt_point] + uv2_interp * rt_w;
+				rt_point_color[rt_point] = rt_point_color[rt_point] + color_interp * rt_w;
+				/* RT_CUSTOM_VARYING_ACCUMULATE */
+			}
+		}
 	}
-	if (any(isnan(rt_corner_vertex[0])) || any(isnan(rt_corner_vertex[1])) || any(isnan(rt_corner_vertex[2]))) {
+	if (rt_removed) {
 		RT_CUSTOM_REMOVED_POINT
 	}
 	rt_hit_bary = rt_bary;
-	rt_set_fragment_inputs(rt_bary);
+	rt_set_fragment_inputs(0);
+	// Ready only after the loop: a dFdx() in vertex() is 0, as raster's vertex() reads mip 0.
 #ifdef RT_STAGE_ANY_HIT
 	// The alpha test reads the textures' base level, as the opacity micromap is baked (raytracing_omm_bake.glsl): no
 	// screen derivatives, so dFdx() is 0 and the material's texture() calls (textureGrad()) take level 0 whatever the
@@ -155,7 +182,6 @@ if ((rt_geom.flags & FLAG_PROCEDURAL) == 0u) {
 	// distance (NVIDIA OMM SDK integration guide: "Pick a texture mip and always use that version").
 	rt_derivatives_ready = false;
 #else
-	hit_barycentric_derivatives(rt_geom, rt_i0, rt_i1, rt_i2, rt_bary, rt_hit_bary_ddx, rt_hit_bary_ddy);
 	rt_derivatives_ready = true;
 #endif
 } else {
