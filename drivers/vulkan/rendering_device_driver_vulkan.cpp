@@ -2271,7 +2271,14 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	VmaAllocationInfo alloc_info = {};
 	// Opacity micromap builds read their inputs at addresses aligned to 256 bytes; the buffer's own requirements
 	// need not guarantee it.
-	const VkDeviceSize min_alignment = p_usage.has_flag(BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT) ? OPACITY_MICROMAP_INPUT_ALIGNMENT : 0;
+	VkDeviceSize min_alignment = p_usage.has_flag(BUFFER_USAGE_OPACITY_MICROMAP_BUILD_INPUT_READ_ONLY_BIT) ? OPACITY_MICROMAP_INPUT_ALIGNMENT : 0;
+	// Each shader binding table region handed to vkCmdTraceRaysKHR starts at a multiple of shaderGroupBaseAlignment
+	// (VUID-vkCmdTraceRaysKHR-pRayGenShaderBindingTable-03682, -03685, -03689): its offsets in the buffer are, the
+	// buffer's address must be too. The memory requirements do not guarantee it: the tables of an AMD RX 6600 were only
+	// 16-byte aligned.
+	if (p_usage.has_flag(BUFFER_USAGE_SHADER_BINDING_TABLE_BIT)) {
+		min_alignment = MAX(min_alignment, (VkDeviceSize)raytracing_capabilities.shader_group_base_alignment);
+	}
 
 	if (!Engine::get_singleton()->is_extra_gpu_memory_tracking_enabled()) {
 		alloc_create_info.preferredFlags &= ~vma_flags_to_remove;
