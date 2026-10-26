@@ -2000,13 +2000,26 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	// (AMD: VK_ERROR_EXTENSION_NOT_PRESENT): it is only used for a GPU Streamline supports (ProgrammingGuide.md, 2.4).
 	// Others, such as the integrated GPU of a hybrid laptop chosen with --gpu-index, are created through the loader.
 	if (main_device && Streamline::get_singleton()) {
+		// Streamline only checks the adapter given by its LUID: with a VkPhysicalDevice alone, slIsFeatureSupported()
+		// reports whether any GPU of the system supports the feature (sl.cpp, "!adapterInfo.deviceLUID) return eOk").
+		VkPhysicalDeviceIDProperties id_properties = {};
+		id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+		VkPhysicalDeviceProperties2 properties_2 = {};
+		properties_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+		properties_2.pNext = &id_properties;
+		const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+		if (functions.GetPhysicalDeviceProperties2 != nullptr) {
+			functions.GetPhysicalDeviceProperties2(physical_device, &properties_2);
+		}
+		const uint8_t *luid = id_properties.deviceLUIDValid ? id_properties.deviceLUID : nullptr;
+
 		if (Streamline::get_singleton()->is_active(false)) {
-			if (!Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.vendor, context_device.name)) {
+			if (!Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, luid, VK_LUID_SIZE, context_device.vendor, context_device.name)) {
 				context_driver->shutdown_streamline();
 			}
 		} else if (Streamline::get_singleton()->is_active(true)) {
 			// Initialized for Direct3D 12, which failed: the device is created with Vulkan instead.
-			Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, context_device.vendor, context_device.name);
+			Streamline::get_singleton()->select_adapter_vulkan((void *)physical_device, luid, VK_LUID_SIZE, context_device.vendor, context_device.name);
 			Streamline::get_singleton()->shutdown();
 		}
 	}

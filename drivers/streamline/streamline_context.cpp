@@ -200,6 +200,9 @@ static sl::Result _system_feature_support(StreamlineContext *self) {
 			if (adapter_result == sl::Result::eOk || result == sl::Result::eErrorNoSupportedAdapterFound) {
 				result = adapter_result;
 			}
+			if (adapter_result == sl::Result::eOk) {
+				print_line(vformat("Streamline: supported on %s (vendor 0x%04x).", String::utf16((const char16_t *)desc.Description), (uint64_t)desc.VendorId));
+			}
 		}
 		adapter->Release();
 		if (result == sl::Result::eOk) {
