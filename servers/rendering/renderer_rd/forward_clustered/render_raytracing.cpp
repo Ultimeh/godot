@@ -1315,6 +1315,17 @@ static void _fill_surface_geometry_data(
 	}
 }
 
+// A geometry without indices gets its vertex buffer's address as index address, never 0. The shaders do not read it
+// (get_triangle_indices_ex() tests RT_INDEX_FORMAT_NONE first), but AMD's Vulkan shader compiler (RX 6600, Adrenalin)
+// loads it ahead of that test when the read is invariant in a loop (the decal loop of the hit shaders): from address 0,
+// a GPU fault (READ_INVALID at 0) and a lost device. The vertex buffer holds at least 24 bytes per triangle (three
+// vertices of 8 bytes or more), more than the 12 bytes per triangle such a load reads.
+static _FORCE_INLINE_ void _rt_set_unindexed_index_address(RT_GeometryData &r_geometry) {
+	if (r_geometry.index_format == RT_INDEX_FORMAT_NONE) {
+		r_geometry.index_buffer_address = r_geometry.vertex_buffer_address;
+	}
+}
+
 void RenderRaytracing::_populate_surface_blas(
 		void *p_mesh_surface,
 		RID p_vertex_buffer_override,
@@ -1346,6 +1357,7 @@ void RenderRaytracing::_populate_surface_blas(
 	if (index_buffer.is_valid() && geom.index_format != RT_INDEX_FORMAT_NONE) {
 		geom.index_buffer_address = rd->buffer_get_device_address(index_buffer);
 	}
+	_rt_set_unindexed_index_address(geom);
 
 	uint32_t vertex_count = geom.vertex_count;
 	uint32_t index_count = (geom.index_format != RT_INDEX_FORMAT_NONE) ? geom.primitive_count * 3 : 0;
@@ -4149,9 +4161,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		geom.index_format = RT_INDEX_FORMAT_UINT32; // always uint32 in replicated buffer
 		geom.primitive_count = p_mm_count * prim_count;
 	} else {
-		geom.index_buffer_address = 0;
 		geom.index_format = RT_INDEX_FORMAT_NONE;
 		geom.primitive_count = p_mm_count * prim_count;
+		_rt_set_unindexed_index_address(geom);
 	}
 
 	return true;
